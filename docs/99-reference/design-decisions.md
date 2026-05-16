@@ -1,6 +1,16 @@
 # Design Decisions
 
-**Version**: 0.1.0 | **Last Updated**: 2026-02-02
+**Version**: 0.2.0 | **Last Updated**: 2026-05-16
+
+> **Pivot notice (2026-05-16)**: The Foundation-phase decisions dated
+> 2026-02-02 below are **Superseded by**
+> [ADR-0001](../adr/ADR-0001-thalamus-as-semantic-control-layer.md), which
+> redefines Thalamus as the semantic control layer for AI traffic. The
+> biological-thalamus model and the Five-Question Framework are no longer
+> normative. History is preserved here, not deleted. New architectural
+> decisions are recorded as ADRs in `docs/adr/`; this log records
+> non-ADR-level decisions and points at ADRs. See the "Post-pivot decisions"
+> section near the end.
 
 ## Purpose
 
@@ -151,7 +161,7 @@ Use this template for all documented decisions:
 
 **Decided By**: RBX Systems leadership
 
-**Status**: Accepted
+**Status**: Superseded by [ADR-0001](../adr/ADR-0001-thalamus-as-semantic-control-layer.md) (2026-05-16). The biological-thalamus model is no longer the normative architecture; the normative model is control plane vs data plane. Retained as historical context and as a loose intuition only.
 
 **Related Decisions**: Foundation First (architectural thinking before implementation)
 
@@ -202,7 +212,7 @@ Use this template for all documented decisions:
 
 **Decided By**: RBX Systems leadership
 
-**Status**: Accepted
+**Status**: Superseded by [ADR-0001](../adr/ADR-0001-thalamus-as-semantic-control-layer.md) (2026-05-16). Replaced by the control-boundary framework in [BOUNDARIES.md](../../BOUNDARIES.md) (Control / Data plane / Gateway-coupling / Ownership / Policy).
 
 **Related Decisions**: Foundation First, Biological Model
 
@@ -347,6 +357,61 @@ Use this template for all documented decisions:
 **Related Decisions**: Biological Model (clear core boundaries)
 
 ---
+
+## Post-pivot decisions
+
+### 2026-05-16: Thalamus is the semantic control layer for AI traffic
+
+**Context**: The Foundation signal-router framing did not name the control
+boundary RBX needs (policy, audit, context authorization, evaluation, risk) for
+AI-mediated calls.
+
+**Decision**: Recorded as
+[ADR-0001](../adr/ADR-0001-thalamus-as-semantic-control-layer.md). Thalamus is
+the control plane for AI traffic; the data plane (Agentgateway, LiteLLM,
+others) is replaceable behind `BackendPort`.
+
+**Control-boundary analysis**: Control YES, Data plane NO, Gateway-coupling NO
+(adapter-only), Ownership NO, variation expressed as Policy.
+
+**Decision Level**: Governed. **Decided By**: RBX Systems leadership.
+**Status**: Accepted. **Supersedes**: Biological Model, Five-Question
+Framework, and the no-code Foundation phase.
+
+### 2026-05-16: Rust-first language decision
+
+**Context**: Thalamus is infrastructure-critical and enforces policy, context
+boundaries, auditability, and operational safety. Strong typing and explicit
+invariants matter; Rust aligns with Robson and RBX reliability posture.
+
+**Decision**: Core, server, policy engine in Rust. SDKs in Python and
+TypeScript. Admin UI in TypeScript. Gateway adapters Rust-first (Go only if an
+ecosystem integration is clearly better). No Zig for v0/v1. Detail in
+[ADR-0001](../adr/ADR-0001-thalamus-as-semantic-control-layer.md) and
+[target-architecture.md](../02-architecture/target-architecture.md).
+
+**Decision Level**: Governed. **Status**: Accepted. **Supersedes**: the
+Foundation rule "no technology choices in Phase 0".
+
+### 2026-05-16: Ports keep the data plane replaceable
+
+**Context**: Direct provider/gateway calls couple products to backends.
+
+**Decision**: `thalamus-core` defines port traits (`BackendPort`,
+`ContextPort`, `PolicyPort`, `AuditPort`, `EvalPort`, `ObservabilityPort`).
+Adapters implement them and depend on `thalamus-core`; `thalamus-core` depends
+on no adapter and no gateway type.
+
+**Decision Level**: Reviewed (architectural, within ADR-0001). **Status**:
+Accepted.
+
+### Open items
+
+- Policy language/representation and evaluation semantics: not yet decided.
+- Audit store schema and retention (must respect Postgres-external constraint):
+  not yet decided.
+- Whether `PolicyEngine` stays in-process or becomes a separate service:
+  deferred until load characteristics are known.
 
 ## Placeholder for Future Decisions
 

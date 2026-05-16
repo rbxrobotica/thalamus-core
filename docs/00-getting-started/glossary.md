@@ -1,318 +1,168 @@
 # Thalamus Glossary
 
-**Version**: 0.1.0 | **Last Updated**: 2026-02-02
+**Version**: 0.2.0 | **Last Updated**: 2026-05-16
 
-## Purpose
+This supersedes the 0.1.0 signal-mediation glossary. See
+[ADR-0001](../adr/ADR-0001-thalamus-as-semantic-control-layer.md).
 
-This glossary defines key terms used throughout Thalamus documentation. Understanding these terms is essential for contributing effectively.
-
----
-
-## Core Concepts
+## Core concepts
 
 ### Thalamus
-The AI-first cognitive mediation layer for RBX Systems. Named after the biological thalamus, it routes, normalizes, and contextualizes signals between perception and decision systems without making business decisions.
+The semantic control layer for AI traffic. Applies business rules, policy,
+context, validation, routing decisions, observability, evaluation, and
+auditability before and after calls to language models, tools, MCP servers, A2A
+agents, or other AI execution backends. Not the model, not a proxy, not a
+gateway, not Agentgateway.
 
-### Signal
-A discrete unit of information flowing through the system. Signals can represent events, requests, responses, alerts, or data updates. Signals have identity, type, priority, payload, and metadata.
+### Control plane
+The layer that decides and validates. Thalamus is the control plane for AI
+traffic.
 
-### Mediation
-The act of routing, normalizing, and contextualizing signals without making strategic or business decisions. Mediation is Thalamus's core function.
+### Data plane
+The layer that moves bytes: connectivity, proxy, transport routing, rate
+limits, transport-level enforcement. Agentgateway, LiteLLM, Envoy, Kong, direct
+provider calls. Replaceable. Reached only through `BackendPort`.
 
-### Boundary
-A clear line defining what belongs in Thalamus versus what belongs in product code. Boundaries prevent scope creep and maintain architectural integrity. See [BOUNDARIES.md](../../BOUNDARIES.md).
+### AI execution backend
+What ultimately runs the work: an LLM provider, a tool, an MCP server, or an
+A2A agent.
 
----
+### Pre-call mediation
+The phase before a backend call: identity, intent, policy, model/tool
+selection, budget, envelope build, context authorization, redaction, routing
+decision, `trace_id`/`audit_id` creation.
 
-## Architectural Terms
+### Post-call validation
+The phase after a backend response: validation, schema check, risk
+classification, hallucination signals, citation/source checks, business rules,
+redaction, audit, evaluation submission, persistence.
 
-### Perception Layer
-External systems that generate signals (market data feeds, code repositories, sensors, APIs, user interfaces). Thalamus receives signals from the perception layer.
+### Policy
+Data that governs an AI-mediated call: which tenant/product/workflow may use
+which model/tool, with which budget, with which authorized context, with which
+risk thresholds, with which output rules, with which evaluation. Evaluated by
+the policy engine. Not branches in product code.
 
-### Decision Layer
-Product-specific systems that make strategic and business decisions (trading engines, code suggestion systems, action planners). Thalamus delivers signals to the decision layer.
+### Envelope
+The approved, policy-built request handed to `BackendPort`: prompt/payload plus
+authorized context plus routing metadata plus `trace_id`/`audit_id`.
 
-### Signal Routing
-Determining which destination(s) should receive a signal based on signal metadata (type, priority, context). Routing is configuration-driven, not business-logic driven.
+### Routing decision
+The control-plane choice of which backend, model, or tool a call goes to. An
+opaque handle, never a gateway type, at the domain layer.
 
-### Signal Normalization
-Transforming diverse signal formats into common representations. Normalization standardizes structure, timestamps, encoding, and metadata without interpreting business meaning.
+### Risk classification
+Post-call assignment of `Low | Medium | High | Prohibited` to a response,
+gating what the caller may do with it.
 
-### Context Management
-Maintaining short-term working context that enriches signals with relevant metadata. Context includes recent signal history, attention state, and detected patterns.
+### Audit event
+A durable governance record of a pre-call decision or post-call outcome, joined
+by `audit_id`. Not sampled. Distinct from observability telemetry.
 
-### Working Context
-Ephemeral, session-scoped state maintained by Thalamus to provide contextual enrichment. Working context is NOT persisted long-term.
+### trace_id
+OpenTelemetry trace identifier propagated across Thalamus, the data plane, the
+provider/tool, and back.
 
-### Signal Enrichment
-Adding contextual metadata to signals (recent patterns, attention state, temporal context) without calculating business values.
+### audit_id
+Stable identifier joining the pre-call and post-call audit events for one
+logical call.
 
----
+## Components
 
-## Boundary-Related Terms
+### thalamus-core
+Rust crate: domain types, policy model, envelopes, decisions, risk levels,
+audit schemas, context authorization types, validation primitives, port traits.
+No I/O, no adapters, no gateway types.
 
-### Business Logic
-Domain-specific decision-making code (trading strategies, risk calculations, code analysis, portfolio management). Business logic does NOT belong in Thalamus.
+### thalamus-server
+Rust service exposing the control-plane API (`decide`, `pre-call`, `call`,
+`post-call`, `evaluate`, `audit`).
 
-### Business-Logic Agnostic
-Containing no domain-specific knowledge or decision-making code. Thalamus is business-logic agnostic by design.
+### thalamus-sdk-python / thalamus-sdk-ts
+Thin SDKs. Python for Robson, jobs, Python agents. TypeScript for Strategos,
+Eden, admin tools. They carry no policy.
 
-### Product-Specific
-Code, configuration, or concepts that apply to only one RBX product (Strategos-specific trading logic, Robson-specific code analysis). Product-specific code does NOT belong in Thalamus core.
+### thalamus-agentgateway-adapter
+`BackendPort` implementation over Agentgateway. The only place that knows
+Agentgateway types.
 
-### Domain-Agnostic
-Applicable across all domains and products. Thalamus core is domain-agnostic (works for trading, coding, healthcare, etc.).
+### thalamus-eval
+Evaluation layer: schema checks, scoring, hallucination signals, citation
+checks, future TruthMetal integration. Uses Langfuse.
 
-### Five-Question Framework
-The boundary validation process from [BOUNDARIES.md](../../BOUNDARIES.md). All features must pass five questions to belong in Thalamus: Signal, Decision, Domain, State, Reusability.
+### thalamus-console
+TypeScript admin UI: policies, traces, audit, costs, model/tool permissions,
+evaluation outcomes.
 
----
+### Port
+A trait defined in `thalamus-core` that keeps the data plane replaceable and
+the domain pure: `BackendPort`, `ContextPort`, `PolicyPort`, `AuditPort`,
+`EvalPort`, `ObservabilityPort`.
 
-## Component Terms
+## Observability and evaluation
 
-### Integration Layer
-Thalamus component that interfaces with external systems via source and sink adapters.
+### OpenTelemetry
+The vendor-neutral observability backbone: traces, spans, metrics, logs
+correlation, trace propagation.
 
-### Routing Layer
-Thalamus component that classifies signals and selects destinations based on metadata.
+### Langfuse
+The LLM observability and evaluation layer: prompts/versions, generations,
+traces, scoring, datasets, eval runs, model comparison, cost/token analysis.
+Not replaced by Prometheus/Grafana.
 
-### Normalization Layer
-Thalamus component that transforms signal formats and validates structure.
+### Prometheus
+Metrics scraping and alerting: SLO/SLA, rate/error/duration/saturation, policy
+decision counts, validation failure counts, provider failure rates. Present in
+`rbx-infra` (kube-prometheus-stack).
 
-### Context Layer
-Thalamus component that maintains working context and provides enrichment metadata.
+### Grafana
+Dashboards and operational views. Present in `rbx-infra`
+(`grafana.rbxsystems.ch`).
 
-### Source Adapter
-Product-provided component that emits signals into Thalamus in standard format.
+## Boundary terms
 
-### Sink Adapter
-Product-provided component that receives normalized signals from Thalamus.
+### Gateway-agnostic at the product layer
+Domain and product code never reference a gateway/provider type. The phrase in
+full: "Thalamus is gateway-agnostic at the product layer, but
+Agentgateway-native at the RBX infrastructure adapter layer."
 
----
+### Control-boundary framework
+The five questions that decide whether a capability belongs in Thalamus:
+Control, Data plane, Gateway-coupling, Ownership, Policy. Replaces the 0.1.0
+Five-Question Framework.
 
-## Signal-Related Terms
+### Invariant
+`thalamus-core` depends on no adapter and no gateway type. Adapters depend on
+`thalamus-core`, never the reverse.
 
-### Signal Type
-Classification of signal purpose (Event, Request, Response, Alert, Data). Types are generic, not domain-specific.
-
-### Signal Priority
-Urgency level set by source systems (Critical, High, Normal, Low, Deferred). Priority drives routing decisions.
-
-### Signal Payload
-The actual data carried by a signal. Payload is opaque to Thalamus—Thalamus routes it without interpreting it.
-
-### Signal Metadata
-Processing information added by Thalamus (received_at, normalized_at, context, routing). Metadata is distinct from payload.
-
-### Signal Identity
-Unique identifier, timestamp, and source information that distinguishes each signal.
-
----
-
-## Process Terms
-
-### Phase
-Development stage with defined objectives and allowed activities. Current phases: Foundation (0), Implementation (1), Integration (2), Evolution (3). See [GOVERNANCE.md](../../GOVERNANCE.md).
-
-### Decision Level
-Authority level required for a change: Autonomous (agent decides), Reviewed (human reviews), Governed (human decides). See [GOVERNANCE.md](../../GOVERNANCE.md).
-
-### Boundary Violation
-A contribution that violates the definitions in [BOUNDARIES.md](../../BOUNDARIES.md) by adding business logic, product-specific code, decision-making, long-term storage, or non-reusable features.
-
-### Design Decision
-A documented choice about architecture, features, or process recorded in [docs/99-reference/design-decisions.md](../99-reference/design-decisions.md) with context, reasoning, and boundary analysis.
-
----
-
-## RBX Systems Terms
-
-### RBX Systems
-The organization building Thalamus and AI-powered products (Strategos, Robson, future systems).
+## Sibling products
 
 ### Strategos
-RBX Systems' AI-powered trading system. Strategos uses Thalamus for signal mediation between market perception and trading decisions.
+Strategic brain and strategic memory. Consumes Thalamus; receives
+operational/audit/evaluation events. Not the LLM gateway.
+
+### TruthMetal
+Future ground-truth and evidence layer. Supplies datasets, assertions, citation
+checks to `thalamus-eval`. Not Thalamus.
 
 ### Robson
-RBX Systems' AI coding assistant. Robson uses Thalamus for signal mediation between code events and coding decisions.
+Trading system. Consumes Thalamus for AI-mediated analysis. Keeps hard
+trading/risk invariants deterministic and separate from LLM suggestions.
+
+### Eden
+IDP/CLI. Uses Thalamus as the governed AI execution baseline for agentic
+workflows.
+
+## Historical
+
+### Signal mediation layer (deprecated)
+The 0.1.0 definition: a business-agnostic biological-thalamus signal router.
+Superseded by ADR-0001. Retained only as history.
+
+### Five-Question Framework (deprecated)
+The 0.1.0 boundary check (Signal, Decision, Domain, State, Reusability).
+Replaced by the control-boundary framework.
 
 ---
 
-## Technical Terms (Phase 1+)
-
-*These terms will be defined when implementation begins.*
-
-### Queue
-(To be defined in Phase 1)
-
-### Backpressure
-(To be defined in Phase 1)
-
-### Adapter Interface
-(To be defined in Phase 1)
-
-### Configuration Schema
-(To be defined in Phase 1)
-
----
-
-## Biological Terms
-
-### Biological Thalamus
-Brain structure that acts as sensory relay station, routing signals from sensory organs to appropriate cortical regions. The biological thalamus inspired Thalamus architecture.
-
-### Cortical Region
-Area of brain cortex that processes specific types of information (visual cortex, auditory cortex). Analogous to decision systems in Thalamus architecture.
-
-### Sensory Relay
-Function of routing sensory information without interpreting meaning. This is the core function Thalamus adopts from neuroscience.
-
-### Attention State
-Biological mechanism for prioritizing certain signals. Thalamus maintains attention state as part of working context.
-
----
-
-## Governance Terms
-
-### Autonomous Decision
-Change that AI agents can make without human approval (typos, formatting, examples). See [GOVERNANCE.md](../../GOVERNANCE.md).
-
-### Reviewed Decision
-Change requiring human review before implementation (new features, architectural changes). See [GOVERNANCE.md](../../GOVERNANCE.md).
-
-### Governed Decision
-Strategic decision requiring explicit human authority (technology choices, phase transitions, boundary changes). See [GOVERNANCE.md](../../GOVERNANCE.md).
-
-### Phase Transition
-Moving from one development phase to the next (Foundation → Implementation → Integration → Evolution). Requires human approval.
-
-### Completion Criteria
-Required conditions for declaring a phase complete and transitioning to the next phase. See [GOVERNANCE.md](../../GOVERNANCE.md).
-
----
-
-## Contribution Terms
-
-### AI-First, Human-Centered
-Development philosophy where AI agents contribute autonomously within clear boundaries, while humans make strategic decisions and maintain architectural integrity.
-
-### Boundary Discipline
-The practice of rigorously maintaining architectural boundaries by rejecting contributions that violate [BOUNDARIES.md](../../BOUNDARIES.md).
-
-### Proposal
-Documented suggestion for a reviewed-level or governed-level change, including context, reasoning, alternatives, and boundary analysis.
-
-### Precedent
-Past design decision documented in [docs/99-reference/design-decisions.md](../99-reference/design-decisions.md) that informs current decisions.
-
----
-
-## Anti-Patterns (What NOT to Do)
-
-### Boundary Creep
-Gradually adding features that violate boundaries, often justified as "small exceptions" or "edge cases."
-
-### Business Logic Infiltration
-Adding domain-specific decision-making code to Thalamus under the guise of "smart routing" or "intelligent processing."
-
-### Product Coupling
-Creating dependencies between Thalamus core and specific products (Strategos, Robson), violating reusability.
-
-### Premature Optimization
-Making technology decisions or implementing code during Phase 0 (Foundation), before architecture is finalized.
-
----
-
-## Quality Attributes
-
-### Latency
-Time between signal input and signal delivery. Thalamus targets low latency (microsecond to millisecond scale).
-
-### Throughput
-Number of signals processed per unit time. Thalamus targets high throughput (100K+ signals/second).
-
-### Reusability
-Ability to use the same core code across all RBX products without modification. Core design principle.
-
-### Maintainability
-Ease of understanding, modifying, and extending code. Enhanced by clear boundaries and layer separation.
-
-### Reliability
-Consistent, predictable behavior under various conditions. Includes graceful degradation and error handling.
-
----
-
-## Document References
-
-### Authoritative Documents
-The root-level documents that define Thalamus ([BOUNDARIES.md](../../BOUNDARIES.md), [ARCHITECTURE.md](../../ARCHITECTURE.md), [PURPOSE.md](../../PURPOSE.md), [GOVERNANCE.md](../../GOVERNANCE.md), [CONTRIBUTING.md](../../CONTRIBUTING.md)).
-
-### Agent Guidelines
-[.claude/agent-guidelines.md](../../.claude/agent-guidelines.md) - Operational manual for AI agents working in Thalamus repository.
-
-### Design Decisions
-[docs/99-reference/design-decisions.md](../99-reference/design-decisions.md) - Historical record of architectural and design decisions with reasoning.
-
----
-
-## Usage Examples
-
-### Good Usage (Aligned with Boundaries)
-
-**Signal**: "Market price update received from exchange API"
-**Normalization**: "Convert exchange timestamp to UTC, validate structure"
-**Routing**: "Route to decision system based on signal.priority"
-**Context**: "Enrich with recent price pattern metadata"
-
-### Bad Usage (Boundary Violations)
-
-**Business Logic**: "Calculate if price change exceeds risk threshold" (Decision boundary violation)
-**Product-Specific**: "Parse Strategos-specific order format" (Domain boundary violation)
-**Long-term Storage**: "Store all signals in database permanently" (State boundary violation)
-**Decision-Making**: "Determine if trade should be executed" (Decision boundary violation)
-
----
-
-## Common Confusions
-
-### "Thalamus is a message bus"
-**Clarification**: Thalamus is more than transport—it understands signal semantics (priority, type, context) while remaining business-agnostic.
-
-### "Thalamus makes routing decisions"
-**Clarification**: Thalamus routes based on metadata SET by source systems. It doesn't calculate what priority should be.
-
-### "Any signal processing belongs in Thalamus"
-**Clarification**: Only business-agnostic processing (normalization, routing, context enrichment). Business-specific processing belongs in products.
-
-### "Thalamus is product-specific"
-**Clarification**: Thalamus core is universal. Products provide adapters and configuration.
-
----
-
-## Related Resources
-
-- **Detailed Definitions**: See [docs/99-reference/terminology.md](../99-reference/terminology.md) (when created)
-- **Conceptual Background**: See [docs/01-concept/](../01-concept/) (when created)
-- **Architecture Details**: See [ARCHITECTURE.md](../../ARCHITECTURE.md)
-- **Boundary Framework**: See [BOUNDARIES.md](../../BOUNDARIES.md)
-
----
-
-## Contributing to This Glossary
-
-To add or modify terms:
-
-1. Ensure term is used in Thalamus documentation
-2. Verify definition aligns with [BOUNDARIES.md](../../BOUNDARIES.md)
-3. Use clear, concise language
-4. Provide examples when helpful
-5. Link to authoritative documents
-6. Update version and date
-
-**Decision Level**: Autonomous for clarifications, Reviewed for new terms
-
----
-
-**Last Updated**: 2026-02-02 | **Version**: 0.1.0
-
-*This glossary is a living document. Suggest improvements via the contribution process defined in [CONTRIBUTING.md](../../CONTRIBUTING.md).*
+*Last updated: 2026-05-16*

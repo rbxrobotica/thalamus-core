@@ -7,9 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Phase 0: Foundation
+### Architecture phase (post-pivot)
 
-Foundation phase establishing conceptual architecture and documentation.
+## [0.2.0] - 2026-05-16
+
+### Changed (BREAKING: definition pivot)
+
+Thalamus is redefined as **the semantic control layer for AI traffic**. The
+0.1.0 "signal mediation layer / biological thalamus" definition is superseded.
+See [docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md](docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md).
+
+- README.md, PURPOSE.md, ARCHITECTURE.md, BOUNDARIES.md, GOVERNANCE.md,
+  CONTRIBUTING.md rewritten for the control-plane definition.
+- docs/00-getting-started/glossary.md and for-agents.md rewritten.
+- .claude/agent-guidelines.md rewritten.
+- docs/99-reference/design-decisions.md: Foundation decisions marked Superseded
+  by ADR-0001; new decisions recorded.
+
+### Added
+
+- docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md (the pivot decision)
+- docs/02-architecture/target-architecture.md (components, ports, language)
+- docs/02-architecture/pre-call-and-post-call-responsibilities.md
+- docs/02-architecture/observability-and-evaluation.md (OpenTelemetry, Langfuse,
+  Prometheus, Grafana; rbx-infra monitoring reality)
+- docs/02-architecture/agentgateway-and-data-plane.md
+- docs/03-integration/cross-product-positioning.md (Strategos, TruthMetal,
+  Robson, Eden)
+
+### Governed decisions in this release
+
+- Thalamus is the control plane for AI traffic; the data plane is replaceable.
+- Gateway-agnostic at the product layer; Agentgateway-native only at the
+  adapter layer. `thalamus-core` must not depend on gateway types.
+- Rust-first for core, server, policy engine; Python and TypeScript SDKs;
+  TypeScript admin UI; no Zig for v0/v1.
+- The Five-Question Framework is replaced by the control-boundary framework.
+
+### Removed
+
+- The "Phase 0 = no technology, no code" constraint (technology is now decided).
+- The biological-thalamus model as the normative architecture (kept only as
+  historical context).
 
 ## [0.1.0] - 2026-02-02
 

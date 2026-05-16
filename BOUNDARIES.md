@@ -1,315 +1,220 @@
 # Thalamus Boundaries
 
-**Status**: Living Document | **Version**: 0.1.0 | **Last Updated**: 2026-02-02
+**Status**: Living Document | **Version**: 0.2.0 | **Last Updated**: 2026-05-16
 
-## Purpose of This Document
+This document supersedes the 0.1.0 signal-mediation boundary framework and its
+Five-Question Framework. See
+[ADR-0001](docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md). This is the
+north-star document. Read it before any contribution.
 
-This is the **north star document** for Thalamus. It defines what Thalamus IS and IS NOT with absolute clarity. Before making any contribution—code, documentation, or architectural decision—you must consult this document.
+## The core principle
 
-**Mandatory Reading**: All contributors (human and AI) must read and understand this document before contributing.
+> Thalamus is the semantic control layer for AI traffic. It decides and
+> validates. It does not run the model and it does not move the bytes.
 
-## The Core Principle
-
-> **Thalamus is a signal mediator, not a decision-maker.**
-
-Thalamus routes, normalizes, and contextualizes signals between perception and decision-making systems. It does NOT make business decisions, implement domain logic, or act as a standalone application.
+Thalamus applies business rules, policies, context, validation, routing
+decisions, observability, evaluation, and auditability before and after calls to
+language models, tools, MCP servers, A2A agents, or other AI execution backends.
 
 ## What Thalamus IS
 
-### ✅ Signal Mediation Layer
-- Routes signals from multiple sources to appropriate destinations
-- Acts as a switchboard between perception and decision systems
-- Manages signal priority and urgency
-- Handles signal queuing and buffering
+### Control plane for AI traffic
+- The single point that decides whether an AI-mediated call is allowed
+- Selects the permitted model, tool, gateway, or backend
+- Enforces budget, token, and latency limits
+- Authorizes and scopes context
+- Makes the routing decision
 
-### ✅ Signal Normalization
-- Transforms diverse signal formats into common representations
-- Standardizes metadata across signal types
-- Enriches signals with contextual information
-- Validates signal structure and integrity
+### Pre-call mediation
+- Identity (tenant, product, user, workflow), intent classification
+- Policy selection and enforcement
+- Envelope construction, context authorization, redaction
+- `trace_id` and `audit_id` creation
 
-### ✅ Context Management (Short-term)
-- Maintains short-term working context
-- Tracks recent signal patterns
-- Provides contextual enrichment for routing decisions
-- Manages attention and focus state
+### Post-call validation
+- Schema validation, operational risk classification
+- Hallucination signals, citation/source checks
+- Business-rule application, redaction
+- Audit event registration, evaluation submission, persistence
 
-### ✅ Business-Logic Agnostic
-- Contains NO product-specific decision logic
-- Works identically across all RBX products
-- Remains neutral to domain semantics
-- Configurable, not programmable with business rules
+### Governance and auditability
+- Model and tool governance
+- Risk classification
+- Traceability
+- Audit events as first-class output
 
-### ✅ Reusable Component
-- Core library shared across Strategos, Robson, and future systems
-- Stable API for integration
-- Product-agnostic interfaces
-- Minimal external dependencies
+### Gateway-agnostic at the product layer
+- Backends are reached through a port; domain code never references a gateway
+  type
 
 ## What Thalamus IS NOT
 
-### ❌ NOT a Decision-Maker
-- Does NOT determine strategic actions
-- Does NOT implement business rules
-- Does NOT choose between tactical options
-- Does NOT contain domain-specific logic
+### NOT the language model
+Thalamus does not generate completions. Providers and AI backends do.
 
-**Example Violation**: "Thalamus should decide whether a market signal requires immediate action based on portfolio risk."
-**Why This Violates**: This is a strategic decision requiring domain knowledge. Thalamus should only route the signal to the appropriate decision system with proper context and priority.
+**Violation example**: "Thalamus should host a fine-tuned model and serve
+inference."
+**Why**: That is an AI backend. Thalamus governs calls to it.
 
-### ❌ NOT Business-Logic Specific
-- Does NOT know about trading strategies
-- Does NOT understand portfolio management
-- Does NOT implement risk calculations
-- Does NOT contain product-specific workflows
+### NOT merely an LLM proxy
+A proxy forwards requests. Thalamus decides whether the request is allowed,
+under which policy, with which context, and whether the response is acceptable.
 
-**Example Violation**: "Add a handler for calculating position sizes based on volatility."
-**Why This Violates**: This is Strategos-specific business logic. Thalamus should route volatility signals, not calculate positions.
+**Violation example**: "Thalamus is a thin pass-through to OpenAI with logging."
+**Why**: That is a data plane. Thalamus is the control plane above it.
 
-### ❌ NOT a Standalone Application
-- Does NOT run independently
-- Does NOT have its own UI
-- Does NOT implement complete workflows
-- Does NOT store application state
+### NOT merely a gateway
+A gateway provides connectivity, routing transport, rate limits. Thalamus
+provides policy, audit, context authorization, risk classification, and
+evaluation.
 
-**Example Violation**: "Create a web dashboard for Thalamus to visualize signal flows."
-**Why This Violates**: Thalamus is a library component. Products that use it may visualize signals, but Thalamus itself doesn't provide UIs.
+**Violation example**: "Add MCP transport multiplexing and connection pooling to
+Thalamus."
+**Why**: Transport is the data plane (Agentgateway, LiteLLM, Envoy, Kong).
 
-### ❌ NOT Long-term Memory
-- Does NOT persist historical data
-- Does NOT implement databases
-- Does NOT manage long-term state
-- Does NOT provide data warehousing
+### NOT based on Agentgateway
+Agentgateway is a privileged data plane backend that Thalamus may support
+through an adapter. Thalamus domain logic must not depend directly on
+Agentgateway types.
 
-**Example Violation**: "Store all signals in Thalamus for historical analysis."
-**Why This Violates**: Long-term persistence is the responsibility of consuming systems. Thalamus maintains only short-term working context.
+**Violation example**: "Import `agentgateway::Route` in the policy engine."
+**Why**: Couples the control plane to one data plane. Only
+`thalamus-agentgateway-adapter` may know Agentgateway.
 
-### ❌ NOT "The Brain"
-- Does NOT orchestrate entire systems
-- Does NOT manage application lifecycle
-- Does NOT control other components
-- Does NOT implement event loops
+### NOT strategic memory, ground truth, or trading invariants
+- Strategos owns decision history and rationale.
+- TruthMetal will own datasets, assertions, and factual oracles.
+- Robson owns hard trading/risk invariants, independent of any LLM suggestion.
 
-**Example Violation**: "Thalamus should manage the startup sequence of all RBX components."
-**Why This Violates**: Thalamus is a mediator, not an orchestrator. System lifecycle is managed by application-level code.
+## The control-boundary framework
 
-## The Five-Question Boundary Framework
+Before adding any capability, answer these questions. The capability belongs in
+Thalamus only if the answers match.
 
-Before adding ANY feature, answer these five questions:
+### 1. Control question
+**Is this a decision or validation about an AI-mediated call (allow, route,
+budget, context, risk, schema, audit, evaluation)?**
+- YES -> may belong in Thalamus
+- NO -> belongs elsewhere
 
-### 1. Signal Question
-**Is this fundamentally about signal routing, normalization, or mediation?**
-- ✅ YES → Likely belongs in Thalamus
-- ❌ NO → Belongs elsewhere
+### 2. Data plane question
+**Does this move bytes, hold connections, proxy streams, or enforce transport
+rate limits?**
+- YES -> does NOT belong in Thalamus (data plane)
+- NO -> may belong in Thalamus
 
-**Examples:**
-- ✅ "Add support for prioritizing urgent signals" → YES (signal routing)
-- ❌ "Add risk calculation for signals" → NO (business logic)
+### 3. Gateway-coupling question
+**Does this require domain or product code to reference a specific gateway or
+provider type?**
+- YES -> does NOT belong in Thalamus core (adapter only)
+- NO -> may belong in Thalamus
 
-### 2. Decision Question
-**Does this make strategic, tactical, or business decisions?**
-- ❌ YES → Does NOT belong in Thalamus
-- ✅ NO → May belong in Thalamus
+### 4. Ownership question
+**Is this strategic memory (Strategos), ground truth (TruthMetal), or hard
+trading/risk invariants (Robson)?**
+- YES -> does NOT belong in Thalamus
+- NO -> may belong in Thalamus
 
-**Examples:**
-- ✅ "Route signals to decision systems based on signal type" → NO (mediation)
-- ❌ "Choose the best trading strategy based on market conditions" → YES (business decision)
+### 5. Policy question
+**Can this be expressed as policy evaluated by the policy engine rather than
+hardcoded product logic?**
+- YES -> belongs as policy, not as a code branch
+- NO -> reconsider; most variation is policy
 
-### 3. Domain Question
-**Is this specific to one product or domain?**
-- ❌ YES → Does NOT belong in Thalamus
-- ✅ NO → May belong in Thalamus
+A capability belongs in Thalamus only if: Control = YES, Data plane = NO,
+Gateway-coupling = NO, Ownership = NO, and variation is expressed as Policy.
 
-**Examples:**
-- ✅ "Normalize timestamps across different signal sources" → NO (universal)
-- ❌ "Parse order execution confirmations" → YES (trading-specific)
+## Common boundary violations
 
-### 4. State Question
-**Does this require long-term persistent state?**
-- ❌ YES → Does NOT belong in Thalamus
-- ✅ NO → May belong in Thalamus
-
-**Examples:**
-- ✅ "Maintain current attention focus for the session" → NO (short-term)
-- ❌ "Store all historical signals for backtesting" → YES (long-term)
-
-### 5. Reusability Question
-**Would every RBX product need this exact capability?**
-- ✅ YES → Likely belongs in Thalamus
-- ❌ NO → Belongs in product-specific code
-
-**Examples:**
-- ✅ "Queue signals during high-volume periods" → YES (universal need)
-- ❌ "Calculate portfolio Greek exposures" → NO (Strategos-specific)
-
-## Decision Process
-
-When evaluating a potential feature:
-
-1. **Check the Five Questions** - All five must pass the boundary test
-2. **Consult ARCHITECTURE.md** - Does it fit the architectural model?
-3. **Review PURPOSE.md** - Does it align with Thalamus's purpose?
-4. **Document in design-decisions.md** - Record your reasoning
-5. **Seek Review** - When in doubt, propose rather than implement
-
-## Common Boundary Violations
-
-### Violation: Business Rules in Routing
-
-**Bad:**
-```
-if signal.type == "market_volatility" and signal.value > threshold:
-    if portfolio.risk_level == "high":
-        route_to_urgent_handler()
-    else:
-        route_to_normal_handler()
-```
-
-**Why**: This contains business logic (risk levels, thresholds, portfolio awareness).
-
-**Good:**
-```
-if signal.priority == "urgent":
-    route_to_urgent_handler()
-else:
-    route_to_normal_handler()
-```
-
-**Why**: Routing based on signal metadata (priority), which was set by the source system.
-
-### Violation: Product-Specific Transformations
-
-**Bad:**
-```
-def normalize_signal(signal):
-    if signal.type == "order_fill":
-        # Calculate P&L from fill price
-        signal.pnl = calculate_pnl(signal.price, signal.position)
-    return signal
-```
-
-**Why**: P&L calculation is Strategos-specific business logic.
-
-**Good:**
-```
-def normalize_signal(signal):
-    # Standardize timestamp format
-    signal.timestamp = parse_timestamp(signal.timestamp).to_utc()
-    # Add signal metadata
-    signal.received_at = current_time()
-    return signal
-```
-
-**Why**: Normalization is limited to universal signal properties (time, metadata).
-
-### Violation: Embedded Decision Logic
-
-**Bad:**
-```
-def should_alert(signal):
-    if signal.type == "price_move" and abs(signal.change) > 0.02:
-        return True  # 2% move threshold
-    return False
-```
-
-**Why**: Determining alert thresholds is a business decision.
-
-**Good:**
-```
-def should_alert(signal):
-    return signal.alert_flag == True
-```
-
-**Why**: Thalamus routes based on signal properties set by source systems.
-
-## Architectural Boundaries
-
-### Layer Boundaries
+### Violation: transport in the control plane
 
 ```
-┌─────────────────────────────────────┐
-│   Product Layer (Strategos, etc.)  │ ← Business Logic Lives Here
-│  - Decisions, strategies, rules    │
-└─────────────────────────────────────┘
-                 ↕
-┌─────────────────────────────────────┐
-│         THALAMUS LAYER              │ ← Mediation Lives Here
-│  - Route, normalize, contextualize │
-└─────────────────────────────────────┘
-                 ↕
-┌─────────────────────────────────────┐
-│   Perception Layer (Sensors, APIs) │ ← Signal Sources Live Here
-│  - Market data, user input, events │
-└─────────────────────────────────────┘
+WRONG: Thalamus opens an HTTP/2 stream to the provider and relays tokens.
+RIGHT: Thalamus produces a routing decision and hands the envelope to
+       BackendPort. The data plane streams.
 ```
 
-**Thalamus must NOT:**
-- Reach up into Product Layer concerns
-- Reach down into Perception Layer implementation
-- Make decisions that belong in Product Layer
-- Implement sources that belong in Perception Layer
+### Violation: gateway type in domain code
 
-## Integration Boundaries
+```
+WRONG: fn decide(req) -> agentgateway::RouteConfig
+RIGHT: fn decide(req) -> PolicyDecision   // backend is an opaque handle
+```
 
-### What Products Provide TO Thalamus:
-- Signal sources (as configured interfaces)
-- Signal destinations (as configured handlers)
-- Signal priority/urgency metadata
-- Configuration (routing rules, filters)
+### Violation: policy hardcoded as branches
 
-### What Thalamus Provides TO Products:
-- Normalized signal delivery
-- Contextual enrichment
-- Priority-based routing
-- Signal queue management
-- Integration interfaces
+```
+WRONG: if product == "strategos" && workflow == "business_plan" {
+           model = "claude"; require_audit = true;
+       }
+RIGHT: let decision = policy_engine.evaluate(request);
+       // model, audit requirement, budget come from policy data
+```
 
-### What Products MUST NOT Expect:
-- Business decisions from Thalamus
-- Domain-specific processing
-- Long-term state storage
-- Complete application logic
+### Violation: skipping post-call validation
+
+```
+WRONG: return backend_response;   // straight back to caller
+RIGHT: let result = post_call.validate(backend_response, policy);
+       // schema, risk, hallucination, citations, audit, eval
+```
+
+### Violation: absorbing another product's ownership
+
+```
+WRONG: Thalamus stores strategic decision rationale for future sessions.
+RIGHT: Thalamus emits an audit/operational event; Strategos persists
+       strategic memory.
+```
+
+## The architectural boundary
+
+```
++-------------------------------------+
+|  Caller layer (Robson, Strategos,   |  business intent
+|  Eden, agents, jobs)                |
++-------------------------------------+
+                 |  Thalamus SDK
++-------------------------------------+
+|  THALAMUS CONTROL PLANE             |  policy, audit, context auth,
+|  decide / pre-call / post-call      |  risk, evaluation, routing decision
++-------------------------------------+
+                 |  BackendPort (no gateway types cross this line)
++-------------------------------------+
+|  DATA PLANE (Agentgateway,          |  connectivity, proxy, rate limits,
+|  LiteLLM, Envoy, Kong, direct)      |  transport enforcement
++-------------------------------------+
+                 |
++-------------------------------------+
+|  AI backends (LLM, tool, MCP, A2A)  |  inference / execution
++-------------------------------------+
+```
+
+Thalamus must NOT reach down into transport, and must NOT absorb caller business
+ownership or sibling-product ownership.
 
 ## Enforcement
 
-### For Human Contributors:
-1. Read this document before contributing
-2. Reference specific boundary sections in proposals
-3. Document boundary reasoning in PRs
-4. Challenge violations respectfully
+### For contributors (human and AI)
+1. Read this document before contributing.
+2. Apply the control-boundary framework and record the result for non-trivial
+   changes in `docs/99-reference/design-decisions.md`.
+3. Keep `thalamus-core` free of adapter and gateway dependencies.
+4. Express variation as policy.
 
-### For AI Agents:
-1. Parse this document before any contribution
-2. Run Five-Question Framework on all features
-3. Document reasoning in `design-decisions.md`
-4. Explicitly state boundary compliance
-5. Flag potential violations for human review
+### For reviewers
+1. Reject changes that put transport, gateway types, or sibling-product
+   ownership into the control plane.
+2. Require a recorded boundary analysis for new capabilities.
+3. Maintain boundary integrity over feature velocity.
 
-### For Reviewers:
-1. Reject PRs that violate boundaries
-2. Request boundary justification
-3. Point to specific sections of this document
-4. Maintain boundary integrity over feature velocity
+## Living document
 
-## Living Document
-
-This document evolves as we learn. When updating:
-
-1. Propose changes with clear reasoning
-2. Document in `design-decisions.md`
-3. Update version and date
-4. Announce changes to contributors
-
-## Questions?
-
-If unsure whether something belongs in Thalamus:
-
-1. Apply the Five-Question Framework
-2. Consult `ARCHITECTURE.md` and `PURPOSE.md`
-3. Check `docs/99-reference/design-decisions.md` for precedent
-4. Document your reasoning and propose for review
-5. When in doubt, keep Thalamus minimal
+When the boundary needs to change, propose it as an ADR (governed decision),
+record it in `docs/adr/`, and add a superseded note rather than deleting the
+prior reasoning.
 
 ---
 
-**Remember**: Thalamus is a cognitive mediator, not a cognitive controller. It routes signals; it doesn't decide what they mean.
+*Thalamus governs AI traffic. It does not generate it and it does not transport
+it.*
