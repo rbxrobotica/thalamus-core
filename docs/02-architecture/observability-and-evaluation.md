@@ -155,6 +155,28 @@ These are distinct and must not be conflated:
 
 A dropped span is acceptable. A dropped audit event is not.
 
+## Deferred and lateral integrations
+
+OpenMetadata is a candidate AI governance catalog (asset catalog, lineage,
+ownership, classifications, glossary, data contracts) for the assets Thalamus
+governs: models, providers, eval datasets, RAG/context sources, tools, agents,
+tenants, owners, risk classes. It is **not** a policy engine, gateway, or
+runtime dependency, and it does not replace Langfuse, OpenTelemetry, or
+Prometheus.
+
+Position and timing:
+
+- Lateral, not in the request path. Thalamus emits; an integration publishes to
+  the catalog. Runtime decisions are served from Thalamus-owned policy
+  snapshots, never from synchronous OpenMetadata calls.
+- Deferred to a later phase (after `thalamus-core`, `thalamus-server`, and the
+  first `BackendPort` adapter). Not part of the first slices.
+- Reached, when introduced, behind a future lateral integration port (same
+  discipline as `EventBusPort`: only when natural, never to future-proof). The
+  port must not exist in slice 1.
+- Must not shape the `Policy` model yet. The policy representation is an open
+  question; an external catalog taxonomy must not pre-decide it.
+
 ## Infrastructure assumptions summary
 
 | Tool | Status in rbx-infra (verified 2026-05-16) | Action |
