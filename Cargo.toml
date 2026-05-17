@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "crates/thalamus-core",
+    "crates/thalamus-server",
 ]
 resolver = "2"

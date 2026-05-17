@@ -1,0 +1,29 @@
+[package]
+name = "thalamus-server"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP API server for the Thalamus semantic control layer"
+publish = false
+
+[features]
+default = []
+dev = []
+
+[[bin]]
+name = "thalamus-server"
+path = "src/main.rs"
+
+[dependencies]
+thalamus-core = { path = "../thalamus-core" }
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
