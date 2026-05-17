@@ -15,9 +15,6 @@ impl ConfigPolicyPort {
         }
     }
 
-    pub fn from_policies(policies: Vec<Policy>) -> Self {
-        Self { policies }
-    }
 }
 
 impl PolicyPort for ConfigPolicyPort {

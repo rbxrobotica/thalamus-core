@@ -84,10 +84,3 @@ pub fn load_config(path: &str) -> Result<ServerConfig, Box<dyn std::error::Error
     Ok(ServerConfig { listen, policies })
 }
 
-/// Build a ServerConfig suitable for testing (no file read).
-pub fn test_config(policies: Vec<Policy>) -> ServerConfig {
-    ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        policies,
-    }
-}

@@ -11,9 +11,6 @@ impl StaticContextPort {
         Self { entries: vec![] }
     }
 
-    pub fn with_entries(entries: Vec<ContextEntry>) -> Self {
-        Self { entries }
-    }
 }
 
 impl ContextPort for StaticContextPort {
