@@ -3,9 +3,9 @@ mod config;
 mod ports;
 mod routes;
 
-#[cfg(feature = "litellm")]
+#[cfg(any(feature = "litellm", feature = "agentgateway"))]
 use std::sync::Arc;
-#[cfg(feature = "litellm")]
+#[cfg(any(feature = "litellm", feature = "agentgateway"))]
 use thalamus_core::BackendPort;
 
 #[tokio::main]
@@ -39,7 +39,22 @@ async fn main() {
         app::build_with_backend(config, backend)
     };
 
-    #[cfg(not(feature = "litellm"))]
+    #[cfg(all(feature = "agentgateway", not(feature = "litellm")))]
+    let app = {
+        let endpoint = std::env::var("AGENTGATEWAY_ENDPOINT")
+            .unwrap_or_else(|_| thalamus_agentgateway_adapter::config::AdapterConfig::default_endpoint());
+        let auth_header = std::env::var("AGENTGATEWAY_AUTH_HEADER").ok();
+        let adapter_config = thalamus_agentgateway_adapter::config::AdapterConfig {
+            endpoint,
+            auth_header,
+            ..Default::default()
+        };
+        let backend: Arc<dyn BackendPort + Send + Sync> =
+            Arc::new(thalamus_agentgateway_adapter::AgentgatewayAdapter::new(adapter_config));
+        app::build_with_backend(config, backend)
+    };
+
+    #[cfg(not(any(feature = "litellm", feature = "agentgateway")))]
     let app = app::build(config);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {

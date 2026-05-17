@@ -673,3 +673,278 @@ async fn concurrent_calls_do_not_block_async_runtime() {
         "concurrent /v1/call serialized: {elapsed:?} (blocking-on-async-runtime bug)"
     );
 }
+
+// === TH-S4: Agentgateway adapter + round-trip tests ===
+
+fn agentgateway_policy() -> Policy {
+    Policy {
+        id: "agentgateway-test-policy".to_owned(),
+        tenant: "RBX".to_owned(),
+        product: "test-product".to_owned(),
+        workflow: "test-workflow".to_owned(),
+        permitted_backends: vec![BackendHandle {
+            id: "test-model".to_owned(),
+            backend_type: BackendType::Model,
+        }],
+        budget: Budget {
+            max_tokens: 1000,
+            max_latency_ms: 5000,
+        },
+        context_grants: vec![ContextGrant {
+            source: "docs".to_owned(),
+            authorized: true,
+        }],
+        redaction_rules: vec![],
+        audit_required: true,
+        risk_threshold: RiskLevel::Medium,
+    }
+}
+
+fn make_agentgateway_adapter(mock_url: &str) -> Arc<dyn BackendPort + Send + Sync> {
+    let config = thalamus_agentgateway_adapter::config::AdapterConfig {
+        endpoint: mock_url.to_owned(),
+        model_map: std::collections::HashMap::new(),
+        timeout: Duration::from_secs(5),
+        auth_header: None,
+    };
+    Arc::new(thalamus_agentgateway_adapter::AgentgatewayAdapter::new(config))
+}
+
+fn openai_success_response() -> String {
+    serde_json::json!({
+        "choices": [{
+            "message": { "content": "Agentgateway mock analysis result" }
+        }],
+        "usage": { "total_tokens": 80 }
+    }).to_string()
+}
+
+#[tokio::test]
+async fn agentgateway_round_trip_happy_path() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server.mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(openai_success_response())
+        .create_async()
+        .await;
+
+    let backend = make_agentgateway_adapter(&server.url());
+    let config = make_config(vec![agentgateway_policy()]);
+    let app = app::build_with_backend(config, backend);
+
+    let body = test_request_body("RBX", "test-product", "test-workflow");
+    let (status, resp) = send_request(app.clone(), "POST", "/v1/call", Some(body)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["decision"].as_str().unwrap(), "Allow");
+    assert_eq!(resp["post_call"]["status"].as_str().unwrap(), "Valid");
+    assert_eq!(resp["post_call"]["risk_class"].as_str().unwrap(), "Low");
+    assert_eq!(
+        resp["backend_content"].as_str().unwrap(),
+        "Agentgateway mock analysis result"
+    );
+
+    let audit_id = resp["post_call"]["audit_id"].as_str().unwrap();
+
+    // Audit is retrievable by audit_id
+    let (status, audit_resp) = send_request(
+        app,
+        "GET",
+        &format!("/v1/audit/{}", audit_id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = audit_resp["events"].as_array().unwrap();
+    assert!(events.len() >= 2);
+
+    mock.assert();
+}
+
+#[tokio::test]
+async fn agentgateway_server_5xx_yields_invalid() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server.mock("POST", "/v1/chat/completions")
+        .with_status(500)
+        .with_body("internal error")
+        .create_async()
+        .await;
+
+    let backend = make_agentgateway_adapter(&server.url());
+    let config = make_config(vec![agentgateway_policy()]);
+    let app = app::build_with_backend(config, backend);
+
+    let body = test_request_body("RBX", "test-product", "test-workflow");
+    let (status, resp) = send_request(app, "POST", "/v1/call", Some(body)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["decision"].as_str().unwrap(), "Allow");
+    assert_eq!(resp["post_call"]["status"].as_str().unwrap(), "Invalid");
+    assert!(resp["backend_content"].as_str().unwrap().is_empty());
+
+    mock.assert();
+}
+
+#[tokio::test]
+async fn agentgateway_malformed_body_yields_invalid() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server.mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("this is not json")
+        .create_async()
+        .await;
+
+    let backend = make_agentgateway_adapter(&server.url());
+    let config = make_config(vec![agentgateway_policy()]);
+    let app = app::build_with_backend(config, backend);
+
+    let body = test_request_body("RBX", "test-product", "test-workflow");
+    let (status, resp) = send_request(app, "POST", "/v1/call", Some(body)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["decision"].as_str().unwrap(), "Allow");
+    assert_eq!(resp["post_call"]["status"].as_str().unwrap(), "Invalid");
+
+    mock.assert();
+}
+
+#[tokio::test]
+async fn agentgateway_over_budget_response_is_prohibited() {
+    let body = serde_json::json!({
+        "choices": [{
+            "message": { "content": "Expensive response" }
+        }],
+        "usage": { "total_tokens": 5000 }
+    }).to_string();
+
+    let mut server = mockito::Server::new_async().await;
+    let mock = server.mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let backend = make_agentgateway_adapter(&server.url());
+    let config = make_config(vec![agentgateway_policy()]);
+    let app = app::build_with_backend(config, backend);
+
+    let req = test_request_body("RBX", "test-product", "test-workflow");
+    let (status, resp) = send_request(app, "POST", "/v1/call", Some(req)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["post_call"]["status"].as_str().unwrap(), "Invalid");
+    assert_eq!(
+        resp["post_call"]["risk_class"].as_str().unwrap(),
+        "Prohibited"
+    );
+    assert!(!resp["post_call"]["executable_by_agent"].as_bool().unwrap());
+
+    mock.assert();
+}
+
+/// Swap test: the same request/flow works with the agentgateway backend exactly
+/// as with the litellm/counting backend. No caller or route difference.
+#[tokio::test]
+async fn backend_swap_agentgateway_produces_same_flow_as_litellm() {
+    // Build a shared policy and request body
+    let policy = Policy {
+        id: "swap-test-policy".to_owned(),
+        tenant: "RBX".to_owned(),
+        product: "swap-product".to_owned(),
+        workflow: "swap-workflow".to_owned(),
+        permitted_backends: vec![BackendHandle {
+            id: "swap-model".to_owned(),
+            backend_type: BackendType::Model,
+        }],
+        budget: Budget {
+            max_tokens: 1000,
+            max_latency_ms: 5000,
+        },
+        context_grants: vec![],
+        redaction_rules: vec![],
+        audit_required: true,
+        risk_threshold: RiskLevel::Low,
+    };
+
+    let success_body = serde_json::json!({
+        "choices": [{
+            "message": { "content": "Swap test response" }
+        }],
+        "usage": { "total_tokens": 42 }
+    }).to_string();
+
+    // --- Run with Agentgateway adapter ---
+    let mut ag_server = mockito::Server::new_async().await;
+    let ag_mock = ag_server.mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(&success_body)
+        .create_async()
+        .await;
+
+    let ag_backend = make_agentgateway_adapter(&ag_server.url());
+    let ag_config = make_config(vec![policy.clone()]);
+    let ag_app = app::build_with_backend(ag_config, ag_backend);
+
+    let req = json!({
+        "tenant": "RBX",
+        "product": "swap-product",
+        "user": "swap-user",
+        "workflow": "swap-workflow",
+        "intent": "swap-test",
+        "prompt": "Swap test prompt",
+        "requested_backend": {
+            "id": "swap-model",
+            "backend_type": "Model"
+        }
+    });
+
+    let (ag_status, ag_resp) =
+        send_request(ag_app.clone(), "POST", "/v1/call", Some(req.clone())).await;
+
+    // --- Run with LiteLLM adapter ---
+    let mut ll_server = mockito::Server::new_async().await;
+    let ll_mock = ll_server.mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(&success_body)
+        .create_async()
+        .await;
+
+    let ll_backend = make_litellm_adapter(&ll_server.url());
+    let ll_config = make_config(vec![policy.clone()]);
+    let ll_app = app::build_with_backend(ll_config, ll_backend);
+
+    let (ll_status, ll_resp) =
+        send_request(ll_app.clone(), "POST", "/v1/call", Some(req.clone())).await;
+
+    // Both produce identical structural outcomes
+    assert_eq!(ag_status, ll_status);
+    assert_eq!(ag_resp["decision"], ll_resp["decision"]);
+    assert_eq!(
+        ag_resp["post_call"]["status"],
+        ll_resp["post_call"]["status"]
+    );
+    assert_eq!(
+        ag_resp["post_call"]["risk_class"],
+        ll_resp["post_call"]["risk_class"]
+    );
+    assert_eq!(
+        ag_resp["post_call"]["executable_by_agent"],
+        ll_resp["post_call"]["executable_by_agent"]
+    );
+    assert_eq!(
+        ag_resp["post_call"]["schema_valid"],
+        ll_resp["post_call"]["schema_valid"]
+    );
+    assert_eq!(
+        ag_resp["backend_content"],
+        ll_resp["backend_content"]
+    );
+
+    ag_mock.assert();
+    ll_mock.assert();
+}

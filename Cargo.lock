@@ -1131,6 +1131,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "thalamus-agentgateway-adapter"
+version = "0.1.0"
+dependencies = [
+ "mockito",
+ "serde",
+ "serde_json",
+ "thalamus-core",
+ "tracing",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
 name = "thalamus-core"
 version = "0.2.0"
 dependencies = [
@@ -1162,6 +1175,7 @@ dependencies = [
  "mockito",
  "serde",
  "serde_json",
+ "thalamus-agentgateway-adapter",
  "thalamus-core",
  "thalamus-litellm-adapter",
  "time",

@@ -466,6 +466,62 @@ network.
 
 **Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S3.
 
+### 2026-05-17: Agentgateway LLM surface is OpenAI-compatible (TH-S4)
+
+**Context**: TH-S4 adds `thalamus-agentgateway-adapter` as a second BackendPort
+implementation. Agentgateway's LLM gateway routing surface exposes an
+OpenAI-compatible contract (POST /v1/chat/completions with standard
+request/response shape). This is the same common denominator the LiteLLM
+adapter targets.
+
+**Decision**: Implement against the OpenAI-compatible contract. The adapter
+sends `POST /v1/chat/completions` with model + messages, parses the standard
+choices/usage response shape. Endpoint URL and optional Authorization header
+are configurable.
+
+**Assumption to confirm**: This is based on Agentgateway's documented
+OpenAI-compatible LLM routing surface. The endpoint path and header names are
+configurable via `AdapterConfig`. If the real Agentgateway contract differs
+materially (e.g. different path, non-standard auth, extra required fields), the
+adapter config and wire types must be updated — but `thalamus-core` and
+`thalamus-server` route/app logic remain unchanged.
+
+**Decision Level**: Autonomous. **Status**: Accepted (assumption pending
+confirmation against official Agentgateway docs). **Refs**: TH-S4, ADR-0001.
+
+### 2026-05-17: Feature-driven backend selection with litellm priority (TH-S4)
+
+**Context**: Multiple BackendPort adapters now exist (litellm, agentgateway).
+The server must select which to wire at build time. Options: (1) Cargo feature
+flags, (2) runtime config, (3) both.
+
+**Decision**: Feature-driven selection. `litellm` feature takes priority when
+both are enabled (it was first; the `#[cfg]` ordering in main.rs reflects this).
+When no feature is enabled, `app::build()` runs with no backend (503 on Allow).
+This matches the TH-S3 pattern exactly and keeps the selection in main.rs only.
+
+Runtime config is deferred: a future slice can add a config-driven factory
+that reads a `backend` field and selects at runtime, but that requires more
+design (what if both adapters are compiled but only one is configured?). For
+now, compile-time selection via features is simple, explicit, and matches the
+existing litellm wiring.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S4.
+
+### 2026-05-17: Agentgateway adapter config shape (TH-S4)
+
+**Context**: The agentgateway adapter needs configuration for endpoint, model
+mapping, timeout, and authentication. This mirrors the LiteLLM adapter but adds
+an `auth_header` field.
+
+**Decision**: `AdapterConfig` fields: `endpoint` (base URL), `model_map`
+(handle ID → model name), `timeout`, `auth_header` (optional `Authorization`
+header value). Env vars for server wiring: `AGENTGATEWAY_ENDPOINT`,
+`AGENTGATEWAY_AUTH_HEADER`. No runtime config file parsing in the adapter —
+the server reads env vars and constructs the config in main.rs.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S4.
+
 ### Open items
 
 - Policy language/representation and evaluation semantics: not yet decided.

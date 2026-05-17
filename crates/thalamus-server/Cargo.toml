@@ -9,6 +9,7 @@ publish = false
 default = []
 dev = []
 litellm = ["thalamus-litellm-adapter"]
+agentgateway = ["thalamus-agentgateway-adapter"]
 
 [[bin]]
 name = "thalamus-server"
@@ -17,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 thalamus-core = { path = "../thalamus-core" }
 thalamus-litellm-adapter = { path = "../thalamus-litellm-adapter", optional = true }
+thalamus-agentgateway-adapter = { path = "../thalamus-agentgateway-adapter", optional = true }
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +34,4 @@ http-body-util = "0.1"
 http = "1"
 mockito = "1"
 thalamus-litellm-adapter = { path = "../thalamus-litellm-adapter" }
+thalamus-agentgateway-adapter = { path = "../thalamus-agentgateway-adapter" }

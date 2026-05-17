@@ -3,5 +3,6 @@ members = [
     "crates/thalamus-core",
     "crates/thalamus-server",
     "crates/thalamus-litellm-adapter",
+    "crates/thalamus-agentgateway-adapter",
 ]
 resolver = "2"
