@@ -21,6 +21,7 @@ pub struct AppState {
     pub audit_store: AuditStore,
 }
 
+#[allow(dead_code, reason = "used by default binary build and integration tests")]
 pub fn build(config: ServerConfig) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());

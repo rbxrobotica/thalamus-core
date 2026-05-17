@@ -2,5 +2,6 @@
 members = [
     "crates/thalamus-core",
     "crates/thalamus-server",
+    "crates/thalamus-litellm-adapter",
 ]
 resolver = "2"

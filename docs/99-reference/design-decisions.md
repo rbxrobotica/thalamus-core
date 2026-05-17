@@ -405,6 +405,67 @@ on no adapter and no gateway type.
 **Decision Level**: Reviewed (architectural, within ADR-0001). **Status**:
 Accepted.
 
+### 2026-05-17: ureq as HTTP client for LiteLLM adapter (TH-S3)
+
+**Context**: `BackendPort::call` is synchronous (returns `BackendResponse`, not a
+Future). The adapter must make real HTTP calls to LiteLLM within this sync trait.
+Options: reqwest (async, would need spawn_blocking bridge), ureq (sync, minimal),
+minreq (very minimal but less maintained).
+
+**Decision**: ureq v3. Sync, production-grade, minimal dependency tree, supports
+TLS via rustls, has timeout support. Matches the sync `BackendPort` trait directly.
+
+**Why not reqwest**: reqwest's blocking feature pulls in tokio, adding weight. The
+async client would need `tokio::task::spawn_blocking` wrapping, adding complexity
+for no benefit. ureq is purpose-built for sync use cases.
+
+**Timeout/retry**: `timeout_global` set to 30s (configurable). No retry in the
+adapter — retry policy belongs in the data plane (LiteLLM) or in a future
+circuit-breaker wrapper, not in the adapter.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S3.
+
+### 2026-05-17: Adapter error taxonomy (TH-S3)
+
+**Context**: The adapter must handle HTTP failures gracefully without panicking.
+`BackendPort::call` returns `BackendResponse` (no error variant), so errors are
+internal to the adapter: logged via tracing, surfaced as empty-content responses
+that post_call marks as Invalid.
+
+**Decision**: Five typed errors in `AdapterError`: Connection, Timeout,
+ServerError (4xx/5xx), MalformedResponse, ModelMapping. The public `call()`
+method catches all errors and returns an empty `BackendResponse`. The internal
+`call_internal()` returns `Result<BackendResponse, AdapterError>` for unit testing.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S3.
+
+### 2026-05-17: Audit-store correlation for post-call (TH-S3 follow-up ii)
+
+**Context**: `/v1/post-call` previously trusted caller-supplied budget and policy.
+This violated the control-plane/data-plane boundary: the caller could lie about
+budget to bypass post-call validation.
+
+**Decision**: `AuditStore` now stores a `PreCallRecord` (envelope + policy) keyed
+by `audit_id`. Both `/v1/pre-call` and `/v1/call` store records. `/v1/post-call`
+looks up the record and uses the stored policy/budget, not caller-supplied values.
+Unknown `audit_id` returns 404 with `UNKNOWN_AUDIT_ID` code. `PostCallRequest`
+simplified to: audit_id + content + tokens_used + latency_ms.
+
+**Decision Level**: Reviewed (within TH-S3 scope). **Status**: Accepted.
+**Refs**: TH-S3, ADR-0001 (control-plane boundary).
+
+### 2026-05-17: mockito for adapter tests (TH-S3)
+
+**Context**: Tests must exercise the full stack (HTTP routes + adapter + mock LiteLLM)
+without real network access. Options: mockito (HTTP mock server), wiremock-rs,
+manual TCP listener.
+
+**Decision**: mockito v1. Lightweight, async-compatible, request matching, runs
+on localhost. The adapter (ureq) connects to mockito's mock server. No real
+network.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S3.
+
 ### Open items
 
 - Policy language/representation and evaluation semantics: not yet decided.

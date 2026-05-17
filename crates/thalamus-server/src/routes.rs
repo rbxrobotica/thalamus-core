@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use thalamus_core::{
-    AuditId, BackendResponse, Budget, CallRequest, Envelope, PolicyDecision,
-    PreCallError, RiskLevel, TraceId,
+    AuditId, BackendResponse, CallRequest, PolicyDecision,
+    PreCallError,
 };
 
 use crate::app::AppState;
@@ -42,25 +42,9 @@ pub struct BudgetHintJson {
 #[derive(Debug, Deserialize)]
 pub struct PostCallRequest {
     pub audit_id: String,
-    pub trace_id: String,
     pub content: String,
     pub tokens_used: Option<u32>,
     pub latency_ms: Option<u64>,
-    pub policy_id: String,
-    pub policy_ref: String,
-    pub backend_handle_id: String,
-    pub backend_handle_type: String,
-    pub prompt: String,
-    pub budget_max_tokens: u32,
-    pub budget_max_latency_ms: u64,
-    pub authorized_context: Vec<ContextEntryJson>,
-    pub redaction_applied: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ContextEntryJson {
-    pub source: String,
-    pub content: String,
 }
 
 // === Response types ===
@@ -187,6 +171,15 @@ pub async fn pre_call(
 
     match outcome {
         Ok(outcome) => {
+            // Store pre-call record for post-call correlation
+            if let Some(ref envelope) = outcome.envelope {
+                state.audit_store.store_pre_call_record(
+                    outcome.audit_id.clone(),
+                    envelope.clone(),
+                    outcome.policy.clone(),
+                );
+            }
+
             let envelope_json = outcome.envelope.as_ref().map(|e| EnvelopeJson {
                 trace_id: e.trace_id.0.to_string(),
                 audit_id: e.audit_id.0.to_string(),
@@ -230,37 +223,35 @@ pub async fn pre_call(
 }
 
 /// POST /v1/post-call — validate an externally-executed response.
+///
+/// Correlates policy/budget from the in-memory audit store by audit_id.
+/// The caller supplies only audit_id and the response data; the envelope
+/// and policy come from the pre-call record stored during /v1/pre-call
+/// or /v1/call. Unknown audit_id => structured 4xx.
 pub async fn post_call(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PostCallRequest>,
-) -> impl IntoResponse {
-    let envelope = match build_envelope_from_request(&req) {
-        Some(e) => e,
-        None => {
+) -> Response {
+    let audit_id = match Uuid::parse_str(&req.audit_id) {
+        Ok(u) => AuditId(u),
+        Err(_) => {
             let resp = ErrorResponse {
-                error: "invalid request parameters".to_owned(),
-                code: "INVALID_REQUEST".to_owned(),
+                error: "invalid audit id".to_owned(),
+                code: "INVALID_AUDIT_ID".to_owned(),
             };
             return (StatusCode::BAD_REQUEST, Json(resp)).into_response();
         }
     };
 
-    // Build a minimal Policy from the request for post-call validation.
-    // The caller is responsible for providing the correct budget/policy_ref.
-    let policy = thalamus_core::Policy {
-        id: req.policy_id.clone(),
-        tenant: String::new(),
-        product: String::new(),
-        workflow: String::new(),
-        permitted_backends: vec![],
-        budget: Budget {
-            max_tokens: req.budget_max_tokens,
-            max_latency_ms: req.budget_max_latency_ms,
-        },
-        context_grants: vec![],
-        redaction_rules: vec![],
-        audit_required: true,
-        risk_threshold: RiskLevel::Medium,
+    let record = match state.audit_store.get_pre_call_record(&audit_id) {
+        Some(r) => r,
+        None => {
+            let resp = ErrorResponse {
+                error: format!("no pre-call record found for audit_id {}", req.audit_id),
+                code: "UNKNOWN_AUDIT_ID".to_owned(),
+            };
+            return (StatusCode::NOT_FOUND, Json(resp)).into_response();
+        }
     };
 
     let response = BackendResponse {
@@ -271,8 +262,8 @@ pub async fn post_call(
 
     let result = thalamus_core::post_call(
         &response,
-        &envelope,
-        &policy,
+        &record.envelope,
+        &record.policy,
         state.audit_port.as_ref(),
         state.eval_port.as_ref(),
         state.obs_port.as_ref(),
@@ -283,7 +274,7 @@ pub async fn post_call(
         risk_class: format!("{:?}", result.risk_class),
         executable_by_agent: result.executable_by_agent,
         schema_valid: result.schema_valid,
-        audit_id: envelope.audit_id.0.to_string(),
+        audit_id: audit_id.0.to_string(),
     };
 
     (StatusCode::OK, Json(resp)).into_response()
@@ -322,6 +313,15 @@ pub async fn full_call(
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(resp)).into_response();
         }
     };
+
+    // Store pre-call record for post-call correlation (Allow/AllowWithReview)
+    if let Some(ref envelope) = outcome.envelope {
+        state.audit_store.store_pre_call_record(
+            outcome.audit_id.clone(),
+            envelope.clone(),
+            outcome.policy.clone(),
+        );
+    }
 
     match &outcome.decision {
         PolicyDecision::Deny { reason, policy_ref } => {
@@ -363,7 +363,20 @@ pub async fn full_call(
     }
 
     // Allow path: backend call + mandatory post_call
-    let envelope = outcome.envelope.as_ref().expect("Allow must produce envelope");
+    let envelope = match outcome.envelope.as_ref() {
+        Some(e) => e,
+        None => {
+            tracing::error!(
+                audit_id = %outcome.audit_id.0,
+                "Allow decision produced no envelope — invariant violation"
+            );
+            let resp = ErrorResponse {
+                error: "allow decision produced no envelope".to_owned(),
+                code: "INVARIANT_VIOLATION".to_owned(),
+            };
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response();
+        }
+    };
 
     let backend = match state.backend_port.as_ref() {
         Some(b) => b,
@@ -503,41 +516,4 @@ fn decide_to_call_request(req: &DecideRequest) -> CallRequest {
             max_latency_ms: h.max_latency_ms,
         }),
     }
-}
-
-fn build_envelope_from_request(req: &PostCallRequest) -> Option<Envelope> {
-    let trace_uuid = Uuid::parse_str(&req.trace_id).ok()?;
-    let audit_uuid = Uuid::parse_str(&req.audit_id).ok()?;
-
-    let backend_type = match req.backend_handle_type.as_str() {
-        "Model" => thalamus_core::BackendType::Model,
-        "Tool" => thalamus_core::BackendType::Tool,
-        "McpServer" => thalamus_core::BackendType::McpServer,
-        "A2AAgent" => thalamus_core::BackendType::A2AAgent,
-        other => thalamus_core::BackendType::Custom(other.to_owned()),
-    };
-
-    Some(Envelope {
-        trace_id: TraceId(trace_uuid),
-        audit_id: AuditId(audit_uuid),
-        backend_handle: thalamus_core::BackendHandle {
-            id: req.backend_handle_id.clone(),
-            backend_type,
-        },
-        prompt: req.prompt.clone(),
-        authorized_context: req
-            .authorized_context
-            .iter()
-            .map(|c| thalamus_core::ContextEntry {
-                source: c.source.clone(),
-                content: c.content.clone(),
-            })
-            .collect(),
-        redaction_applied: req.redaction_applied,
-        policy_ref: req.policy_ref.clone(),
-        budget: thalamus_core::Budget {
-            max_tokens: req.budget_max_tokens,
-            max_latency_ms: req.budget_max_latency_ms,
-        },
-    })
 }
