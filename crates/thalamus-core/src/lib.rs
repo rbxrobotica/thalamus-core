@@ -10,6 +10,6 @@ pub use domain::{
     ContextEntry, Envelope, PostCallResult, PostCallStatus, PolicyDecision, RiskLevel,
     StrategosEvent, TraceId,
 };
-pub use flow::{post_call, pre_call, PreCallOutcome};
+pub use flow::{post_call, pre_call, PreCallError, PreCallOutcome};
 pub use policy::{Budget, ContextGrant, Policy, PolicyEngine, RedactionAction, RedactionRule};
 pub use ports::{AuditPort, BackendPort, ContextPort, EvalPort, ObservabilityPort, PolicyPort};

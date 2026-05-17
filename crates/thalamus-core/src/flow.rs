@@ -9,7 +9,30 @@ use crate::policy::{Policy, RedactionAction};
 use crate::ports::{AuditPort, ContextPort, EvalPort, ObservabilityPort, PolicyPort};
 use time::OffsetDateTime;
 
+/// Typed errors from the pre-call phase.
+#[derive(Debug, Clone)]
+pub enum PreCallError {
+    NoPermittedBackend {
+        tenant: String,
+        product: String,
+        policy_id: String,
+    },
+}
+
+impl std::fmt::Display for PreCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PreCallError::NoPermittedBackend { tenant, product, policy_id } => {
+                write!(f, "policy {policy_id} for tenant {tenant} product {product} has no permitted backends")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PreCallError {}
+
 /// Outcome of the pre-call phase (steps 1-10).
+#[derive(Debug)]
 pub struct PreCallOutcome {
     pub decision: PolicyDecision,
     pub envelope: Option<Envelope>,
@@ -30,7 +53,7 @@ pub fn pre_call(
     context_port: &dyn ContextPort,
     audit_port: &dyn AuditPort,
     _obs_port: &dyn ObservabilityPort,
-) -> PreCallOutcome {
+) -> Result<PreCallOutcome, PreCallError> {
     // 1-2: identity and intent carried in request
     // 3: resolve applicable policy
     let policy = policy_port.resolve(request);
@@ -58,17 +81,17 @@ pub fn pre_call(
                 });
             }
 
-            PreCallOutcome {
+            Ok(PreCallOutcome {
                 decision,
                 envelope: None,
                 trace_id,
                 audit_id,
                 policy,
-            }
+            })
         }
         PolicyDecision::Allow | PolicyDecision::AllowWithReview { .. } => {
             // 6: select backend from policy
-            let backend_handle = select_backend(request, &policy);
+            let backend_handle = select_backend(request, &policy)?;
 
             // 7: fetch authorized context
             let context = context_port.fetch(&policy.context_grants);
@@ -101,13 +124,13 @@ pub fn pre_call(
                 });
             }
 
-            PreCallOutcome {
+            Ok(PreCallOutcome {
                 decision,
                 envelope: Some(envelope),
                 trace_id,
                 audit_id,
                 policy,
-            }
+            })
         }
     }
 }
@@ -193,21 +216,28 @@ pub fn post_call(
 
 /// Select the backend from policy. Uses the first permitted backend
 /// or the caller's requested backend if allowed.
-fn select_backend(request: &CallRequest, policy: &Policy) -> crate::domain::BackendHandle {
+fn select_backend(
+    request: &CallRequest,
+    policy: &Policy,
+) -> Result<crate::domain::BackendHandle, PreCallError> {
     if let Some(ref requested) = request.requested_backend {
         if policy
             .permitted_backends
             .iter()
             .any(|b| b.id == requested.id)
         {
-            return requested.clone();
+            return Ok(requested.clone());
         }
     }
     policy
         .permitted_backends
         .first()
-        .expect("policy must have at least one permitted backend")
-        .clone()
+        .cloned()
+        .ok_or_else(|| PreCallError::NoPermittedBackend {
+            tenant: request.tenant.clone(),
+            product: request.product.clone(),
+            policy_id: policy.id.clone(),
+        })
 }
 
 /// Apply redaction rules to context entries. Block-level rules remove
@@ -438,7 +468,7 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        );
+        ).unwrap();
 
         assert!(matches!(outcome.decision, PolicyDecision::Deny { .. }));
         assert!(outcome.envelope.is_none());
@@ -470,7 +500,7 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        );
+        ).unwrap();
 
         assert!(matches!(outcome.decision, PolicyDecision::Allow));
         let envelope = outcome.envelope.expect("Allow must produce envelope");
@@ -507,7 +537,7 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        );
+        ).unwrap();
 
         assert!(matches!(
             outcome.decision,
@@ -547,7 +577,7 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        );
+        ).unwrap();
 
         let envelope = outcome.envelope.unwrap();
         let response = backend.call(&envelope);
@@ -579,7 +609,7 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        );
+        ).unwrap();
 
         let envelope = outcome.envelope.unwrap();
         let response = backend.call(&envelope);
@@ -611,7 +641,7 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        );
+        ).unwrap();
 
         let envelope = outcome.envelope.unwrap();
         let response = backend.call(&envelope);
@@ -650,7 +680,7 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        );
+        ).unwrap();
 
         let envelope = outcome.envelope.unwrap();
         assert_eq!(envelope.authorized_context.len(), 1);
@@ -671,7 +701,7 @@ mod tests {
             backend_type: BackendType::Model,
         });
 
-        let outcome = pre_call(&req, &policy_port, &context_port, &audit_port, &FakeObsPort);
+        let outcome = pre_call(&req, &policy_port, &context_port, &audit_port, &FakeObsPort).unwrap();
 
         let envelope = outcome.envelope.unwrap();
         assert_eq!(envelope.backend_handle.id, "claude-opus");
@@ -690,10 +720,32 @@ mod tests {
             backend_type: BackendType::Model,
         });
 
-        let outcome = pre_call(&req, &policy_port, &context_port, &audit_port, &FakeObsPort);
+        let outcome = pre_call(&req, &policy_port, &context_port, &audit_port, &FakeObsPort).unwrap();
 
         let envelope = outcome.envelope.unwrap();
         // Falls back to first permitted backend since requested is not in policy
         assert_eq!(envelope.backend_handle.id, "claude-opus");
+    }
+
+    #[test]
+    fn empty_permitted_backends_returns_error() {
+        let mut policy = test_policy();
+        policy.permitted_backends = vec![];
+
+        let policy_port = FakePolicyPort::allowing(policy);
+        let context_port = FakeContextPort { entries: vec![] };
+        let audit_port = FakeAuditPort::new();
+
+        let result = pre_call(
+            &test_request(),
+            &policy_port,
+            &context_port,
+            &audit_port,
+            &FakeObsPort,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, PreCallError::NoPermittedBackend { .. }));
     }
 }
