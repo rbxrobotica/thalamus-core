@@ -522,6 +522,58 @@ the server reads env vars and constructs the config in main.rs.
 
 **Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S4.
 
+### 2026-05-17: Python SDK uses httpx + pydantic v2 (TH-S5)
+
+**Context**: The Python SDK needs an HTTP client and typed models. Options:
+(1) requests + dataclasses (heavier HTTP lib, no validation),
+(2) httpx + pydantic v2 (modern sync client, validated models),
+(3) aiohttp + attrs (async-first, over-engineered for a thin SDK).
+
+**Decision**: httpx (sync) + pydantic v2. httpx is the modern Python HTTP client
+with a clean sync API, timeout support, and a well-maintained mocking library
+(respx). pydantic v2 provides validated, typed models that serialize/deserialize
+JSON directly. Sync is chosen over async because the SDK is a thin transport
+client; callers can wrap in asyncio if needed.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S5, ADR-0001.
+
+### 2026-05-17: TypeScript SDK uses native fetch, no runtime deps (TH-S5)
+
+**Context**: The TS SDK needs HTTP and type systems. Options:
+(1) native fetch + plain interfaces (zero deps, Node 18+),
+(2) undici + zod (extra dep, validation),
+(3) axios + io-ts (heavier).
+
+**Decision**: Native fetch + plain TypeScript interfaces. Node 18+ ships fetch
+globally. The SDK is a thin transport client — no runtime validation library is
+needed. Types are enforced at compile time by tsc. Zero runtime dependencies
+keeps the package minimal.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S5, ADR-0001.
+
+### 2026-05-17: Shared contract fixture in JSON (TH-S5)
+
+**Context**: Both SDKs need to verify they match the server wire contract.
+Options: (1) separate fixtures per SDK, (2) shared fixture, (3) codegen from
+Rust types.
+
+**Decision**: Single shared `sdks/contract-fixture.json` derived from
+routes.rs handler structs. Both SDK test suites consume it. This makes
+server↔SDK drift detectable: if either SDK diverges from the fixture, tests
+fail. Codegen is out of scope for TH-S5.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S5.
+
+### 2026-05-17: Vitest for TypeScript SDK tests (TH-S5)
+
+**Context**: TS SDK needs a test runner. Options: vitest, jest.
+Vitest is ESM-native, faster, and has first-class TypeScript support without
+babel transforms. Jest requires CJS interop for ESM packages.
+
+**Decision**: vitest. Matches ESM module system, zero config for TS.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S5.
+
 ### Open items
 
 - Policy language/representation and evaluation semantics: not yet decided.
