@@ -40,16 +40,11 @@ pub fn build(config: ServerConfig) -> Router {
         audit_store,
     });
 
-    Router::new()
-        .route("/v1/decide", post(routes::decide))
-        .route("/v1/pre-call", post(routes::pre_call))
-        .route("/v1/post-call", post(routes::post_call))
-        .route("/v1/call", post(routes::full_call))
-        .route("/v1/audit/{id}", get(routes::get_audit))
-        .with_state(state)
+    build_router(state)
 }
 
 /// Build an app for testing with a custom backend port.
+#[allow(dead_code, reason = "used by integration tests")]
 pub fn build_with_backend(
     config: ServerConfig,
     backend: Arc<dyn BackendPort + Send + Sync>,
@@ -71,6 +66,35 @@ pub fn build_with_backend(
         audit_store,
     });
 
+    build_router(state)
+}
+
+/// Build an app for testing with custom policy and backend ports.
+#[allow(dead_code, reason = "used by integration tests")]
+pub fn build_with_ports(
+    policy_port: Arc<dyn thalamus_core::PolicyPort + Send + Sync>,
+    backend: Arc<dyn BackendPort + Send + Sync>,
+) -> Router {
+    let context_port = Arc::new(ports::StaticContextPort::empty());
+    let audit_port = Arc::new(ports::InMemoryAuditPort::new());
+    let audit_store = audit_port.store();
+    let eval_port = Arc::new(ports::LoggingEvalPort);
+    let obs_port = Arc::new(ports::LoggingObservabilityPort);
+
+    let state = Arc::new(AppState {
+        policy_port,
+        context_port,
+        audit_port,
+        eval_port,
+        obs_port,
+        backend_port: Some(backend),
+        audit_store,
+    });
+
+    build_router(state)
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/decide", post(routes::decide))
         .route("/v1/pre-call", post(routes::pre_call))

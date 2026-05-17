@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use thalamus_core::{
-    BackendHandle, BackendPort, BackendResponse, BackendType, Budget, ContextGrant,
-    Envelope, Policy, RiskLevel,
+    BackendHandle, BackendPort, BackendResponse, BackendType, Budget, CallRequest,
+    ContextGrant, Envelope, Policy, PolicyDecision, PolicyPort, RiskLevel,
 };
 
 use thalamus_server::app;
@@ -37,6 +37,51 @@ impl BackendPort for CountingBackendPort {
     fn call(&self, _envelope: &Envelope) -> BackendResponse {
         *self.calls.lock().unwrap() += 1;
         self.response.clone()
+    }
+}
+
+/// Fake PolicyPort that returns AllowWithReview for matching requests,
+/// Deny otherwise. Used to test the AllowWithReview code path without
+/// inventing config-driven review semantics.
+struct FakeReviewPolicyPort {
+    policy: Policy,
+}
+
+impl PolicyPort for FakeReviewPolicyPort {
+    fn resolve(&self, request: &CallRequest) -> Policy {
+        if self.policy.tenant == request.tenant
+            && self.policy.product == request.product
+            && self.policy.workflow == request.workflow
+        {
+            self.policy.clone()
+        } else {
+            Policy {
+                id: "no-match".to_owned(),
+                tenant: request.tenant.clone(),
+                product: request.product.clone(),
+                workflow: request.workflow.clone(),
+                permitted_backends: vec![],
+                budget: Budget { max_tokens: 0, max_latency_ms: 0 },
+                context_grants: vec![],
+                redaction_rules: vec![],
+                audit_required: false,
+                risk_threshold: RiskLevel::Low,
+            }
+        }
+    }
+
+    fn evaluate(&self, _request: &CallRequest, policy: &Policy) -> PolicyDecision {
+        if policy.id != "no-match" {
+            PolicyDecision::AllowWithReview {
+                review_reason: "test-triggered human review".to_owned(),
+                policy_ref: policy.id.clone(),
+            }
+        } else {
+            PolicyDecision::Deny {
+                reason: "no matching policy".to_owned(),
+                policy_ref: "no-match".to_owned(),
+            }
+        }
     }
 }
 
@@ -144,29 +189,36 @@ async fn call_deny_returns_structured_deny_no_backend_call() {
 
 #[tokio::test]
 async fn call_allow_with_review_no_backend_needs_human_review() {
-    // Create a policy that will match but produce AllowWithReview
-    // Since ConfigPolicyPort only returns Allow or Deny, we test the
-    // structural enforcement via a custom test. The server's policy
-    // implementation always does Allow for matching policies, so we
-    // verify the code path exists through the /v1/call flow structure.
-    //
-    // NOTE: The AllowWithReview path is structurally enforced in the route
-    // handler — it never calls backend. We verify the deny path as proxy
-    // and trust the match arm structure (identical pattern to deny).
-    let config = make_config(vec![test_policy()]);
+    // Inject a FakeReviewPolicyPort that returns AllowWithReview for matching
+    // requests — this genuinely exercises the AllowWithReview arm of full_call.
+    let policy = test_policy();
+    let policy_port = Arc::new(FakeReviewPolicyPort { policy });
     let backend = Arc::new(CountingBackendPort::new(BackendResponse {
         content: "should not appear".to_owned(),
         tokens_used: None,
         latency_ms: None,
     }));
-    let app = app::build_with_backend(config, backend.clone());
+    let app = app::build_with_ports(policy_port, backend.clone());
 
-    // With no matching policy, it's Deny — 0 backend calls
-    let body = test_request_body("no-match", "no-match", "no-match");
+    // Request matching the fake policy tenant/product/workflow
+    let body = test_request_body("RBX", "test-product", "test-workflow");
     let (status, resp) = send_request(app, "POST", "/v1/call", Some(body)).await;
 
+    // 1. HTTP 200
     assert_eq!(status, StatusCode::OK);
-    assert!(resp["decision"].as_str().unwrap().starts_with("Deny"));
+
+    // 2. decision starts with "AllowWithReview" and contains "review_id:"
+    let decision = resp["decision"].as_str().unwrap();
+    assert!(decision.starts_with("AllowWithReview"), "decision was: {decision}");
+    assert!(decision.contains("review_id:"), "decision missing review_id: {decision}");
+
+    // 3. post_call.status == "NeedsHumanReview"
+    assert_eq!(resp["post_call"]["status"].as_str().unwrap(), "NeedsHumanReview");
+
+    // 4. backend_content is null (no backend call)
+    assert!(resp["backend_content"].is_null());
+
+    // 5. BackendPort was never called
     assert_eq!(backend.call_count(), 0);
 }
 
