@@ -54,12 +54,8 @@ impl PolicyPort for ConfigPolicyPort {
                 policy_ref: "no-match".to_owned(),
             };
         }
-        if policy.permitted_backends.is_empty() {
-            return PolicyDecision::Deny {
-                reason: "policy has no permitted backends".to_owned(),
-                policy_ref: policy.id.clone(),
-            };
-        }
+        // Empty permitted_backends is handled by select_backend returning
+        // PreCallError::NoPermittedBackend, which produces a typed 4xx.
         PolicyDecision::Allow
     }
 }

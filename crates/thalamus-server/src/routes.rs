@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use thalamus_core::{
-    AuditId, BackendResponse, CallRequest, Envelope, PolicyDecision,
-    PreCallError, TraceId,
+    AuditId, BackendResponse, Budget, CallRequest, Envelope, PolicyDecision,
+    PreCallError, RiskLevel, TraceId,
 };
 
 use crate::app::AppState;
@@ -245,16 +245,23 @@ pub async fn post_call(
         }
     };
 
-    let policy = state.policy_port.resolve(&CallRequest {
-        tenant: "external".to_owned(),
-        product: "external".to_owned(),
-        user: String::new(),
+    // Build a minimal Policy from the request for post-call validation.
+    // The caller is responsible for providing the correct budget/policy_ref.
+    let policy = thalamus_core::Policy {
+        id: req.policy_id.clone(),
+        tenant: String::new(),
+        product: String::new(),
         workflow: String::new(),
-        intent: String::new(),
-        prompt: String::new(),
-        requested_backend: None,
-        budget_hint: None,
-    });
+        permitted_backends: vec![],
+        budget: Budget {
+            max_tokens: req.budget_max_tokens,
+            max_latency_ms: req.budget_max_latency_ms,
+        },
+        context_grants: vec![],
+        redaction_rules: vec![],
+        audit_required: true,
+        risk_threshold: RiskLevel::Medium,
+    };
 
     let response = BackendResponse {
         content: req.content,
