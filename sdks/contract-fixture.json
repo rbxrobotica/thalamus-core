@@ -1,0 +1,364 @@
+{
+  "_comment": "TH-S5 contract fixture. Derived from crates/thalamus-server/src/routes.rs at fece79c. Both SDK test suites consume this file to detect wire-contract drift.",
+  "_regeneration": "Re-derive from routes.rs handler structs (DecideRequest, PostCallRequest, DecideResponse, PreCallResponse, EnvelopeJson, PostCallResponse, FullCallResponse, AuditResponse, ErrorResponse) whenever the server API changes.",
+
+  "decide_allow": {
+    "endpoint": "POST /v1/decide",
+    "request": {
+      "tenant": "rbx",
+      "product": "robson",
+      "user": "agent-1",
+      "workflow": "trade-analysis",
+      "intent": "market-summary",
+      "prompt": "Summarize BTC market conditions",
+      "requested_backend": { "id": "gpt-4o", "backend_type": "Model" },
+      "budget_hint": { "max_tokens": 4096, "max_latency_ms": 30000 }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "decision": "Allow",
+        "policy_id": "rbx-robson-default",
+        "reason": null,
+        "review_reason": null,
+        "policy_ref": null
+      }
+    }
+  },
+
+  "decide_deny": {
+    "endpoint": "POST /v1/decide",
+    "request": {
+      "tenant": "rbx",
+      "product": "robson",
+      "user": "agent-1",
+      "workflow": "trade-analysis",
+      "intent": "market-summary",
+      "prompt": "Summarize BTC market conditions",
+      "requested_backend": null,
+      "budget_hint": null
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "decision": "Deny",
+        "policy_id": "rbx-robson-restricted",
+        "reason": "budget exceeded",
+        "review_reason": null,
+        "policy_ref": "rbx-robson-budget-v2"
+      }
+    }
+  },
+
+  "decide_allow_with_review": {
+    "endpoint": "POST /v1/decide",
+    "request": {
+      "tenant": "rbx",
+      "product": "strategos",
+      "user": "analyst-1",
+      "workflow": "strategic-plan",
+      "intent": "business-analysis",
+      "prompt": "Analyze Q3 expansion strategy",
+      "requested_backend": { "id": "claude-opus", "backend_type": "Model" },
+      "budget_hint": null
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "decision": "AllowWithReview",
+        "policy_id": "rbx-strategos-high-sensitivity",
+        "reason": null,
+        "review_reason": "high sensitivity classification requires human review",
+        "policy_ref": "rbx-strategos-review-v1"
+      }
+    }
+  },
+
+  "pre_call_allow": {
+    "endpoint": "POST /v1/pre-call",
+    "request": {
+      "tenant": "rbx",
+      "product": "robson",
+      "user": "agent-1",
+      "workflow": "trade-analysis",
+      "intent": "market-summary",
+      "prompt": "Summarize BTC market conditions",
+      "requested_backend": { "id": "gpt-4o", "backend_type": "Model" },
+      "budget_hint": { "max_tokens": 4096, "max_latency_ms": 30000 }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "decision": "Allow",
+        "trace_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "audit_id": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+        "policy_id": "rbx-robson-default",
+        "envelope": {
+          "trace_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+          "audit_id": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+          "backend_handle_id": "gpt-4o",
+          "prompt": "Summarize BTC market conditions",
+          "policy_ref": "rbx-robson-default",
+          "budget_max_tokens": 4096,
+          "budget_max_latency_ms": 30000
+        },
+        "review_reason": null,
+        "policy_ref": null
+      }
+    }
+  },
+
+  "pre_call_no_permitted_backends": {
+    "endpoint": "POST /v1/pre-call",
+    "request": {
+      "tenant": "rbx",
+      "product": "unknown-product",
+      "user": "agent-1",
+      "workflow": "test",
+      "intent": "test",
+      "prompt": "test",
+      "requested_backend": null,
+      "budget_hint": null
+    },
+    "response": {
+      "status": 422,
+      "body": {
+        "error": "no permitted backends for tenant rbx product unknown-product",
+        "code": "NO_PERMITTED_BACKENDS"
+      }
+    }
+  },
+
+  "post_call_valid": {
+    "endpoint": "POST /v1/post-call",
+    "request": {
+      "audit_id": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+      "content": "BTC is trading at $95,000 with moderate volatility...",
+      "tokens_used": 512,
+      "latency_ms": 1200
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "status": "Valid",
+        "risk_class": "Low",
+        "executable_by_agent": true,
+        "schema_valid": true,
+        "audit_id": "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+      }
+    }
+  },
+
+  "post_call_unknown_audit": {
+    "endpoint": "POST /v1/post-call",
+    "request": {
+      "audit_id": "00000000-0000-0000-0000-000000000000",
+      "content": "orphan response",
+      "tokens_used": null,
+      "latency_ms": null
+    },
+    "response": {
+      "status": 404,
+      "body": {
+        "error": "no pre-call record found for audit_id 00000000-0000-0000-0000-000000000000",
+        "code": "UNKNOWN_AUDIT_ID"
+      }
+    }
+  },
+
+  "post_call_invalid_audit_id": {
+    "endpoint": "POST /v1/post-call",
+    "request": {
+      "audit_id": "not-a-uuid",
+      "content": "test",
+      "tokens_used": null,
+      "latency_ms": null
+    },
+    "response": {
+      "status": 400,
+      "body": {
+        "error": "invalid audit id",
+        "code": "INVALID_AUDIT_ID"
+      }
+    }
+  },
+
+  "full_call_allow": {
+    "endpoint": "POST /v1/call",
+    "request": {
+      "tenant": "rbx",
+      "product": "robson",
+      "user": "agent-1",
+      "workflow": "trade-analysis",
+      "intent": "market-summary",
+      "prompt": "Summarize BTC market conditions",
+      "requested_backend": { "id": "gpt-4o", "backend_type": "Model" },
+      "budget_hint": { "max_tokens": 4096, "max_latency_ms": 30000 }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "decision": "Allow",
+        "post_call": {
+          "status": "Valid",
+          "risk_class": "Low",
+          "executable_by_agent": true,
+          "schema_valid": true,
+          "audit_id": "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+        },
+        "backend_content": "BTC is trading at $95,000 with moderate volatility..."
+      }
+    }
+  },
+
+  "full_call_deny": {
+    "endpoint": "POST /v1/call",
+    "request": {
+      "tenant": "rbx",
+      "product": "robson",
+      "user": "agent-1",
+      "workflow": "trade-analysis",
+      "intent": "market-summary",
+      "prompt": "Summarize BTC market conditions",
+      "requested_backend": null,
+      "budget_hint": null
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "decision": "Deny: budget exceeded (ref: rbx-robson-budget-v2)",
+        "post_call": {
+          "status": "Denied",
+          "risk_class": "N/A",
+          "executable_by_agent": false,
+          "schema_valid": false,
+          "audit_id": "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+        },
+        "backend_content": null
+      }
+    }
+  },
+
+  "full_call_allow_with_review": {
+    "endpoint": "POST /v1/call",
+    "request": {
+      "tenant": "rbx",
+      "product": "strategos",
+      "user": "analyst-1",
+      "workflow": "strategic-plan",
+      "intent": "business-analysis",
+      "prompt": "Analyze Q3 expansion strategy",
+      "requested_backend": { "id": "claude-opus", "backend_type": "Model" },
+      "budget_hint": null
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "decision": "AllowWithReview: high sensitivity classification requires human review (ref: rbx-strategos-review-v1, review_id: f1e2d3c4-b5a6-7890-abcd-ef1234567890)",
+        "post_call": {
+          "status": "NeedsHumanReview",
+          "risk_class": "N/A",
+          "executable_by_agent": false,
+          "schema_valid": false,
+          "audit_id": "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+        },
+        "backend_content": null
+      }
+    }
+  },
+
+  "full_call_no_permitted_backends": {
+    "endpoint": "POST /v1/call",
+    "request": {
+      "tenant": "rbx",
+      "product": "unknown-product",
+      "user": "agent-1",
+      "workflow": "test",
+      "intent": "test",
+      "prompt": "test",
+      "requested_backend": null,
+      "budget_hint": null
+    },
+    "response": {
+      "status": 422,
+      "body": {
+        "error": "no permitted backends for tenant rbx product unknown-product (policy rbx-default)",
+        "code": "NO_PERMITTED_BACKENDS"
+      }
+    }
+  },
+
+  "full_call_no_backend_configured": {
+    "endpoint": "POST /v1/call",
+    "request": {
+      "tenant": "rbx",
+      "product": "robson",
+      "user": "agent-1",
+      "workflow": "trade-analysis",
+      "intent": "market-summary",
+      "prompt": "Summarize BTC market conditions",
+      "requested_backend": { "id": "gpt-4o", "backend_type": "Model" },
+      "budget_hint": { "max_tokens": 4096, "max_latency_ms": 30000 }
+    },
+    "response": {
+      "status": 503,
+      "body": {
+        "error": "no backend configured",
+        "code": "NO_BACKEND"
+      }
+    }
+  },
+
+  "audit_found": {
+    "endpoint": "GET /v1/audit/{id}",
+    "request": {
+      "audit_id": "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "audit_id": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+        "events": [
+          {
+            "kind": "PreCallDecision",
+            "trace_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "timestamp": "2026-05-17T12:00:00Z",
+            "details": {
+              "tenant": "rbx",
+              "product": "robson",
+              "workflow": "trade-analysis",
+              "policy_ref": "rbx-robson-default",
+              "decision": "Allow",
+              "backend": "gpt-4o"
+            }
+          },
+          {
+            "kind": "PostCallOutcome",
+            "trace_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "timestamp": "2026-05-17T12:00:01Z",
+            "details": {
+              "status": "Valid",
+              "risk_class": "Low",
+              "executable_by_agent": true,
+              "schema_valid": true
+            }
+          }
+        ]
+      }
+    }
+  },
+
+  "audit_invalid_id": {
+    "endpoint": "GET /v1/audit/{id}",
+    "request": {
+      "audit_id": "not-a-uuid"
+    },
+    "response": {
+      "status": 400,
+      "body": {
+        "error": "invalid audit id",
+        "code": "INVALID_AUDIT_ID"
+      }
+    }
+  }
+}
