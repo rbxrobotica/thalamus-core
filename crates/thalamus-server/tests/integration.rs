@@ -630,3 +630,46 @@ async fn post_call_unknown_audit_id_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(resp["code"].as_str().unwrap(), "UNKNOWN_AUDIT_ID");
 }
+
+struct SlowBackendPort {
+    delay: std::time::Duration,
+    response: BackendResponse,
+}
+
+impl BackendPort for SlowBackendPort {
+    fn call(&self, _envelope: &Envelope) -> BackendResponse {
+        std::thread::sleep(self.delay);
+        self.response.clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn concurrent_calls_do_not_block_async_runtime() {
+    let config = make_config(vec![test_policy()]);
+    let backend = Arc::new(SlowBackendPort {
+        delay: std::time::Duration::from_millis(400),
+        response: BackendResponse {
+            content: "slow result".to_owned(),
+            tokens_used: Some(100),
+            latency_ms: Some(400),
+        },
+    });
+    let app = app::build_with_backend(config, backend);
+    let body = test_request_body("RBX", "test-product", "test-workflow");
+
+    let start = std::time::Instant::now();
+    let (r1, r2) = tokio::join!(
+        send_request(app.clone(), "POST", "/v1/call", Some(body.clone())),
+        send_request(app.clone(), "POST", "/v1/call", Some(body.clone())),
+    );
+    let elapsed = start.elapsed();
+
+    assert_eq!(r1.0, StatusCode::OK);
+    assert_eq!(r2.0, StatusCode::OK);
+    assert_eq!(r1.1["post_call"]["status"].as_str().unwrap(), "Valid");
+    assert_eq!(r2.1["post_call"]["status"].as_str().unwrap(), "Valid");
+    assert!(
+        elapsed < std::time::Duration::from_millis(700),
+        "concurrent /v1/call serialized: {elapsed:?} (blocking-on-async-runtime bug)"
+    );
+}

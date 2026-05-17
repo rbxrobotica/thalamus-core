@@ -379,7 +379,7 @@ pub async fn full_call(
     };
 
     let backend = match state.backend_port.as_ref() {
-        Some(b) => b,
+        Some(b) => std::sync::Arc::clone(b),
         None => {
             let resp = ErrorResponse {
                 error: "no backend configured".to_owned(),
@@ -389,7 +389,27 @@ pub async fn full_call(
         }
     };
 
-    let backend_response = backend.call(envelope);
+    // Run the synchronous BackendPort off the async runtime so a slow data
+    // plane (real LLM latency) cannot starve the tokio worker.
+    let envelope_for_backend = envelope.clone();
+    let backend_response = match tokio::task::spawn_blocking(move || {
+        backend.call(&envelope_for_backend)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(_join_err) => {
+            tracing::error!(
+                audit_id = %outcome.audit_id.0,
+                "backend blocking task panicked"
+            );
+            let resp = ErrorResponse {
+                error: "backend execution task failed".to_owned(),
+                code: "BACKEND_TASK_FAILED".to_owned(),
+            };
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response();
+        }
+    };
 
     // post_call is non-bypassable on the Allow path
     let post_result = thalamus_core::post_call(
