@@ -638,6 +638,86 @@ crossbeam's API is cleaner and the dep is minimal.
 
 **Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S6a.
 
+### 2026-05-18: EvalSink trait — abstract sink for eval forwarding (TH-S6b)
+
+**Context**: TH-S6a established a non-blocking ChannelEvalPort with a dedicated
+worker thread that stores records in EvalStore. External observability (Langfuse)
+needs to receive the same records, but thalamus-eval must stay HTTP-free.
+
+**Decision**: `EvalSink` trait in thalamus-eval: `fn accept(&self, submission:
+&EvalSubmission)`. Object-safe, no HTTP or tokio dependencies. ChannelEvalPort
+accepts an injected `Arc<dyn EvalSink + Send + Sync>` via `new_with_sink()`.
+Default `new()` uses `NoOpSink` (store-only, backward compatible). The worker
+thread always inserts into EvalStore first, then forwards to the sink.
+
+`EvalSubmission` wraps `EvalRecord` + optional `authorized_content: Option<String>`.
+When ContentPolicy is MetadataOnly (default), authorized_content is always None.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S6b.
+
+### 2026-05-18: ContentPolicy — metadata-only default with redaction boundary (TH-S6b)
+
+**Context**: Raw prompt/response content must not leave the process unless policy
+explicitly authorizes it AND redaction is applied. The boundary is enforced BEFORE
+the record reaches any external sink.
+
+**Decision**: `ContentPolicy` enum: `MetadataOnly` (default, no content) vs
+`IncludeRedacted` (content included after redaction). Applied in `submit()` before
+the channel send — the EvalSubmission that reaches the sink already reflects the
+policy decision. Redaction uses literal substring matching on `Policy.redaction_rules`:
+`Redact` action replaces with `[REDACTED]`, `Block` action drops content entirely
+(returns None). Literal matching (not regex) avoids adding regex to thalamus-eval.
+
+**Boundary analysis**: EvalRecord already contains only deterministic metadata
+(no raw content). ContentPolicy controls the optional authorized_content field.
+Default = no content leaves. Only MetadataOnly is wired in thalamus-server today.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S6b.
+
+### 2026-05-18: Langfuse ingestion contract — configurable with recorded assumptions (TH-S6b)
+
+**Context**: The Langfuse ingestion API contract could not be authoritatively
+confirmed from public docs (JS-rendered pages, 404s on API reference URLs).
+
+**Decision**: Implement against the assumed contract: `POST /api/public/ingestion`
+with Bearer `{public_key}:{secret_key}` auth, JSON body `{ "batch": [event...] }`
+where each event has `id`, `type`, `name`, `metadata`, `output`, `timestamp`.
+All parts (endpoint path, auth header, payload shape) are configurable via
+`LangfuseConfig`. If the real contract differs, only `LangfuseSink::build_payload`
+and `LangfuseClient::post` need updating — no core/eval/server changes.
+
+**Assumption**: Batch ingestion endpoint at `/api/public/ingestion` with Bearer
+key:secret auth and event shape as described above. To be confirmed against
+official Langfuse docs when available.
+
+**Decision Level**: Autonomous. **Status**: Accepted (assumption pending
+confirmation). **Refs**: TH-S6b.
+
+### 2026-05-18: Sync ureq on eval worker thread for Langfuse (TH-S6b)
+
+**Context**: Langfuse HTTP calls must not block the async runtime. The eval worker
+thread is already a dedicated std::thread (from TH-S6a). Options: (1) sync ureq
+on the worker thread, (2) tokio::spawn_blocking, (3) async HTTP client.
+
+**Decision**: Sync ureq on the worker thread (option 1). The worker already runs
+outside the async runtime. No spawn_blocking needed. No async HTTP dep needed.
+Failure is best-effort: logged via tracing, record dropped, no retry. This matches
+the TH-S3 ureq pattern and keeps the adapter simple.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S6b.
+
+### 2026-05-18: Langfuse feature gate in thalamus-server (TH-S6b)
+
+**Context**: Langfuse adapter must not leak ureq/langfuse dependencies when the
+feature is disabled. Default build must have no ureq in normal deps.
+
+**Decision**: `langfuse` Cargo feature in thalamus-server, gating
+`thalamus-langfuse-adapter` dependency and `app::build_with_eval_sink()`. Main.rs
+has six mutually-exclusive cfg blocks (3 langfuse × {litellm, agentgateway, none}).
+`cargo tree --edges normal` with no features shows no ureq via eval/langfuse path.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S6b.
+
 ### Open items
 
 - Policy language/representation and evaluation semantics: not yet decided.

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use thalamus_core::{BackendResponse, EvalPort, Policy};
+use thalamus_core::{BackendResponse, EvalPort, Policy, RedactionAction, RedactionRule};
 
 // === EvalRecord: structured, deterministic facts per evaluation submission ===
 
@@ -36,6 +36,39 @@ pub struct ResponseMetadata {
     pub content_len: usize,
     pub tokens_used: Option<u32>,
     pub latency_ms: Option<u64>,
+}
+
+// === EvalSink: abstract sink for forwarding eval records ===
+
+/// Object-safe sink for eval submissions. Implementations may forward to
+/// external systems (Langfuse, etc.) or discard. Failures are best-effort.
+pub trait EvalSink {
+    fn accept(&self, submission: &EvalSubmission);
+}
+
+/// Default sink that discards everything — preserves store-only behavior.
+pub struct NoOpSink;
+
+impl EvalSink for NoOpSink {
+    fn accept(&self, _submission: &EvalSubmission) {}
+}
+
+// === ContentPolicy: controls whether raw content is forwarded ===
+
+#[derive(Debug, Clone)]
+pub enum ContentPolicy {
+    /// Only deterministic metadata is forwarded (default).
+    MetadataOnly,
+    /// Raw response content is included after redaction rules are applied.
+    IncludeRedacted,
+}
+
+// === EvalSubmission: what gets forwarded to the sink ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalSubmission {
+    pub record: EvalRecord,
+    pub authorized_content: Option<String>,
 }
 
 // === EvalStore: in-memory store keyed by eval_ref ===
@@ -93,7 +126,7 @@ impl EvalStore {
 // === Internal message for the worker channel ===
 
 enum EvalMessage {
-    Record(EvalRecord),
+    Submission(EvalSubmission),
     Shutdown,
 }
 
@@ -106,26 +139,43 @@ enum EvalMessage {
 pub struct ChannelEvalPort {
     tx: Sender<EvalMessage>,
     store: EvalStore,
+    content_policy: ContentPolicy,
+    _sink: Arc<dyn EvalSink + Send + Sync>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ChannelEvalPort {
     /// Create a new ChannelEvalPort with a bounded channel of capacity `cap`.
+    /// Uses NoOpSink (store-only behavior, backward compatible).
     pub fn new(cap: usize) -> Self {
+        Self::new_with_sink(cap, Arc::new(NoOpSink), ContentPolicy::MetadataOnly)
+    }
+
+    /// Create a ChannelEvalPort with an injected sink and content policy.
+    /// The sink receives every EvalSubmission; the store is always populated
+    /// regardless of sink outcome.
+    pub fn new_with_sink(
+        cap: usize,
+        sink: Arc<dyn EvalSink + Send + Sync>,
+        content_policy: ContentPolicy,
+    ) -> Self {
         let (tx, rx) = bounded::<EvalMessage>(cap);
         let store = EvalStore::new();
         let worker_store = store.clone();
+        let worker_sink = sink.clone();
 
         let handle = std::thread::Builder::new()
             .name("thalamus-eval-worker".to_owned())
             .spawn(move || {
-                worker_loop(rx, &worker_store);
+                worker_loop(rx, &worker_store, &*worker_sink);
             })
             .expect("failed to spawn eval worker thread");
 
         Self {
             tx,
             store,
+            content_policy,
+            _sink: sink,
             worker_handle: Some(handle),
         }
     }
@@ -162,8 +212,20 @@ impl EvalPort for ChannelEvalPort {
             None,
         );
 
+        let authorized_content = match &self.content_policy {
+            ContentPolicy::MetadataOnly => None,
+            ContentPolicy::IncludeRedacted => {
+                redact_content(&response.content, &policy.redaction_rules)
+            }
+        };
+
+        let submission = EvalSubmission {
+            record,
+            authorized_content,
+        };
+
         // Non-blocking send: if channel full, drop (best-effort eval)
-        match self.tx.try_send(EvalMessage::Record(record)) {
+        match self.tx.try_send(EvalMessage::Submission(submission)) {
             Ok(()) => {}
             Err(_) => {
                 tracing::warn!(
@@ -177,11 +239,12 @@ impl EvalPort for ChannelEvalPort {
     }
 }
 
-fn worker_loop(rx: Receiver<EvalMessage>, store: &EvalStore) {
+fn worker_loop(rx: Receiver<EvalMessage>, store: &EvalStore, sink: &dyn EvalSink) {
     loop {
         match rx.recv() {
-            Ok(EvalMessage::Record(record)) => {
-                store.insert(record);
+            Ok(EvalMessage::Submission(submission)) => {
+                store.insert(submission.record.clone());
+                sink.accept(&submission);
             }
             Ok(EvalMessage::Shutdown) | Err(_) => {
                 break;
@@ -243,6 +306,23 @@ fn classify_risk_from_budget(tokens_used: Option<u32>, max_tokens: u32) -> Strin
         Some(tokens) if tokens > max_tokens / 2 => "Medium".to_owned(),
         _ => "Low".to_owned(),
     }
+}
+
+/// Apply redaction rules to content. Returns None if any rule blocks.
+/// Uses literal substring matching (not regex) — see design-decisions.md.
+fn redact_content(content: &str, rules: &[RedactionRule]) -> Option<String> {
+    let mut result = content.to_owned();
+    for rule in rules {
+        if result.contains(&rule.pattern) {
+            match rule.action {
+                RedactionAction::Block => return None,
+                RedactionAction::Redact => {
+                    result = result.replace(&rule.pattern, "[REDACTED]");
+                }
+            }
+        }
+    }
+    Some(result)
 }
 
 #[cfg(test)]
@@ -493,9 +573,9 @@ mod tests {
             .spawn(move || {
                 loop {
                     match rx.recv() {
-                        Ok(EvalMessage::Record(record)) => {
+                        Ok(EvalMessage::Submission(submission)) => {
                             std::thread::sleep(std::time::Duration::from_millis(worker_delay_ms));
-                            worker_store.insert(record);
+                            worker_store.insert(submission.record);
                         }
                         Ok(EvalMessage::Shutdown) | Err(_) => break,
                     }
@@ -510,7 +590,8 @@ mod tests {
         for _ in 0..n {
             let eval_ref = format!("eval-{}", Uuid::new_v4());
             let record = build_record(eval_ref, &resp, &policy, None, None);
-            let _ = tx.try_send(EvalMessage::Record(record));
+            let submission = EvalSubmission { record, authorized_content: None };
+            let _ = tx.try_send(EvalMessage::Submission(submission));
         }
         let elapsed = start.elapsed();
 
@@ -527,5 +608,181 @@ mod tests {
             elapsed_ms,
             serial_min_ms,
         );
+    }
+
+    // === ContentPolicy and redaction tests ===
+
+    #[test]
+    fn redact_content_no_rules_returns_content() {
+        let result = redact_content("hello world", &[]);
+        assert_eq!(result, Some("hello world".to_owned()));
+    }
+
+    #[test]
+    fn redact_content_redact_action_replaces_pattern() {
+        let rules = vec![RedactionRule {
+            pattern: "secret".to_owned(),
+            action: RedactionAction::Redact,
+        }];
+        let result = redact_content("the secret is here", &rules);
+        assert_eq!(result, Some("the [REDACTED] is here".to_owned()));
+    }
+
+    #[test]
+    fn redact_content_block_action_returns_none() {
+        let rules = vec![RedactionRule {
+            pattern: "forbidden".to_owned(),
+            action: RedactionAction::Block,
+        }];
+        let result = redact_content("this is forbidden content", &rules);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn redact_content_multiple_rules_applied_in_order() {
+        let rules = vec![
+            RedactionRule {
+                pattern: "api-key-123".to_owned(),
+                action: RedactionAction::Redact,
+            },
+            RedactionRule {
+                pattern: "forbidden".to_owned(),
+                action: RedactionAction::Block,
+            },
+        ];
+        // First rule redacts, second rule blocks
+        let result = redact_content("use api-key-123 which is forbidden", &rules);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn redact_content_no_match_returns_untouched() {
+        let rules = vec![RedactionRule {
+            pattern: "not-present".to_owned(),
+            action: RedactionAction::Redact,
+        }];
+        let result = redact_content("clean content", &rules);
+        assert_eq!(result, Some("clean content".to_owned()));
+    }
+
+    #[test]
+    fn metadata_only_policy_never_includes_content() {
+        let port = ChannelEvalPort::new(64);
+        let mut policy = test_policy();
+        policy.redaction_rules = vec![RedactionRule {
+            pattern: "sensitive".to_owned(),
+            action: RedactionAction::Redact,
+        }];
+        let resp = test_response("sensitive data here", Some(100));
+
+        let eval_ref = port.submit(&resp, &policy);
+        let count = port.store().wait_for_count(1, 2000);
+        assert_eq!(count, 1);
+
+        // MetadataOnly is default: store gets record (no content field),
+        // and the submission carries no authorized_content
+        let _ = eval_ref;
+    }
+
+    // === Sink integration test ===
+
+    /// A tracking sink that records every submission it receives.
+    struct TrackingSink {
+        submissions: std::sync::Mutex<Vec<EvalSubmission>>,
+    }
+
+    impl TrackingSink {
+        fn new() -> Self {
+            Self {
+                submissions: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn received(&self) -> Vec<EvalSubmission> {
+            self.submissions.lock().unwrap().clone()
+        }
+    }
+
+    impl EvalSink for TrackingSink {
+        fn accept(&self, submission: &EvalSubmission) {
+            self.submissions.lock().unwrap().push(submission.clone());
+        }
+    }
+
+    #[test]
+    fn sink_receives_submissions_and_store_is_populated() {
+        let sink = Arc::new(TrackingSink::new());
+        let port = ChannelEvalPort::new_with_sink(
+            64,
+            sink.clone(),
+            ContentPolicy::MetadataOnly,
+        );
+
+        let policy = test_policy();
+        let resp = test_response("test content", Some(50));
+        let eval_ref = port.submit(&resp, &policy);
+
+        port.store().wait_for_count(1, 2000);
+
+        // Store is populated
+        assert!(port.store().get(&eval_ref).is_some());
+
+        // Sink received the submission
+        let received = sink.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].record.eval_ref, eval_ref);
+        // MetadataOnly: no authorized content
+        assert!(received[0].authorized_content.is_none());
+    }
+
+    #[test]
+    fn include_redacted_policy_passes_redacted_content_to_sink() {
+        let sink = Arc::new(TrackingSink::new());
+        let port = ChannelEvalPort::new_with_sink(
+            64,
+            sink.clone(),
+            ContentPolicy::IncludeRedacted,
+        );
+
+        let mut policy = test_policy();
+        policy.redaction_rules = vec![RedactionRule {
+            pattern: "secret".to_owned(),
+            action: RedactionAction::Redact,
+        }];
+        let resp = test_response("the secret value", Some(50));
+        let eval_ref = port.submit(&resp, &policy);
+
+        port.store().wait_for_count(1, 2000);
+
+        let received = sink.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].authorized_content, Some("the [REDACTED] value".to_owned()));
+        // Store still gets the record (metadata only, no content)
+        assert!(port.store().get(&eval_ref).is_some());
+    }
+
+    #[test]
+    fn block_rule_prevents_content_from_reaching_sink() {
+        let sink = Arc::new(TrackingSink::new());
+        let port = ChannelEvalPort::new_with_sink(
+            64,
+            sink.clone(),
+            ContentPolicy::IncludeRedacted,
+        );
+
+        let mut policy = test_policy();
+        policy.redaction_rules = vec![RedactionRule {
+            pattern: "BLOCKED".to_owned(),
+            action: RedactionAction::Block,
+        }];
+        let resp = test_response("contains BLOCKED text", Some(50));
+        port.submit(&resp, &policy);
+
+        port.store().wait_for_count(1, 2000);
+
+        let received = sink.received();
+        assert_eq!(received.len(), 1);
+        // Block rule: content is None
+        assert!(received[0].authorized_content.is_none());
     }
 }

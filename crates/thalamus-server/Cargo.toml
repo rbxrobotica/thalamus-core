@@ -10,6 +10,7 @@ default = []
 dev = []
 litellm = ["thalamus-litellm-adapter"]
 agentgateway = ["thalamus-agentgateway-adapter"]
+langfuse = ["thalamus-langfuse-adapter"]
 
 [[bin]]
 name = "thalamus-server"
@@ -20,6 +21,7 @@ thalamus-core = { path = "../thalamus-core" }
 thalamus-eval = { path = "../thalamus-eval" }
 thalamus-litellm-adapter = { path = "../thalamus-litellm-adapter", optional = true }
 thalamus-agentgateway-adapter = { path = "../thalamus-agentgateway-adapter", optional = true }
+thalamus-langfuse-adapter = { path = "../thalamus-langfuse-adapter", optional = true }
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

@@ -115,6 +115,40 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Build an app with an injected eval sink (for Langfuse or other external sinks).
+#[cfg(feature = "langfuse")]
+pub fn build_with_eval_sink(
+    config: ServerConfig,
+    backend: Option<Arc<dyn BackendPort + Send + Sync>>,
+    eval_sink: Arc<dyn thalamus_eval::EvalSink + Send + Sync>,
+    content_policy: thalamus_eval::ContentPolicy,
+) -> Router {
+    let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
+    let context_port = Arc::new(ports::StaticContextPort::empty());
+    let audit_port = Arc::new(ports::InMemoryAuditPort::new());
+    let audit_store = audit_port.store();
+    let eval_port = Arc::new(ports::ChannelEvalPort::new_with_sink(
+        EVAL_CHANNEL_CAPACITY,
+        eval_sink,
+        content_policy,
+    ));
+    let eval_store = eval_port.store().clone();
+    let obs_port = Arc::new(ports::LoggingObservabilityPort);
+
+    let state = Arc::new(AppState {
+        policy_port,
+        context_port,
+        audit_port,
+        eval_port,
+        obs_port,
+        backend_port: backend,
+        audit_store,
+        eval_store,
+    });
+
+    build_router(state)
+}
+
 /// Build an app for testing that returns the Router and the EvalStore handle,
 /// so integration tests can inspect eval records after requests.
 #[allow(dead_code, reason = "used by integration tests")]

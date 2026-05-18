@@ -1181,6 +1181,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "thalamus-langfuse-adapter"
+version = "0.1.0"
+dependencies = [
+ "mockito",
+ "serde",
+ "serde_json",
+ "thalamus-eval",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
 name = "thalamus-litellm-adapter"
 version = "0.1.0"
 dependencies = [
@@ -1206,6 +1218,7 @@ dependencies = [
  "thalamus-agentgateway-adapter",
  "thalamus-core",
  "thalamus-eval",
+ "thalamus-langfuse-adapter",
  "thalamus-litellm-adapter",
  "time",
  "tokio",
