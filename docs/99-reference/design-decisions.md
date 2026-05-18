@@ -574,6 +574,70 @@ babel transforms. Jest requires CJS interop for ESM packages.
 
 **Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S5.
 
+### 2026-05-18: Bounded channel + dedicated worker thread for non-blocking eval (TH-S6a)
+
+**Context**: `EvalPort::submit` is called inside `post_call`, which runs on the
+async handler thread (the same tokio worker that serves the HTTP request). A slow
+or blocking eval submission would re-create the TH-S3.1 starvation bug: the async
+runtime stalls while eval runs synchronously.
+
+**Considered Options**:
+1. **`tokio::spawn` async task** — submit returns immediately, eval runs in a
+   spawned task. Pro: idiomatic async. Con: `EvalPort::submit` is a sync trait
+   method (returns `String`, not a Future). Spawning from a sync context inside
+   an async runtime requires `tokio::runtime::Handle::current().spawn()`, which
+   couples thalamus-eval to tokio — violating the crate's dep constraint
+   (thalamus-eval depends on thalamus-core only).
+2. **Bounded crossbeam channel + dedicated worker thread** — submit does a
+   `try_send` through a bounded channel; a dedicated std thread receives and
+   stores. Pro: no async dep, no tokio coupling, bounded backpressure, truly
+   non-blocking (`try_send` never blocks). Con: one extra thread per eval port
+   instance.
+3. **`std::thread::spawn` per submission** — fire-and-forget threads. Pro:
+   simple. Con: unbounded thread creation, no backpressure, no graceful
+   shutdown.
+
+**Decision**: Option 2. Bounded crossbeam-channel (`crossbeam-channel` crate)
+with a dedicated worker thread. Capacity 256 (configurable via constant in
+app.rs). `try_send` is O(1) and never blocks. Full channel => record dropped
+with a tracing warning (eval is best-effort per
+observability-and-evaluation.md). Worker thread named `thalamus-eval-worker`
+for diagnostics.
+
+**Boundary analysis**: No new port, no core change, no HTTP, no ML. EvalRecord
+contains only deterministic facts (schema validity, budget-based risk class,
+content length, citation placeholder). No fabricated "quality scores".
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S6a, ADR-0001.
+
+### 2026-05-18: EvalRecord shape — deterministic facts only (TH-S6a)
+
+**Context**: The eval record must be honest about what it knows. There is no ML,
+no hallucination detection model, no scoring engine. The record must contain
+only what can be derived deterministically from the response and policy.
+
+**Decision**: EvalRecord fields: `eval_ref` (UUID), `schema_valid` (non-empty
+content), `citation_check` (placeholder: always NotRequired), `hallucination_signals`
+(empty Vec — placeholder), `risk_class` (derived from budget usage, same logic as
+flow.rs), `response_metadata` (content_len, tokens_used, latency_ms), `trace_id`,
+`audit_id`, `policy_id`, `created_at`. Every placeholder is explicitly documented
+in code as a placeholder. No numeric "quality score" or "confidence" field.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S6a.
+
+### 2026-05-18: crossbeam-channel over std::sync::mpsc for eval (TH-S6a)
+
+**Context**: Need a bounded channel for the eval worker. Options: `std::sync::mpsc`
+(sync channel, bounded available), `crossbeam-channel` (more robust, better
+performance, `try_send` semantics).
+
+**Decision**: crossbeam-channel v0.5. More ergonomic `try_send` (returns
+`TrySendError` without panic), better performance under contention, widely used
+in the Rust ecosystem. `std::sync::mpsc::sync_channel` would work but
+crossbeam's API is cleaner and the dep is minimal.
+
+**Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S6a.
+
 ### Open items
 
 - Policy language/representation and evaluation semantics: not yet decided.

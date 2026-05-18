@@ -7,6 +7,6 @@ pub mod policy;
 
 pub use audit::InMemoryAuditPort;
 pub use context::StaticContextPort;
-pub use eval::LoggingEvalPort;
+pub use eval::ChannelEvalPort;
 pub use observability::LoggingObservabilityPort;
 pub use policy::ConfigPolicyPort;

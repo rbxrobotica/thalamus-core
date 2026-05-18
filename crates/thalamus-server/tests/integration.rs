@@ -948,3 +948,87 @@ async fn backend_swap_agentgateway_produces_same_flow_as_litellm() {
     ag_mock.assert();
     ll_mock.assert();
 }
+
+// === TH-S6a: EvalPort integration tests ===
+
+#[tokio::test]
+async fn call_produces_eval_record_retrievable_by_ref() {
+    let config = make_config(vec![test_policy()]);
+    let backend = Arc::new(CountingBackendPort::new(BackendResponse {
+        content: "Eval test result".to_owned(),
+        tokens_used: Some(100),
+        latency_ms: Some(200),
+    }));
+    let (app, eval_store) = app::build_with_eval_inspection(config, backend);
+
+    let body = test_request_body("RBX", "test-product", "test-workflow");
+    let (status, resp) = send_request(app, "POST", "/v1/call", Some(body)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["decision"].as_str().unwrap(), "Allow");
+
+    // Wait for the eval worker to process the record
+    let count = eval_store.wait_for_count(1, 2000);
+    assert_eq!(count, 1, "expected 1 eval record, got {count}");
+
+    let eval_refs = eval_store.all_refs();
+    let eval_ref = &eval_refs[0];
+    let record = eval_store.get(eval_ref).expect("record must exist");
+
+    assert!(record.schema_valid);
+    assert_eq!(record.risk_class, "Low");
+    assert_eq!(record.policy_id, "test-policy");
+    assert_eq!(record.response_metadata.tokens_used, Some(100));
+    assert_eq!(record.response_metadata.content_len, 16); // "Eval test result".len()
+}
+
+#[tokio::test]
+async fn concurrent_calls_with_slow_eval_do_not_serialize() {
+    // Concurrency regression test (TH-S3.1 style).
+    // N concurrent /v1/call requests where the backend is slow but eval is
+    // non-blocking. Total time must be << N * (backend_delay + eval_delay).
+    let n: usize = 10;
+    let backend_delay_ms = 100;
+
+    let config = make_config(vec![test_policy()]);
+    let backend = Arc::new(SlowBackendPort {
+        delay: std::time::Duration::from_millis(backend_delay_ms),
+        response: BackendResponse {
+            content: "slow eval test".to_owned(),
+            tokens_used: Some(100),
+            latency_ms: Some(backend_delay_ms),
+        },
+    });
+    let (app, eval_store) = app::build_with_eval_inspection(config, backend);
+    let body = test_request_body("RBX", "test-product", "test-workflow");
+
+    let start = std::time::Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let app_clone = app.clone();
+        let body_clone = body.clone();
+        handles.push(tokio::spawn(async move {
+            send_request(app_clone, "POST", "/v1/call", Some(body_clone)).await
+        }));
+    }
+
+    for handle in handles {
+        let (status, resp) = handle.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["decision"].as_str().unwrap(), "Allow");
+    }
+    let elapsed = start.elapsed();
+
+    // If requests were serialized: elapsed >= n * backend_delay_ms
+    // With non-blocking eval + spawn_blocking backend: elapsed < n * backend_delay_ms
+    let serial_min_ms = (n as u64) * backend_delay_ms;
+    let elapsed_ms = elapsed.as_millis() as u64;
+    assert!(
+        elapsed_ms < serial_min_ms,
+        "concurrent /v1/call serialized: {elapsed_ms}ms >= {serial_min_ms}ms — eval blocks the async runtime"
+    );
+
+    // All eval records eventually stored
+    let count = eval_store.wait_for_count(n, 3000);
+    assert_eq!(count, n, "expected {n} eval records, got {count}");
+}

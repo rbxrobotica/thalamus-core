@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 thalamus-core = { path = "../thalamus-core" }
+thalamus-eval = { path = "../thalamus-eval" }
 thalamus-litellm-adapter = { path = "../thalamus-litellm-adapter", optional = true }
 thalamus-agentgateway-adapter = { path = "../thalamus-agentgateway-adapter", optional = true }
 axum = { version = "0.8", features = ["json"] }
