@@ -78,6 +78,12 @@ pub struct EvalStore {
     records: Arc<Mutex<HashMap<String, EvalRecord>>>,
 }
 
+impl Default for EvalStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EvalStore {
     pub fn new() -> Self {
         Self {
@@ -126,7 +132,7 @@ impl EvalStore {
 // === Internal message for the worker channel ===
 
 enum EvalMessage {
-    Submission(EvalSubmission),
+    Submission(Box<EvalSubmission>),
     Shutdown,
 }
 
@@ -204,13 +210,7 @@ impl EvalPort for ChannelEvalPort {
     fn submit(&self, response: &BackendResponse, policy: &Policy) -> String {
         let eval_ref = format!("eval-{}", Uuid::new_v4());
 
-        let record = build_record(
-            eval_ref.clone(),
-            response,
-            policy,
-            None,
-            None,
-        );
+        let record = build_record(eval_ref.clone(), response, policy, None, None);
 
         let authorized_content = match &self.content_policy {
             ContentPolicy::MetadataOnly => None,
@@ -225,7 +225,10 @@ impl EvalPort for ChannelEvalPort {
         };
 
         // Non-blocking send: if channel full, drop (best-effort eval)
-        match self.tx.try_send(EvalMessage::Submission(submission)) {
+        match self
+            .tx
+            .try_send(EvalMessage::Submission(Box::new(submission)))
+        {
             Ok(()) => {}
             Err(_) => {
                 tracing::warn!(
@@ -240,16 +243,9 @@ impl EvalPort for ChannelEvalPort {
 }
 
 fn worker_loop(rx: Receiver<EvalMessage>, store: &EvalStore, sink: &dyn EvalSink) {
-    loop {
-        match rx.recv() {
-            Ok(EvalMessage::Submission(submission)) => {
-                store.insert(submission.record.clone());
-                sink.accept(&submission);
-            }
-            Ok(EvalMessage::Shutdown) | Err(_) => {
-                break;
-            }
-        }
+    while let Ok(EvalMessage::Submission(submission)) = rx.recv() {
+        store.insert(submission.record.clone());
+        sink.accept(&submission);
     }
 }
 
@@ -571,14 +567,9 @@ mod tests {
         let handle = std::thread::Builder::new()
             .name("slow-eval-worker".to_owned())
             .spawn(move || {
-                loop {
-                    match rx.recv() {
-                        Ok(EvalMessage::Submission(submission)) => {
-                            std::thread::sleep(std::time::Duration::from_millis(worker_delay_ms));
-                            worker_store.insert(submission.record);
-                        }
-                        Ok(EvalMessage::Shutdown) | Err(_) => break,
-                    }
+                while let Ok(EvalMessage::Submission(submission)) = rx.recv() {
+                    std::thread::sleep(std::time::Duration::from_millis(worker_delay_ms));
+                    worker_store.insert(submission.record);
                 }
             })
             .expect("spawn worker");
@@ -590,8 +581,11 @@ mod tests {
         for _ in 0..n {
             let eval_ref = format!("eval-{}", Uuid::new_v4());
             let record = build_record(eval_ref, &resp, &policy, None, None);
-            let submission = EvalSubmission { record, authorized_content: None };
-            let _ = tx.try_send(EvalMessage::Submission(submission));
+            let submission = EvalSubmission {
+                record,
+                authorized_content: None,
+            };
+            let _ = tx.try_send(EvalMessage::Submission(Box::new(submission)));
         }
         let elapsed = start.elapsed();
 
@@ -712,11 +706,7 @@ mod tests {
     #[test]
     fn sink_receives_submissions_and_store_is_populated() {
         let sink = Arc::new(TrackingSink::new());
-        let port = ChannelEvalPort::new_with_sink(
-            64,
-            sink.clone(),
-            ContentPolicy::MetadataOnly,
-        );
+        let port = ChannelEvalPort::new_with_sink(64, sink.clone(), ContentPolicy::MetadataOnly);
 
         let policy = test_policy();
         let resp = test_response("test content", Some(50));
@@ -738,11 +728,7 @@ mod tests {
     #[test]
     fn include_redacted_policy_passes_redacted_content_to_sink() {
         let sink = Arc::new(TrackingSink::new());
-        let port = ChannelEvalPort::new_with_sink(
-            64,
-            sink.clone(),
-            ContentPolicy::IncludeRedacted,
-        );
+        let port = ChannelEvalPort::new_with_sink(64, sink.clone(), ContentPolicy::IncludeRedacted);
 
         let mut policy = test_policy();
         policy.redaction_rules = vec![RedactionRule {
@@ -756,7 +742,10 @@ mod tests {
 
         let received = sink.received();
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].authorized_content, Some("the [REDACTED] value".to_owned()));
+        assert_eq!(
+            received[0].authorized_content,
+            Some("the [REDACTED] value".to_owned())
+        );
         // Store still gets the record (metadata only, no content)
         assert!(port.store().get(&eval_ref).is_some());
     }
@@ -764,11 +753,7 @@ mod tests {
     #[test]
     fn block_rule_prevents_content_from_reaching_sink() {
         let sink = Arc::new(TrackingSink::new());
-        let port = ChannelEvalPort::new_with_sink(
-            64,
-            sink.clone(),
-            ContentPolicy::IncludeRedacted,
-        );
+        let port = ChannelEvalPort::new_with_sink(64, sink.clone(), ContentPolicy::IncludeRedacted);
 
         let mut policy = test_policy();
         policy.redaction_rules = vec![RedactionRule {

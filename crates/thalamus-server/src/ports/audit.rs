@@ -10,6 +10,12 @@ pub struct InMemoryAuditPort {
     records: Arc<Mutex<HashMap<AuditId, PreCallRecord>>>,
 }
 
+impl Default for InMemoryAuditPort {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemoryAuditPort {
     pub fn new() -> Self {
         Self {
@@ -62,10 +68,10 @@ impl AuditStore {
     }
 
     pub fn store_pre_call_record(&self, audit_id: AuditId, envelope: Envelope, policy: Policy) {
-        self.records.lock().unwrap().insert(
-            audit_id,
-            PreCallRecord { envelope, policy },
-        );
+        self.records
+            .lock()
+            .unwrap()
+            .insert(audit_id, PreCallRecord { envelope, policy });
     }
 
     pub fn get_pre_call_record(&self, audit_id: &AuditId) -> Option<PreCallRecord> {

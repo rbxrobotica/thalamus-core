@@ -2,8 +2,8 @@ use uuid::Uuid;
 
 use crate::audit::AuditEvent;
 use crate::domain::{
-    AuditId, BackendResponse, CallRequest, CitationCheck, ContextEntry, Envelope,
-    PostCallResult, PostCallStatus, PolicyDecision, RiskLevel, StrategosEvent, TraceId,
+    AuditId, BackendResponse, CallRequest, CitationCheck, ContextEntry, Envelope, PolicyDecision,
+    PostCallResult, PostCallStatus, RiskLevel, StrategosEvent, TraceId,
 };
 use crate::policy::{Policy, RedactionAction};
 use crate::ports::{AuditPort, ContextPort, EvalPort, ObservabilityPort, PolicyPort};
@@ -22,7 +22,11 @@ pub enum PreCallError {
 impl std::fmt::Display for PreCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PreCallError::NoPermittedBackend { tenant, product, policy_id } => {
+            PreCallError::NoPermittedBackend {
+                tenant,
+                product,
+                policy_id,
+            } => {
                 write!(f, "policy {policy_id} for tenant {tenant} product {product} has no permitted backends")
             }
         }
@@ -66,7 +70,10 @@ pub fn pre_call(
     let audit_id = AuditId(Uuid::new_v4());
 
     match &decision {
-        PolicyDecision::Deny { reason: _, policy_ref } => {
+        PolicyDecision::Deny {
+            reason: _,
+            policy_ref,
+        } => {
             if policy.audit_required {
                 audit_port.emit(AuditEvent::PreCallDecision {
                     trace_id: trace_id.clone(),
@@ -193,7 +200,7 @@ pub fn post_call(
             trace_id: envelope.trace_id.clone(),
             audit_id: envelope.audit_id.clone(),
             status: format!("{:?}", status),
-            risk_class: risk_class.clone(),
+            risk_class,
             executable_by_agent,
             schema_valid,
             timestamp: OffsetDateTime::now_utc(),
@@ -251,7 +258,8 @@ fn apply_redaction(
         .iter()
         .filter(|entry| {
             !rules.iter().any(|rule| {
-                matches!(rule.action, RedactionAction::Block) && entry.content.contains(&rule.pattern)
+                matches!(rule.action, RedactionAction::Block)
+                    && entry.content.contains(&rule.pattern)
             })
         })
         .cloned()
@@ -468,7 +476,8 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(matches!(outcome.decision, PolicyDecision::Deny { .. }));
         assert!(outcome.envelope.is_none());
@@ -500,7 +509,8 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(matches!(outcome.decision, PolicyDecision::Allow));
         let envelope = outcome.envelope.expect("Allow must produce envelope");
@@ -509,7 +519,14 @@ mod tests {
         let response = backend.call(&envelope);
 
         // Post-call validation always runs on Allow path
-        let result = post_call(&response, &envelope, &policy, &audit_port, &eval_port, &FakeObsPort);
+        let result = post_call(
+            &response,
+            &envelope,
+            &policy,
+            &audit_port,
+            &eval_port,
+            &FakeObsPort,
+        );
 
         assert_eq!(result.status, PostCallStatus::Valid);
         assert_eq!(result.risk_class, RiskLevel::Low);
@@ -537,7 +554,8 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(matches!(
             outcome.decision,
@@ -577,11 +595,19 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        ).unwrap();
+        )
+        .unwrap();
 
         let envelope = outcome.envelope.unwrap();
         let response = backend.call(&envelope);
-        let result = post_call(&response, &envelope, &policy, &audit_port, &eval_port, &FakeObsPort);
+        let result = post_call(
+            &response,
+            &envelope,
+            &policy,
+            &audit_port,
+            &eval_port,
+            &FakeObsPort,
+        );
 
         assert_eq!(result.risk_class, RiskLevel::High);
         assert_eq!(result.status, PostCallStatus::NeedsHumanReview);
@@ -609,11 +635,19 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        ).unwrap();
+        )
+        .unwrap();
 
         let envelope = outcome.envelope.unwrap();
         let response = backend.call(&envelope);
-        let result = post_call(&response, &envelope, &policy, &audit_port, &eval_port, &FakeObsPort);
+        let result = post_call(
+            &response,
+            &envelope,
+            &policy,
+            &audit_port,
+            &eval_port,
+            &FakeObsPort,
+        );
 
         assert_eq!(result.risk_class, RiskLevel::Prohibited);
         assert_eq!(result.status, PostCallStatus::Invalid);
@@ -641,11 +675,19 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        ).unwrap();
+        )
+        .unwrap();
 
         let envelope = outcome.envelope.unwrap();
         let response = backend.call(&envelope);
-        let result = post_call(&response, &envelope, &policy, &audit_port, &eval_port, &FakeObsPort);
+        let result = post_call(
+            &response,
+            &envelope,
+            &policy,
+            &audit_port,
+            &eval_port,
+            &FakeObsPort,
+        );
 
         assert_eq!(result.risk_class, RiskLevel::Medium);
         assert!(result.strategos_event.is_some());
@@ -680,7 +722,8 @@ mod tests {
             &context_port,
             &audit_port,
             &FakeObsPort,
-        ).unwrap();
+        )
+        .unwrap();
 
         let envelope = outcome.envelope.unwrap();
         assert_eq!(envelope.authorized_context.len(), 1);
@@ -701,7 +744,8 @@ mod tests {
             backend_type: BackendType::Model,
         });
 
-        let outcome = pre_call(&req, &policy_port, &context_port, &audit_port, &FakeObsPort).unwrap();
+        let outcome =
+            pre_call(&req, &policy_port, &context_port, &audit_port, &FakeObsPort).unwrap();
 
         let envelope = outcome.envelope.unwrap();
         assert_eq!(envelope.backend_handle.id, "claude-opus");
@@ -720,7 +764,8 @@ mod tests {
             backend_type: BackendType::Model,
         });
 
-        let outcome = pre_call(&req, &policy_port, &context_port, &audit_port, &FakeObsPort).unwrap();
+        let outcome =
+            pre_call(&req, &policy_port, &context_port, &audit_port, &FakeObsPort).unwrap();
 
         let envelope = outcome.envelope.unwrap();
         // Falls back to first permitted backend since requested is not in policy

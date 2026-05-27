@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use thalamus_eval::{EvalSink, EvalSubmission};
-use tracing;
 
 pub mod config;
 
@@ -33,7 +32,10 @@ struct LangfuseClient {
 
 impl LangfuseClient {
     fn post(&self, payload: &serde_json::Value) -> Result<(), String> {
-        let url = format!("{}/api/public/ingestion", self.endpoint.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/public/ingestion",
+            self.endpoint.trim_end_matches('/')
+        );
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         let config = ureq::Agent::config_builder()
@@ -43,7 +45,10 @@ impl LangfuseClient {
 
         agent
             .post(&url)
-            .header("Authorization", &format!("Bearer {}:{}", self.public_key, self.secret_key))
+            .header(
+                "Authorization",
+                &format!("Bearer {}:{}", self.public_key, self.secret_key),
+            )
             .header("Content-Type", "application/json")
             .send_json(payload)
             .map_err(|e| format!("langfuse POST: {e}"))?;
@@ -108,9 +113,7 @@ impl EvalSink for LangfuseSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thalamus_eval::{
-        CitationCheckOutcome, EvalRecord, ResponseMetadata,
-    };
+    use thalamus_eval::{CitationCheckOutcome, EvalRecord, ResponseMetadata};
 
     fn test_submission(content: Option<&str>) -> EvalSubmission {
         EvalSubmission {
@@ -180,7 +183,8 @@ mod tests {
     #[test]
     fn happy_path_posts_to_langfuse() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("POST", "/api/public/ingestion")
+        let mock = server
+            .mock("POST", "/api/public/ingestion")
             .match_header("Authorization", "Bearer pk-test:sk-test")
             .match_header("Content-Type", "application/json")
             .with_status(200)
@@ -202,8 +206,11 @@ mod tests {
     #[test]
     fn boundary_test_raw_content_never_reaches_langfuse() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("POST", "/api/public/ingestion")
-            .match_body(mockito::Matcher::Regex(String::from("secret-api-key-12345")))
+        let mock = server
+            .mock("POST", "/api/public/ingestion")
+            .match_body(mockito::Matcher::Regex(String::from(
+                "secret-api-key-12345",
+            )))
             .expect(0) // MUST NEVER match
             .with_status(200)
             .create();
@@ -227,7 +234,8 @@ mod tests {
     #[test]
     fn resilience_5xx_does_not_panic() {
         let mut server = mockito::Server::new();
-        let mock = server.mock("POST", "/api/public/ingestion")
+        let mock = server
+            .mock("POST", "/api/public/ingestion")
             .with_status(500)
             .expect(1)
             .create();

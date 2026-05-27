@@ -1,6 +1,7 @@
 /// Dev echo backend: only available under the `dev` feature flag,
 /// never in default builds.
 #[cfg(feature = "dev")]
+#[allow(dead_code)]
 pub struct EchoBackendPort;
 
 #[cfg(feature = "dev")]
