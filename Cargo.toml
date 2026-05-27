@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/thalamus-core",
+    "crates/thalamus-server",
+    "crates/thalamus-litellm-adapter",
+    "crates/thalamus-agentgateway-adapter",
+    "crates/thalamus-eval",
+    "crates/thalamus-langfuse-adapter",
+]
+resolver = "2"

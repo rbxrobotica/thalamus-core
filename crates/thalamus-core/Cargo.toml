@@ -1,0 +1,11 @@
+[package]
+name = "thalamus-core"
+version = "0.2.0"
+edition = "2021"
+description = "Domain types, policy model, ports, and pure flow for the Thalamus semantic control layer"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde"] }

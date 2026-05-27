@@ -1,198 +1,158 @@
 # Thalamus
 
-**AI-First Cognitive Mediation Layer for RBX Systems**
+**The semantic control layer for AI traffic in RBX Systems**
 
 ---
 
 ## What is Thalamus?
 
-Thalamus is a **signal mediation layer** that routes, normalizes, and contextualizes information between perception and decision-making systems. Inspired by the biological thalamus—the brain's sensory relay station—this component manages signal flow without making strategic decisions.
+Thalamus applies business rules, policies, context, validation, routing
+decisions, observability, evaluation, and auditability **before and after**
+calls to language models, tools, MCP servers, A2A agents, or other AI execution
+backends.
 
-Think of Thalamus as a **cognitive switchboard**: it ensures the right signals reach the right decision-makers at the right time, with the right context, while remaining completely agnostic to business logic.
+Thalamus is the control plane for AI traffic. It is the single point that
+answers, for every AI-mediated call:
 
-## Quick Navigation
+- Who can call which model?
+- With which budget?
+- Under which policy?
+- With which context?
+- With which risk level?
+- With which evaluation?
+- With which traceability?
+- With which output rule?
+- Which calls require human review?
+- Which responses can become agent-executable actions?
+- Which events must be persisted into Strategos?
+- Which evidence should feed TruthMetal in the future?
 
-### For Humans
-- **New here?** Start with [docs/00-getting-started/for-humans.md](docs/00-getting-started/for-humans.md)
-- **Want to contribute?** Read [CONTRIBUTING.md](CONTRIBUTING.md)
-- **Understand the vision?** See [PURPOSE.md](PURPOSE.md)
-- **Explore architecture?** Check [ARCHITECTURE.md](ARCHITECTURE.md)
+## What Thalamus is NOT
 
-### For AI Agents
-- **Agent guidelines**: [.claude/agent-guidelines.md](.claude/agent-guidelines.md)
-- **Quick start**: [docs/00-getting-started/for-agents.md](docs/00-getting-started/for-agents.md)
-- **Boundaries (REQUIRED)**: [BOUNDARIES.md](BOUNDARIES.md)
+- Not the language model.
+- Not merely an LLM proxy.
+- Not merely a gateway.
+- Not based on Agentgateway.
 
-### Key Documents
-- [BOUNDARIES.md](BOUNDARIES.md) - **Read this first** - Defines what Thalamus IS and IS NOT
-- [PURPOSE.md](PURPOSE.md) - Why Thalamus exists
-- [ARCHITECTURE.md](ARCHITECTURE.md) - Conceptual architecture
-- [GOVERNANCE.md](GOVERNANCE.md) - Decision-making framework
-- [CONTRIBUTING.md](CONTRIBUTING.md) - How to contribute
-- [CHANGELOG.md](CHANGELOG.md) - Version history
+Thalamus is gateway-agnostic at the product and domain layer. Agentgateway is a
+low-level data plane backend that Thalamus may support as a privileged backend
+through an adapter.
 
-## Core Principles
+> Thalamus is gateway-agnostic at the product layer, but Agentgateway-native at
+> the RBX infrastructure adapter layer.
 
-### What Thalamus IS ✅
-- **Signal Router**: Directs signals from sources to appropriate handlers
-- **Signal Normalizer**: Transforms diverse formats into common representations
-- **Context Manager**: Maintains short-term working context for signal enrichment
-- **Business-Agnostic**: No product-specific logic, reusable across all RBX systems
+See [BOUNDARIES.md](BOUNDARIES.md) for the full control boundary.
 
-### What Thalamus IS NOT ❌
-- **Decision-Maker**: Does not implement business rules or strategies
-- **Domain-Specific**: Contains no trading, portfolio, or product logic
-- **Standalone App**: A library component, not an application
-- **Long-term Storage**: Manages working context, not persistent data
-
-See [BOUNDARIES.md](BOUNDARIES.md) for the complete boundary framework.
-
-## Current Status
-
-**Phase**: Foundation (Pre-Implementation)
-**Version**: 0.1.0
-**Status**: Documentation and architecture definition
-
-We are currently establishing the conceptual foundation. No implementation code exists yet. This is intentional—we're building the architecture right before writing any code.
-
-## Repository Structure
+## Control plane vs data plane
 
 ```
-thalamus-core/
-├── README.md                 # You are here
-├── BOUNDARIES.md             # Boundary definitions (READ FIRST)
-├── PURPOSE.md                # Vision and rationale
-├── ARCHITECTURE.md           # Conceptual architecture
-├── GOVERNANCE.md             # Decision framework
-├── CONTRIBUTING.md           # Contribution guide
-├── CHANGELOG.md              # Version history
-├── LICENSE                   # Legal terms (TBD)
-│
-├── .claude/
-│   └── agent-guidelines.md   # AI agent operational manual
-│
-└── docs/
-    ├── 00-getting-started/   # Onboarding for humans and agents
-    ├── 01-concept/           # Conceptual framework
-    ├── 02-architecture/      # Architecture details
-    ├── 03-integration/       # Product integration guides
-    ├── 04-governance/        # Governance details
-    ├── 05-development/       # Development practices
-    └── 99-reference/         # References and decisions
+                 +-------------------------------------------+
+   product /     |              THALAMUS                     |
+   agent / job   |        semantic control layer             |
+       |         |                                           |
+       |  call   |  pre-call:  identity, intent, policy,      |
+       +-------->|             model/tool selection, budget,  |
+                 |             context auth, redaction,       |
+                 |             routing decision, trace/audit  |
+                 |                                           |
+                 |  -- delegates transport to data plane --> |
+                 +---------------------+---------------------+
+                                       |
+                                       v
+                 +-------------------------------------------+
+                 |   DATA PLANE (replaceable backend)        |
+                 |   Agentgateway | LiteLLM | OpenRouter |   |
+                 |   Envoy | Kong | direct provider calls    |
+                 |   connectivity, proxy, rate limits,       |
+                 |   transport-level enforcement             |
+                 +---------------------+---------------------+
+                                       |
+                                       v
+                 +-------------------------------------------+
+                 |   AI backend: LLM | tool | MCP | A2A      |
+                 +---------------------+---------------------+
+                                       |
+                 +---------------------v---------------------+
+                 |              THALAMUS                     |
+                 |  post-call: schema check, risk class,     |
+                 |             hallucination signals,        |
+                 |             citation/source check,        |
+                 |             business rules, redaction,    |
+                 |             audit events, evaluation,     |
+                 |             persistence                   |
+                 +-------------------------------------------+
 ```
 
-## Use Cases
+## Target components
 
-### Strategos (AI Trading System)
-Thalamus routes market data, news signals, and risk alerts to Strategos's decision engine with proper priority and context, without implementing any trading logic.
+| Component | Language | Role |
+|-----------|----------|------|
+| `thalamus-core` | Rust crate | Domain types, policy model, envelopes, decisions, risk levels, audit event schemas, context authorization types, validation primitives |
+| `thalamus-server` | Rust service | HTTP/gRPC APIs: policy decisions, pre-call mediation, post-call validation, evaluation hooks, auditing, gateway integration |
+| `thalamus-sdk-python` | Python | SDK for Robson, Python agents, jobs, backend services, evaluation workflows |
+| `thalamus-sdk-ts` | TypeScript | SDK for Strategos, Eden, admin tools, web apps |
+| `thalamus-agentgateway-adapter` | Rust | Translates Thalamus decisions into Agentgateway routes, headers, metadata, policy hooks, observability signals |
+| `thalamus-eval` | Rust + SDK | Schema checks, output validation, quality scoring, hallucination signals, citation checks, future TruthMetal integration |
+| `thalamus-console` | TypeScript | Admin UI: policies, traces, audit events, costs, model/tool permissions, evaluation outcomes |
 
-### Robson (AI Coding Assistant)
-Thalamus mediates between code change detection, test results, and decision systems, normalizing signals from different development tools.
+This repository (`thalamus-core`) is the canonical home for the domain model and
+the architecture of the control layer. Implementation crates and services are
+added here or in sibling repositories as the architecture lands.
 
-### Future RBX Systems
-Any system needing intelligent signal routing between perception and decision can integrate Thalamus without modification.
+## Key documents
 
-## The Biological Inspiration
+| Document | Purpose |
+|----------|---------|
+| [BOUNDARIES.md](BOUNDARIES.md) | What Thalamus is and is not. Read first. |
+| [PURPOSE.md](PURPOSE.md) | Why the control layer exists |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Control plane architecture |
+| [GOVERNANCE.md](GOVERNANCE.md) | Decision framework and phases |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution process |
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
+| [docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md](docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md) | The pivot decision |
+| [docs/02-architecture/target-architecture.md](docs/02-architecture/target-architecture.md) | Components, ports, adapters |
+| [docs/02-architecture/pre-call-and-post-call-responsibilities.md](docs/02-architecture/pre-call-and-post-call-responsibilities.md) | The two mediation phases |
+| [docs/02-architecture/observability-and-evaluation.md](docs/02-architecture/observability-and-evaluation.md) | OpenTelemetry, Langfuse, Prometheus, Grafana |
+| [docs/02-architecture/agentgateway-and-data-plane.md](docs/02-architecture/agentgateway-and-data-plane.md) | Backend adapter model |
+| [docs/03-integration/cross-product-positioning.md](docs/03-integration/cross-product-positioning.md) | Strategos, TruthMetal, Robson, Eden |
+| [docs/99-reference/design-decisions.md](docs/99-reference/design-decisions.md) | Decision log (Foundation entries superseded) |
 
-The biological thalamus acts as the brain's sensory relay station:
-- Receives signals from sensory organs
-- Filters and prioritizes based on attention state
-- Routes to appropriate cortical regions
-- Does NOT interpret meaning or make decisions
+## Status
 
-Our Thalamus follows the same pattern for AI systems. See [docs/01-concept/biological-inspiration.md](docs/01-concept/biological-inspiration.md) for details.
+**Phase**: Architecture (post-pivot). The Foundation-phase signal-router
+definition is superseded by
+[ADR-0001](docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md).
 
-## Key Architectural Insight
+**Language**: Rust-first for core, server, and policy engine. Python and
+TypeScript SDKs. TypeScript admin UI. This is a governed decision, recorded in
+ADR-0001. No implementation code exists yet; the next step is the
+`thalamus-core` Rust crate (domain types and policy model).
 
-```
-Perception Layer → THALAMUS → Decision Layer
-   (Signals)      (Mediation)   (Actions)
+## Use across RBX
 
-Thalamus sits in the middle, providing:
-- Signal normalization
-- Priority-based routing
-- Contextual enrichment
-- Attention management
+- **Robson**: consumes Thalamus for AI-mediated analysis, risk classification,
+  audit, and operational recommendations. Hard trading/risk invariants stay
+  separate from LLM suggestions. Execution-affecting responses require strong
+  policy gates and deterministic or human validation.
+- **Strategos**: consumes Thalamus as a governed AI control service, receives
+  operational/audit/evaluation events, and may expose policy, business plan, and
+  situation-room views. Strategos does not become the low-level LLM gateway.
+- **TruthMetal**: future ground-truth and evidence layer. Provides datasets,
+  assertions, evaluation cases, citation checks, and factual validation hooks.
+  Distinct from Thalamus.
+- **Eden**: uses Thalamus as part of the platform baseline for agentic
+  workflows, internal developer platform features, and governed AI execution.
 
-WITHOUT:
-- Making decisions
-- Implementing business rules
-- Containing domain logic
-- Acting as a standalone system
-```
-
-## Documentation Philosophy
-
-This repository is **AI-first, human-centered**:
-- Documentation designed for both humans and AI agents
-- Clear boundaries enable autonomous agent work
-- Explicit decision frameworks prevent scope creep
-- Living documents evolve with the project
-
-All contributors (human and AI) follow the same standards defined in [CONTRIBUTING.md](CONTRIBUTING.md) and [GOVERNANCE.md](GOVERNANCE.md).
-
-## Getting Started
-
-### I want to understand Thalamus
-1. Read [PURPOSE.md](PURPOSE.md) - Understand why it exists
-2. Read [BOUNDARIES.md](BOUNDARIES.md) - Understand what it is/isn't
-3. Read [ARCHITECTURE.md](ARCHITECTURE.md) - Understand how it works
-4. Explore [docs/01-concept/](docs/01-concept/) - Deep conceptual dive
-
-### I want to contribute
-1. Read [BOUNDARIES.md](BOUNDARIES.md) - **Mandatory**
-2. Read [CONTRIBUTING.md](CONTRIBUTING.md) - Process and standards
-3. Read [GOVERNANCE.md](GOVERNANCE.md) - Decision framework
-4. Check [docs/99-reference/design-decisions.md](docs/99-reference/design-decisions.md) - Past decisions
-5. Propose your contribution following the guidelines
-
-### I want to integrate Thalamus
-1. Read [ARCHITECTURE.md](ARCHITECTURE.md) - System boundaries
-2. Review [docs/03-integration/](docs/03-integration/) - Integration patterns
-3. See product-specific guides (Strategos, Robson, etc.)
-4. Note: Implementation not yet available (Foundation phase)
-
-### I'm an AI agent
-1. Read [.claude/agent-guidelines.md](.claude/agent-guidelines.md) - **Start here**
-2. Read [BOUNDARIES.md](BOUNDARIES.md) - **Mandatory before any work**
-3. Read [docs/00-getting-started/for-agents.md](docs/00-getting-started/for-agents.md) - Quick reference
-4. Follow the decision framework for all contributions
-
-## Development Phases
-
-1. **Phase 0: Foundation** (Current) - Architecture and documentation
-2. **Phase 1: Implementation** - Core signal routing and normalization
-3. **Phase 2: Integration** - Strategos and Robson integration
-4. **Phase 3: Evolution** - Refinement based on real-world use
-
-See [GOVERNANCE.md](GOVERNANCE.md) for phase transition criteria.
-
-## Technology Decisions
-
-**None yet.** We are deliberately NOT choosing technologies, languages, or frameworks during the Foundation phase. These decisions will be made when we transition to Implementation, based on the architectural foundation we're establishing now.
-
-## Questions?
-
-- **Architecture questions**: See [ARCHITECTURE.md](ARCHITECTURE.md) and [docs/02-architecture/](docs/02-architecture/)
-- **Contribution questions**: See [CONTRIBUTING.md](CONTRIBUTING.md)
-- **Boundary questions**: See [BOUNDARIES.md](BOUNDARIES.md)
-- **Conceptual questions**: See [PURPOSE.md](PURPOSE.md) and [docs/01-concept/](docs/01-concept/)
+See [docs/03-integration/cross-product-positioning.md](docs/03-integration/cross-product-positioning.md).
 
 ## License
 
-To be determined by RBX Systems. See [LICENSE](LICENSE) when available.
-
-## Part of RBX Systems
-
-Thalamus is a core component of the RBX Systems ecosystem:
-- **Strategos**: AI-powered trading system
-- **Robson**: AI coding assistant
-- **Future systems**: Additional RBX products
-
-Thalamus provides the cognitive mediation layer enabling these systems to process signals intelligently without embedding business logic.
+To be determined by RBX Systems. See [LICENSE](LICENSE).
 
 ---
 
-**Remember**: Thalamus routes signals; it doesn't decide what they mean.
+*Thalamus governs AI traffic. It does not run the model and it does not move the
+bytes. It decides what is allowed, with which context, and whether the result is
+acceptable.*
 
-*Last updated: 2026-02-02*
+*Last updated: 2026-05-16*
