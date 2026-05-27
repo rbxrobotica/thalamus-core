@@ -16,8 +16,14 @@ pub enum RiskLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyDecision {
     Allow,
-    Deny { reason: String, policy_ref: String },
-    AllowWithReview { review_reason: String, policy_ref: String },
+    Deny {
+        reason: String,
+        policy_ref: String,
+    },
+    AllowWithReview {
+        review_reason: String,
+        policy_ref: String,
+    },
 }
 
 // === Post-call status ===

@@ -52,7 +52,10 @@ impl From<BackendHandleFile> for BackendHandle {
             "A2AAgent" => BackendType::A2AAgent,
             other => BackendType::Custom(other.to_owned()),
         };
-        BackendHandle { id: f.id, backend_type }
+        BackendHandle {
+            id: f.id,
+            backend_type,
+        }
     }
 }
 
@@ -83,4 +86,3 @@ pub fn load_config(path: &str) -> Result<ServerConfig, Box<dyn std::error::Error
     let policies = file.policies.into_iter().map(Into::into).collect();
     Ok(ServerConfig { listen, policies })
 }
-

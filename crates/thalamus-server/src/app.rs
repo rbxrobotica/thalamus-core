@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use axum::Router;
 use axum::routing::{get, post};
+use axum::Router;
 
 use thalamus_core::BackendPort;
 
@@ -21,11 +21,17 @@ pub struct AppState {
     pub obs_port: Arc<dyn thalamus_core::ObservabilityPort + Send + Sync>,
     pub backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
     pub audit_store: AuditStore,
-    #[allow(dead_code, reason = "used by integration tests and future eval inspection endpoint")]
+    #[allow(
+        dead_code,
+        reason = "used by integration tests and future eval inspection endpoint"
+    )]
     pub eval_store: thalamus_eval::EvalStore,
 }
 
-#[allow(dead_code, reason = "used by default binary build and integration tests")]
+#[allow(
+    dead_code,
+    reason = "used by default binary build and integration tests"
+)]
 pub fn build(config: ServerConfig) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());

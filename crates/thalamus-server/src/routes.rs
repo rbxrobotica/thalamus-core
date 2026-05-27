@@ -6,10 +6,7 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use thalamus_core::{
-    AuditId, BackendResponse, CallRequest, PolicyDecision,
-    PreCallError,
-};
+use thalamus_core::{AuditId, BackendResponse, CallRequest, PolicyDecision, PreCallError};
 
 use crate::app::AppState;
 
@@ -142,7 +139,10 @@ pub async fn decide(
             review_reason: None,
             policy_ref: Some(policy_ref.clone()),
         },
-        PolicyDecision::AllowWithReview { review_reason, policy_ref } => DecideResponse {
+        PolicyDecision::AllowWithReview {
+            review_reason,
+            policy_ref,
+        } => DecideResponse {
             decision: "AllowWithReview".to_owned(),
             policy_id: policy.id.clone(),
             reason: None,
@@ -192,12 +192,18 @@ pub async fn pre_call(
 
             let (decision_str, review_reason, policy_ref) = match &outcome.decision {
                 PolicyDecision::Allow => ("Allow".to_owned(), None, None),
-                PolicyDecision::Deny { reason, policy_ref: pr } => {
-                    ("Deny".to_owned(), None, Some(format!("{}: {}", pr, reason)))
-                }
-                PolicyDecision::AllowWithReview { review_reason: rr, policy_ref: pr } => {
-                    ("AllowWithReview".to_owned(), Some(rr.clone()), Some(pr.clone()))
-                }
+                PolicyDecision::Deny {
+                    reason,
+                    policy_ref: pr,
+                } => ("Deny".to_owned(), None, Some(format!("{}: {}", pr, reason))),
+                PolicyDecision::AllowWithReview {
+                    review_reason: rr,
+                    policy_ref: pr,
+                } => (
+                    "AllowWithReview".to_owned(),
+                    Some(rr.clone()),
+                    Some(pr.clone()),
+                ),
             };
 
             let resp = PreCallResponse {
@@ -212,9 +218,16 @@ pub async fn pre_call(
 
             (StatusCode::OK, Json(resp)).into_response()
         }
-        Err(PreCallError::NoPermittedBackend { tenant, product, policy_id: _ }) => {
+        Err(PreCallError::NoPermittedBackend {
+            tenant,
+            product,
+            policy_id: _,
+        }) => {
             let resp = ErrorResponse {
-                error: format!("no permitted backends for tenant {} product {}", tenant, product),
+                error: format!(
+                    "no permitted backends for tenant {} product {}",
+                    tenant, product
+                ),
                 code: "NO_PERMITTED_BACKENDS".to_owned(),
             };
             (StatusCode::UNPROCESSABLE_ENTITY, Json(resp)).into_response()
@@ -302,7 +315,11 @@ pub async fn full_call(
         state.obs_port.as_ref(),
     ) {
         Ok(o) => o,
-        Err(PreCallError::NoPermittedBackend { tenant, product, policy_id }) => {
+        Err(PreCallError::NoPermittedBackend {
+            tenant,
+            product,
+            policy_id,
+        }) => {
             let resp = ErrorResponse {
                 error: format!(
                     "no permitted backends for tenant {} product {} (policy {})",
@@ -340,7 +357,10 @@ pub async fn full_call(
             };
             return (StatusCode::OK, Json(resp)).into_response();
         }
-        PolicyDecision::AllowWithReview { review_reason, policy_ref } => {
+        PolicyDecision::AllowWithReview {
+            review_reason,
+            policy_ref,
+        } => {
             // NO backend call on AllowWithReview
             let post_resp = PostCallResponse {
                 status: "NeedsHumanReview".to_owned(),
@@ -392,24 +412,21 @@ pub async fn full_call(
     // Run the synchronous BackendPort off the async runtime so a slow data
     // plane (real LLM latency) cannot starve the tokio worker.
     let envelope_for_backend = envelope.clone();
-    let backend_response = match tokio::task::spawn_blocking(move || {
-        backend.call(&envelope_for_backend)
-    })
-    .await
-    {
-        Ok(r) => r,
-        Err(_join_err) => {
-            tracing::error!(
-                audit_id = %outcome.audit_id.0,
-                "backend blocking task panicked"
-            );
-            let resp = ErrorResponse {
-                error: "backend execution task failed".to_owned(),
-                code: "BACKEND_TASK_FAILED".to_owned(),
-            };
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response();
-        }
-    };
+    let backend_response =
+        match tokio::task::spawn_blocking(move || backend.call(&envelope_for_backend)).await {
+            Ok(r) => r,
+            Err(_join_err) => {
+                tracing::error!(
+                    audit_id = %outcome.audit_id.0,
+                    "backend blocking task panicked"
+                );
+                let resp = ErrorResponse {
+                    error: "backend execution task failed".to_owned(),
+                    code: "BACKEND_TASK_FAILED".to_owned(),
+                };
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response();
+            }
+        };
 
     // post_call is non-bypassable on the Allow path
     let post_result = thalamus_core::post_call(
@@ -529,7 +546,10 @@ fn decide_to_call_request(req: &DecideRequest) -> CallRequest {
                 "A2AAgent" => thalamus_core::BackendType::A2AAgent,
                 other => thalamus_core::BackendType::Custom(other.to_owned()),
             };
-            thalamus_core::BackendHandle { id: b.id.clone(), backend_type: bt }
+            thalamus_core::BackendHandle {
+                id: b.id.clone(),
+                backend_type: bt,
+            }
         }),
         budget_hint: req.budget_hint.as_ref().map(|h| thalamus_core::BudgetHint {
             max_tokens: h.max_tokens,

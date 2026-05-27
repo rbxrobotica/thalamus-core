@@ -1,5 +1,5 @@
-use thalamus_core::{CallRequest, Policy, PolicyDecision, PolicyPort};
 use crate::config::ServerConfig;
+use thalamus_core::{CallRequest, Policy, PolicyDecision, PolicyPort};
 
 /// Concrete PolicyPort: matches request tenant+product+workflow to loaded
 /// policies. Evaluation is Allow when a matching policy exists with at least
@@ -14,7 +14,6 @@ impl ConfigPolicyPort {
             policies: config.policies.clone(),
         }
     }
-
 }
 
 impl PolicyPort for ConfigPolicyPort {

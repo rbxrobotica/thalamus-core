@@ -50,12 +50,13 @@ impl LiteLLMAdapter {
             .send_json(&request_body)
             .map_err(|e| map_ureq_error(e, start.elapsed()))?;
 
-        let parsed: ChatCompletionsResponse = response
-            .into_body()
-            .read_json()
-            .map_err(|e| AdapterError::MalformedResponse {
-                reason: e.to_string(),
-            })?;
+        let parsed: ChatCompletionsResponse =
+            response
+                .into_body()
+                .read_json()
+                .map_err(|e| AdapterError::MalformedResponse {
+                    reason: e.to_string(),
+                })?;
 
         let content = parsed
             .choices

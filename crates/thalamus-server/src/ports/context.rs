@@ -1,4 +1,4 @@
-use thalamus_core::{ContextEntry, ContextPort, ContextGrant};
+use thalamus_core::{ContextEntry, ContextGrant, ContextPort};
 
 /// Stub context port: returns empty context. Production implementations
 /// would fetch from authorized data sources.
@@ -10,7 +10,6 @@ impl StaticContextPort {
     pub fn empty() -> Self {
         Self { entries: vec![] }
     }
-
 }
 
 impl ContextPort for StaticContextPort {

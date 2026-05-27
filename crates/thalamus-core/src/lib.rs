@@ -7,7 +7,7 @@ pub mod ports;
 pub use audit::AuditEvent;
 pub use domain::{
     AuditId, BackendHandle, BackendResponse, BackendType, BudgetHint, CallRequest, CitationCheck,
-    ContextEntry, Envelope, PostCallResult, PostCallStatus, PolicyDecision, RiskLevel,
+    ContextEntry, Envelope, PolicyDecision, PostCallResult, PostCallStatus, RiskLevel,
     StrategosEvent, TraceId,
 };
 pub use flow::{post_call, pre_call, PreCallError, PreCallOutcome};

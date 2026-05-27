@@ -2,14 +2,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
-use http_body_util::BodyExt;
 use http::{Request, StatusCode};
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use thalamus_core::{
-    BackendHandle, BackendPort, BackendResponse, BackendType, Budget, CallRequest,
-    ContextGrant, Envelope, Policy, PolicyDecision, PolicyPort, RiskLevel,
+    BackendHandle, BackendPort, BackendResponse, BackendType, Budget, CallRequest, ContextGrant,
+    Envelope, Policy, PolicyDecision, PolicyPort, RiskLevel,
 };
 
 use thalamus_server::app;
@@ -62,7 +62,10 @@ impl PolicyPort for FakeReviewPolicyPort {
                 product: request.product.clone(),
                 workflow: request.workflow.clone(),
                 permitted_backends: vec![],
-                budget: Budget { max_tokens: 0, max_latency_ms: 0 },
+                budget: Budget {
+                    max_tokens: 0,
+                    max_latency_ms: 0,
+                },
                 context_grants: vec![],
                 redaction_rules: vec![],
                 audit_required: false,
@@ -150,11 +153,18 @@ fn test_request_body(tenant: &str, product: &str, workflow: &str) -> Value {
     })
 }
 
-async fn send_request(app: axum::Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+async fn send_request(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let mut builder = Request::builder().method(method).uri(uri);
     let request = if let Some(b) = body {
         builder = builder.header("content-type", "application/json");
-        builder.body::<Body>(Body::from(serde_json::to_string(&b).unwrap())).unwrap()
+        builder
+            .body::<Body>(Body::from(serde_json::to_string(&b).unwrap()))
+            .unwrap()
     } else {
         builder.body::<Body>(Body::empty()).unwrap()
     };
@@ -210,11 +220,20 @@ async fn call_allow_with_review_no_backend_needs_human_review() {
 
     // 2. decision starts with "AllowWithReview" and contains "review_id:"
     let decision = resp["decision"].as_str().unwrap();
-    assert!(decision.starts_with("AllowWithReview"), "decision was: {decision}");
-    assert!(decision.contains("review_id:"), "decision missing review_id: {decision}");
+    assert!(
+        decision.starts_with("AllowWithReview"),
+        "decision was: {decision}"
+    );
+    assert!(
+        decision.contains("review_id:"),
+        "decision missing review_id: {decision}"
+    );
 
     // 3. post_call.status == "NeedsHumanReview"
-    assert_eq!(resp["post_call"]["status"].as_str().unwrap(), "NeedsHumanReview");
+    assert_eq!(
+        resp["post_call"]["status"].as_str().unwrap(),
+        "NeedsHumanReview"
+    );
 
     // 4. backend_content is null (no backend call)
     assert!(resp["backend_content"].is_null());
@@ -247,7 +266,10 @@ async fn call_allow_runs_backend_and_post_call() {
     assert!(post_call["schema_valid"].as_bool().unwrap());
 
     // Backend content returned (not raw — post_call ran first)
-    assert_eq!(resp["backend_content"].as_str().unwrap(), "Market analysis result");
+    assert_eq!(
+        resp["backend_content"].as_str().unwrap(),
+        "Market analysis result"
+    );
 }
 
 #[tokio::test]
@@ -425,13 +447,15 @@ fn litellm_success_response() -> String {
             "message": { "content": "Mock LLM analysis result" }
         }],
         "usage": { "total_tokens": 80 }
-    }).to_string()
+    })
+    .to_string()
 }
 
 #[tokio::test]
 async fn litellm_round_trip_happy_path() {
     let mut server = mockito::Server::new_async().await;
-    let mock = server.mock("POST", "/v1/chat/completions")
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(litellm_success_response())
@@ -449,12 +473,16 @@ async fn litellm_round_trip_happy_path() {
     assert_eq!(resp["decision"].as_str().unwrap(), "Allow");
     assert_eq!(resp["post_call"]["status"].as_str().unwrap(), "Valid");
     assert_eq!(resp["post_call"]["risk_class"].as_str().unwrap(), "Low");
-    assert_eq!(resp["backend_content"].as_str().unwrap(), "Mock LLM analysis result");
+    assert_eq!(
+        resp["backend_content"].as_str().unwrap(),
+        "Mock LLM analysis result"
+    );
 
     let audit_id = resp["post_call"]["audit_id"].as_str().unwrap();
 
     // Audit is retrievable by audit_id
-    let (status, audit_resp) = send_request(app, "GET", &format!("/v1/audit/{}", audit_id), None).await;
+    let (status, audit_resp) =
+        send_request(app, "GET", &format!("/v1/audit/{}", audit_id), None).await;
     assert_eq!(status, StatusCode::OK);
     let events = audit_resp["events"].as_array().unwrap();
     assert!(events.len() >= 2);
@@ -465,7 +493,8 @@ async fn litellm_round_trip_happy_path() {
 #[tokio::test]
 async fn litellm_server_5xx_yields_invalid() {
     let mut server = mockito::Server::new_async().await;
-    let mock = server.mock("POST", "/v1/chat/completions")
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
         .with_status(500)
         .with_body("internal error")
         .create_async()
@@ -491,7 +520,8 @@ async fn litellm_server_5xx_yields_invalid() {
 #[tokio::test]
 async fn litellm_malformed_body_yields_invalid() {
     let mut server = mockito::Server::new_async().await;
-    let mock = server.mock("POST", "/v1/chat/completions")
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body("this is not json")
@@ -519,10 +549,12 @@ async fn litellm_over_budget_response_is_prohibited() {
             "message": { "content": "Expensive response" }
         }],
         "usage": { "total_tokens": 5000 }
-    }).to_string();
+    })
+    .to_string();
 
     let mut server = mockito::Server::new_async().await;
-    let mock = server.mock("POST", "/v1/chat/completions")
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(body)
@@ -538,7 +570,10 @@ async fn litellm_over_budget_response_is_prohibited() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(resp["post_call"]["status"].as_str().unwrap(), "Invalid");
-    assert_eq!(resp["post_call"]["risk_class"].as_str().unwrap(), "Prohibited");
+    assert_eq!(
+        resp["post_call"]["risk_class"].as_str().unwrap(),
+        "Prohibited"
+    );
     assert!(!resp["post_call"]["executable_by_agent"].as_bool().unwrap());
 
     mock.assert();
@@ -571,12 +606,14 @@ async fn litellm_split_path_decide_then_post_call() {
         "tokens_used": 80,
         "latency_ms": 150
     });
-    let (status, post_resp) = send_request(app.clone(), "POST", "/v1/post-call", Some(post_body)).await;
+    let (status, post_resp) =
+        send_request(app.clone(), "POST", "/v1/post-call", Some(post_body)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(post_resp["status"].as_str().unwrap(), "Valid");
 
     // Step 3: audit retrievable
-    let (status, audit_resp) = send_request(app, "GET", &format!("/v1/audit/{}", audit_id), None).await;
+    let (status, audit_resp) =
+        send_request(app, "GET", &format!("/v1/audit/{}", audit_id), None).await;
     assert_eq!(status, StatusCode::OK);
     let events = audit_resp["events"].as_array().unwrap();
     assert!(events.len() >= 2);
@@ -707,7 +744,9 @@ fn make_agentgateway_adapter(mock_url: &str) -> Arc<dyn BackendPort + Send + Syn
         timeout: Duration::from_secs(5),
         auth_header: None,
     };
-    Arc::new(thalamus_agentgateway_adapter::AgentgatewayAdapter::new(config))
+    Arc::new(thalamus_agentgateway_adapter::AgentgatewayAdapter::new(
+        config,
+    ))
 }
 
 fn openai_success_response() -> String {
@@ -716,13 +755,15 @@ fn openai_success_response() -> String {
             "message": { "content": "Agentgateway mock analysis result" }
         }],
         "usage": { "total_tokens": 80 }
-    }).to_string()
+    })
+    .to_string()
 }
 
 #[tokio::test]
 async fn agentgateway_round_trip_happy_path() {
     let mut server = mockito::Server::new_async().await;
-    let mock = server.mock("POST", "/v1/chat/completions")
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(openai_success_response())
@@ -748,13 +789,8 @@ async fn agentgateway_round_trip_happy_path() {
     let audit_id = resp["post_call"]["audit_id"].as_str().unwrap();
 
     // Audit is retrievable by audit_id
-    let (status, audit_resp) = send_request(
-        app,
-        "GET",
-        &format!("/v1/audit/{}", audit_id),
-        None,
-    )
-    .await;
+    let (status, audit_resp) =
+        send_request(app, "GET", &format!("/v1/audit/{}", audit_id), None).await;
     assert_eq!(status, StatusCode::OK);
     let events = audit_resp["events"].as_array().unwrap();
     assert!(events.len() >= 2);
@@ -765,7 +801,8 @@ async fn agentgateway_round_trip_happy_path() {
 #[tokio::test]
 async fn agentgateway_server_5xx_yields_invalid() {
     let mut server = mockito::Server::new_async().await;
-    let mock = server.mock("POST", "/v1/chat/completions")
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
         .with_status(500)
         .with_body("internal error")
         .create_async()
@@ -789,7 +826,8 @@ async fn agentgateway_server_5xx_yields_invalid() {
 #[tokio::test]
 async fn agentgateway_malformed_body_yields_invalid() {
     let mut server = mockito::Server::new_async().await;
-    let mock = server.mock("POST", "/v1/chat/completions")
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body("this is not json")
@@ -817,10 +855,12 @@ async fn agentgateway_over_budget_response_is_prohibited() {
             "message": { "content": "Expensive response" }
         }],
         "usage": { "total_tokens": 5000 }
-    }).to_string();
+    })
+    .to_string();
 
     let mut server = mockito::Server::new_async().await;
-    let mock = server.mock("POST", "/v1/chat/completions")
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(body)
@@ -874,11 +914,13 @@ async fn backend_swap_agentgateway_produces_same_flow_as_litellm() {
             "message": { "content": "Swap test response" }
         }],
         "usage": { "total_tokens": 42 }
-    }).to_string();
+    })
+    .to_string();
 
     // --- Run with Agentgateway adapter ---
     let mut ag_server = mockito::Server::new_async().await;
-    let ag_mock = ag_server.mock("POST", "/v1/chat/completions")
+    let ag_mock = ag_server
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(&success_body)
@@ -907,7 +949,8 @@ async fn backend_swap_agentgateway_produces_same_flow_as_litellm() {
 
     // --- Run with LiteLLM adapter ---
     let mut ll_server = mockito::Server::new_async().await;
-    let ll_mock = ll_server.mock("POST", "/v1/chat/completions")
+    let ll_mock = ll_server
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(&success_body)
@@ -940,10 +983,7 @@ async fn backend_swap_agentgateway_produces_same_flow_as_litellm() {
         ag_resp["post_call"]["schema_valid"],
         ll_resp["post_call"]["schema_valid"]
     );
-    assert_eq!(
-        ag_resp["backend_content"],
-        ll_resp["backend_content"]
-    );
+    assert_eq!(ag_resp["backend_content"], ll_resp["backend_content"]);
 
     ag_mock.assert();
     ll_mock.assert();
