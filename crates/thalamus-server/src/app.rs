@@ -121,8 +121,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Build an app with an injected eval sink (for Langfuse or other external sinks).
-#[cfg(feature = "langfuse")]
+/// Build an app with an injected eval sink, normally backed by the TraceExporter seam.
 pub fn build_with_eval_sink(
     config: ServerConfig,
     backend: Option<Arc<dyn BackendPort + Send + Sync>>,

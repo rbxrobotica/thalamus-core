@@ -106,6 +106,13 @@ label {
   margin-bottom: var(--s-1);
 }
 
+.field-label {
+  display: block;
+  font-size: var(--text-sm);
+  color: var(--fg-2);
+  margin-bottom: var(--s-1);
+}
+
 /* Buttons */
 button.primary {
   padding: 10px 20px;

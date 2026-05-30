@@ -84,21 +84,21 @@
     <h3>Result</h3>
     <div class="row" style="margin-bottom: var(--s-3);">
       <div>
-        <label>Status</label>
+        <span class="field-label">Status</span>
         <span class="badge badge-allow">{result.status}</span>
       </div>
       <div>
-        <label>Risk Class</label>
+        <span class="field-label">Risk Class</span>
         <span class="badge" style="background: rgba(0, 255, 255, 0.08); color: var(--cyan-muted);">{result.risk_class}</span>
       </div>
     </div>
     <div class="row" style="margin-bottom: var(--s-3);">
       <div>
-        <label>Executable by Agent</label>
+        <span class="field-label">Executable by Agent</span>
         <span>{result.executable_by_agent ? 'Yes' : 'No'}</span>
       </div>
       <div>
-        <label>Schema Valid</label>
+        <span class="field-label">Schema Valid</span>
         <span>{result.schema_valid ? 'Yes' : 'No'}</span>
       </div>
     </div>
