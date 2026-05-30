@@ -10,9 +10,8 @@ use thalamus_core::BackendPort;
 
 #[cfg(feature = "langfuse")]
 fn default_trace_exporter_sink() -> Arc<dyn thalamus_eval::EvalSink + Send + Sync> {
-    let exporter: Arc<dyn ports::TraceExporter + Send + Sync> =
-        Arc::new(ports::trace_exporter::LangfuseTraceExporter::from_env());
-    Arc::new(ports::TraceExporterEvalSink::new(exporter))
+    ports::trace_exporter::trace_exporter_sink_from_env()
+        .unwrap_or_else(|| Arc::new(thalamus_eval::NoOpSink))
 }
 
 #[tokio::main]
@@ -30,7 +29,7 @@ async fn main() {
 
     let addr = config.listen_addr();
 
-    // === Langfuse + LiteLLM ===
+    // === Trace exporter + LiteLLM ===
     #[cfg(all(feature = "langfuse", feature = "litellm"))]
     let app = {
         let endpoint = std::env::var("LITELLM_ENDPOINT").unwrap_or_else(|_| {
@@ -52,7 +51,7 @@ async fn main() {
         )
     };
 
-    // === Langfuse + AgentGateway ===
+    // === Trace exporter + AgentGateway ===
     #[cfg(all(
         feature = "langfuse",
         feature = "agentgateway",
@@ -80,7 +79,7 @@ async fn main() {
         )
     };
 
-    // === Langfuse, no backend ===
+    // === Trace exporter, no backend ===
     #[cfg(all(
         feature = "langfuse",
         not(any(feature = "litellm", feature = "agentgateway"))
@@ -108,7 +107,16 @@ async fn main() {
         let backend: Arc<dyn BackendPort + Send + Sync> = Arc::new(
             thalamus_litellm_adapter::LiteLLMAdapter::new(adapter_config),
         );
-        app::build_with_backend(config, backend)
+        if let Some(sink) = ports::trace_exporter::trace_exporter_sink_from_env() {
+            app::build_with_eval_sink(
+                config,
+                Some(backend),
+                sink,
+                thalamus_eval::ContentPolicy::MetadataOnly,
+            )
+        } else {
+            app::build_with_backend(config, backend)
+        }
     };
 
     // === AgentGateway, no Langfuse ===
@@ -130,7 +138,16 @@ async fn main() {
         let backend: Arc<dyn BackendPort + Send + Sync> = Arc::new(
             thalamus_agentgateway_adapter::AgentgatewayAdapter::new(adapter_config),
         );
-        app::build_with_backend(config, backend)
+        if let Some(sink) = ports::trace_exporter::trace_exporter_sink_from_env() {
+            app::build_with_eval_sink(
+                config,
+                Some(backend),
+                sink,
+                thalamus_eval::ContentPolicy::MetadataOnly,
+            )
+        } else {
+            app::build_with_backend(config, backend)
+        }
     };
 
     // === No backend, no Langfuse ===
@@ -138,7 +155,16 @@ async fn main() {
         not(feature = "langfuse"),
         not(any(feature = "litellm", feature = "agentgateway"))
     ))]
-    let app = app::build(config);
+    let app = if let Some(sink) = ports::trace_exporter::trace_exporter_sink_from_env() {
+        app::build_with_eval_sink(
+            config,
+            None,
+            sink,
+            thalamus_eval::ContentPolicy::MetadataOnly,
+        )
+    } else {
+        app::build(config)
+    };
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

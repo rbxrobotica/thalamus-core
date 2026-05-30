@@ -1,6 +1,6 @@
 # Observability Migration
 
-This note tracks the first conservative increment of the ADR-0010 / ADR-0300
+This note tracks the conservative increments of the ADR-0010 / ADR-0300
 Thalamus slim-down for observability.
 
 ## Current State
@@ -14,6 +14,12 @@ The server now routes that export through a thin `TraceExporter` seam in
 `thalamus-server`. The default implementation is `LangfuseTraceExporter`, which
 wraps the existing adapter instead of replacing it.
 
+An HTTP exporter is also available behind configuration. When
+`RBX_OBSERVABILITY_URL` is set, Thalamus sends eval trace spans to
+`{RBX_OBSERVABILITY_URL}/v1/traces` using `Authorization: Bearer
+<RBX_OBSERVABILITY_TOKEN>` when `RBX_OBSERVABILITY_TOKEN` is configured. When
+`RBX_OBSERVABILITY_URL` is unset, runtime behavior is unchanged.
+
 ## New Owner
 
 Reusable Langfuse ingestion logic now also lives in `rbx-observability` as a
@@ -22,12 +28,10 @@ metrics, and alerting per governance ADR-0300.
 
 ## Planned Cutover
 
-The next increment should keep the `TraceExporter` trait and replace
-`LangfuseTraceExporter` with an HTTP exporter that sends trace/eval submissions
-to `rbx-observability` once its real ingestion endpoint is live.
-
-After that service path is verified, a later increment can remove
-`thalamus-langfuse-adapter` from Thalamus.
+The final increment should remove Thalamus' in-process Langfuse adapter only
+after `rbx-observability` is deployed and the `/v1/traces` service path is
+validated. That removal is intentionally out of scope for the HTTP-exporter
+increment.
 
 ## References
 
