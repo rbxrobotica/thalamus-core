@@ -8,6 +8,13 @@ use std::sync::Arc;
 #[cfg(any(feature = "litellm", feature = "agentgateway"))]
 use thalamus_core::BackendPort;
 
+#[cfg(feature = "langfuse")]
+fn default_trace_exporter_sink() -> Arc<dyn thalamus_eval::EvalSink + Send + Sync> {
+    let exporter: Arc<dyn ports::TraceExporter + Send + Sync> =
+        Arc::new(ports::trace_exporter::LangfuseTraceExporter::from_env());
+    Arc::new(ports::TraceExporterEvalSink::new(exporter))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().json().with_target(false).init();
@@ -36,10 +43,7 @@ async fn main() {
         let backend: Arc<dyn BackendPort + Send + Sync> = Arc::new(
             thalamus_litellm_adapter::LiteLLMAdapter::new(adapter_config),
         );
-        let langfuse_config = thalamus_langfuse_adapter::config::LangfuseConfig::from_env();
-        let sink: Arc<dyn thalamus_eval::EvalSink + Send + Sync> = Arc::new(
-            thalamus_langfuse_adapter::LangfuseSink::new(langfuse_config),
-        );
+        let sink = default_trace_exporter_sink();
         app::build_with_eval_sink(
             config,
             Some(backend),
@@ -67,10 +71,7 @@ async fn main() {
         let backend: Arc<dyn BackendPort + Send + Sync> = Arc::new(
             thalamus_agentgateway_adapter::AgentgatewayAdapter::new(adapter_config),
         );
-        let langfuse_config = thalamus_langfuse_adapter::config::LangfuseConfig::from_env();
-        let sink: Arc<dyn thalamus_eval::EvalSink + Send + Sync> = Arc::new(
-            thalamus_langfuse_adapter::LangfuseSink::new(langfuse_config),
-        );
+        let sink = default_trace_exporter_sink();
         app::build_with_eval_sink(
             config,
             Some(backend),
@@ -85,10 +86,7 @@ async fn main() {
         not(any(feature = "litellm", feature = "agentgateway"))
     ))]
     let app = {
-        let langfuse_config = thalamus_langfuse_adapter::config::LangfuseConfig::from_env();
-        let sink: Arc<dyn thalamus_eval::EvalSink + Send + Sync> = Arc::new(
-            thalamus_langfuse_adapter::LangfuseSink::new(langfuse_config),
-        );
+        let sink = default_trace_exporter_sink();
         app::build_with_eval_sink(
             config,
             None,
