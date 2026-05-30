@@ -8,6 +8,7 @@
     { href: '/call', label: 'Call' },
     { href: '/post-call', label: 'Post-Call' },
     { href: '/audit', label: 'Audit' },
+    { href: '/system', label: 'System' },
   ];
 </script>
 

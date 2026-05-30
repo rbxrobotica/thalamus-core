@@ -53,27 +53,27 @@
         <h3>Post-Call</h3>
         <div class="row">
           <div>
-            <label>Status</label>
+            <span class="field-label">Status</span>
             <span class="badge badge-allow">{result.post_call.status}</span>
           </div>
           <div>
-            <label>Risk Class</label>
+            <span class="field-label">Risk Class</span>
             <span class="badge" style="background: rgba(0, 255, 255, 0.08); color: var(--cyan-muted);">{result.post_call.risk_class}</span>
           </div>
         </div>
         <div class="row">
           <div>
-            <label>Executable by Agent</label>
+            <span class="field-label">Executable by Agent</span>
             <span>{result.post_call.executable_by_agent ? 'Yes' : 'No'}</span>
           </div>
           <div>
-            <label>Schema Valid</label>
+            <span class="field-label">Schema Valid</span>
             <span>{result.post_call.schema_valid ? 'Yes' : 'No'}</span>
           </div>
         </div>
         {#if result.post_call.audit_id}
           <div>
-            <label>Audit ID</label>
+            <span class="field-label">Audit ID</span>
             <code style="font-family: var(--font-mono); font-size: var(--text-xs); color: var(--cyan-muted);">{result.post_call.audit_id}</code>
           </div>
         {/if}

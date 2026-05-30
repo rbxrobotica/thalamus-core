@@ -51,11 +51,11 @@
     </div>
     <div class="row" style="margin-bottom: var(--s-3);">
       <div>
-        <label>Trace ID</label>
+        <span class="field-label">Trace ID</span>
         <code style="font-family: var(--font-mono); font-size: var(--text-xs); color: var(--cyan-muted);">{result.trace_id}</code>
       </div>
       <div>
-        <label>Audit ID</label>
+        <span class="field-label">Audit ID</span>
         <code style="font-family: var(--font-mono); font-size: var(--text-xs); color: var(--cyan-muted);">{result.audit_id}</code>
       </div>
     </div>

@@ -3,6 +3,10 @@ const STORAGE_KEY = 'thalamus-console-config';
 export interface AppConfig {
   baseUrl: string;
   authHeader?: string;
+  observabilityUrl?: string;
+  observabilityToken?: string;
+  memoryUrl?: string;
+  maestroUrl?: string;
 }
 
 function load(): AppConfig {
