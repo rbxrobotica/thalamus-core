@@ -1,6 +1,6 @@
 # Thalamus Boundaries
 
-**Status**: Living Document | **Version**: 0.2.0 | **Last Updated**: 2026-05-16
+**Status**: Living Document | **Version**: 0.3.0 | **Last Updated**: 2026-07-12
 
 This document supersedes the 0.1.0 signal-mediation boundary framework and its
 Five-Question Framework. See
@@ -9,12 +9,17 @@ north-star document. Read it before any contribution.
 
 ## The core principle
 
-> Thalamus is the semantic control layer for AI traffic. It decides and
-> validates. It does not run the model and it does not move the bytes.
+> Thalamus does not host inference, own provider execution, or embed
+> provider-specific transport as domain logic. When deployed in inline mediated
+> mode, Thalamus may carry prompts, responses and streams as an enforcement
+> point, applying identity, policy, budget, routing, pre-call controls,
+> post-call validation and audit correlation through a replaceable BackendPort.
 
 Thalamus applies business rules, policies, context, validation, routing
 decisions, observability, evaluation, and auditability before and after calls to
 language models, tools, MCP servers, A2A agents, or other AI execution backends.
+`BackendPort` is the only approved boundary through which model traffic leaves
+Thalamus toward LiteLLM, Agentgateway, or future backend adapters.
 
 ## What Thalamus IS
 
@@ -98,10 +103,16 @@ budget, context, risk, schema, audit, evaluation)?**
 - NO -> belongs elsewhere
 
 ### 2. Data plane question
-**Does this move bytes, hold connections, proxy streams, or enforce transport
-rate limits?**
-- YES -> does NOT belong in Thalamus (data plane)
+**Does this require Thalamus core/server to own provider-specific protocol,
+connection pooling, gateway types, credentials, or generic transport
+infrastructure?**
+- YES -> does NOT belong in Thalamus (adapter/backend/data plane)
 - NO -> may belong in Thalamus
+
+**Does this carry approved model payload only so Thalamus can enforce policy in
+inline mediated mode through `BackendPort`?**
+- YES -> may belong in `thalamus-server`
+- NO -> evaluate the other boundary questions
 
 ### 3. Gateway-coupling question
 **Does this require domain or product code to reference a specific gateway or
@@ -121,17 +132,21 @@ hardcoded product logic?**
 - YES -> belongs as policy, not as a code branch
 - NO -> reconsider; most variation is policy
 
-A capability belongs in Thalamus only if: Control = YES, Data plane = NO,
-Gateway-coupling = NO, Ownership = NO, and variation is expressed as Policy.
+A capability belongs in Thalamus only if: Control = YES, provider/gateway
+transport ownership = NO, Gateway-coupling = NO, Ownership = NO, and variation is
+expressed as Policy. Inline payload mediation is permitted only through
+`BackendPort` as an enforcement path.
 
 ## Common boundary violations
 
-### Violation: transport in the control plane
+### Violation: provider transport in the control plane
 
 ```
-WRONG: Thalamus opens an HTTP/2 stream to the provider and relays tokens.
-RIGHT: Thalamus produces a routing decision and hands the envelope to
-       BackendPort. The data plane streams.
+WRONG: thalamus-core imports a provider SDK or Agentgateway/LiteLLM type.
+WRONG: thalamus-server owns provider connection pooling, provider credentials,
+       or provider-specific retry/fallback semantics.
+RIGHT: thalamus-server invokes BackendPort with an approved route envelope.
+       Adapter/backend code owns provider-specific transport and technical retry.
 ```
 
 ### Violation: gateway type in domain code
@@ -176,8 +191,8 @@ RIGHT: Thalamus emits an audit/operational event; Strategos persists
 +-------------------------------------+
                  |  Thalamus SDK
 +-------------------------------------+
-|  THALAMUS CONTROL PLANE             |  policy, audit, context auth,
-|  decide / pre-call / post-call      |  risk, evaluation, routing decision
+|  THALAMUS INLINE CONTROL PLANE      |  policy, audit, context auth,
+|  decide / pre-call / call / post    |  risk, evaluation, routing decision
 +-------------------------------------+
                  |  BackendPort (no gateway types cross this line)
 +-------------------------------------+
@@ -190,8 +205,10 @@ RIGHT: Thalamus emits an audit/operational event; Strategos persists
 +-------------------------------------+
 ```
 
-Thalamus must NOT reach down into transport, and must NOT absorb caller business
-ownership or sibling-product ownership.
+Thalamus must NOT reach down into provider-specific transport ownership, and
+must NOT absorb caller business ownership or sibling-product ownership. Inline
+model payload mediation is allowed only as a policy/audit enforcement path
+through `BackendPort`.
 
 ## Enforcement
 
@@ -203,18 +220,19 @@ ownership or sibling-product ownership.
 4. Express variation as policy.
 
 ### For reviewers
-1. Reject changes that put transport, gateway types, or sibling-product
-   ownership into the control plane.
+1. Reject changes that put provider-specific transport ownership, gateway types,
+   or sibling-product ownership into the control plane.
 2. Require a recorded boundary analysis for new capabilities.
 3. Maintain boundary integrity over feature velocity.
 
 ## Living document
 
 When the boundary needs to change, propose it as an ADR (governed decision),
-record it in `docs/adr/`, and add a superseded note rather than deleting the
-prior reasoning.
+record it in `docs/adr/` or the tactical governance ADR set, and add a superseded
+note rather than deleting the prior reasoning.
 
 ---
 
-*Thalamus governs AI traffic. It does not generate it and it does not transport
-it.*
+*Thalamus governs AI traffic. It does not generate inference or own provider
+transport. In inline mediated mode it may carry approved model payloads through
+`BackendPort` to enforce policy, budget, validation, and audit.*
