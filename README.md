@@ -34,12 +34,13 @@ answers, for every AI-mediated call:
 - Not merely a gateway.
 - Not based on Agentgateway.
 
-Thalamus is gateway-agnostic at the product and domain layer. Agentgateway is a
-low-level data plane backend that Thalamus may support as a privileged backend
-through an adapter.
+Thalamus is gateway-agnostic at the product and domain layer. Agentgateway and
+LiteLLM are replaceable technical backends that Thalamus may support through
+`BackendPort` adapters.
 
-> Thalamus is gateway-agnostic at the product layer, but Agentgateway-native at
-> the RBX infrastructure adapter layer.
+> Thalamus does not host inference or own provider transport. In inline mediated
+> mode, it may carry prompts, responses and streams as the institutional
+> enforcement point.
 
 See [BOUNDARIES.md](BOUNDARIES.md) for the full control boundary.
 
@@ -55,7 +56,7 @@ See [BOUNDARIES.md](BOUNDARIES.md) for the full control boundary.
                  |             context auth, redaction,       |
                  |             routing decision, trace/audit  |
                  |                                           |
-                 |  -- delegates transport to data plane --> |
+                 |  -- BackendPort inline mediation -------->|
                  +---------------------+---------------------+
                                        |
                                        v
@@ -116,17 +117,27 @@ added here or in sibling repositories as the architecture lands.
 | [docs/02-architecture/agentgateway-and-data-plane.md](docs/02-architecture/agentgateway-and-data-plane.md) | Backend adapter model |
 | [docs/03-integration/cross-product-positioning.md](docs/03-integration/cross-product-positioning.md) | Strategos, TruthMetal, Robson, Eden |
 | [docs/99-reference/design-decisions.md](docs/99-reference/design-decisions.md) | Decision log (Foundation entries superseded) |
+| [rbx-governance ADR-0401](../rbx-governance/docs/adr/ADR-0401-thalamus-inline-mediated-mode.md) | Proposed inline mediated mode for institutional LLM access |
+| [Agentic LLM Access P0 Standard](../rbx-governance/docs/standards/agentic-llm-access-p0.md) | Proposed session, route, lease, streaming, monitoring, and audit contracts |
 
 ## Status
 
-**Phase**: Architecture (post-pivot). The Foundation-phase signal-router
-definition is superseded by
-[ADR-0001](docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md).
+**Phase**: Architecture and P0 contract hardening (post-pivot). The Foundation
+signal-router definition is superseded by
+[ADR-0001](docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md) and the
+inline mediated mode is proposed in
+[`rbx-governance` ADR-0401](../rbx-governance/docs/adr/ADR-0401-thalamus-inline-mediated-mode.md).
 
-**Language**: Rust-first for core, server, and policy engine. Python and
-TypeScript SDKs. TypeScript admin UI. This is a governed decision, recorded in
-ADR-0001. No implementation code exists yet; the next step is the
-`thalamus-core` Rust crate (domain types and policy model).
+**Current implementation**: this repository already contains Rust crates for
+`thalamus-core`, `thalamus-server`, LiteLLM and Agentgateway adapters, and eval
+support. The server currently exposes `/v1/decide`, `/v1/pre-call`,
+`/v1/post-call`, `/v1/call`, and `/v1/audit/{id}`.
+
+**Not production-ready for the institutional LLM pilot yet**: authentication,
+session records, route envelopes, durable audit, payload redaction, streaming,
+cancellation, typed errors, health/readiness, OpenTelemetry, budget enforcement,
+rate limits, circuit breakers, and LiteLLM bypass-blocking NetworkPolicies are
+still P0 implementation work.
 
 ## Use across RBX
 
@@ -151,8 +162,8 @@ To be determined by RBX Systems. See [LICENSE](LICENSE).
 
 ---
 
-*Thalamus governs AI traffic. It does not run the model and it does not move the
-bytes. It decides what is allowed, with which context, and whether the result is
-acceptable.*
+*Thalamus governs AI traffic. It does not run the model or own provider
+transport. In inline mediated mode it may carry model payloads through
+`BackendPort` to enforce policy, budget, routing, validation, and audit.*
 
-*Last updated: 2026-05-16*
+*Last updated: 2026-07-12*

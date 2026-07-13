@@ -22,7 +22,7 @@ READ FIRST (binding, do not skip; if any conflict, the doc wins, stop and ask):
 DEFINITION (do not relitigate)
 Thalamus is the semantic control layer for AI traffic. It decides (pre-call),
 validates (post-call), audits, evaluates, classifies risk, and produces routing
-decisions. It does NOT transport bytes. Agentgateway/LiteLLM are BackendPort
+decisions. It does NOT own provider transport. Inline model payload mediation is allowed only through BackendPort. Agentgateway/LiteLLM are BackendPort
 implementations, never domain dependencies.
 
 SCOPE: TH-S1 ONLY = the `thalamus-core` Rust crate. Nothing else.

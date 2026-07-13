@@ -1,6 +1,6 @@
 # Contributing to Thalamus
 
-**Version**: 0.2.0 | **Last Updated**: 2026-05-16
+**Version**: 0.3.0 | **Last Updated**: 2026-07-12
 
 This supersedes the 0.1.0 contribution guide, which assumed Phase 0 was
 documentation-only with no technology decisions. See
@@ -34,8 +34,9 @@ truth, Robson invariants).
 Before adding a capability, answer (from [BOUNDARIES.md](BOUNDARIES.md)):
 
 1. **Control**: is this a decision/validation about an AI-mediated call?
-2. **Data plane**: does this move bytes / hold connections / proxy / transport
-   rate-limit? (must be NO)
+2. **Provider transport ownership**: does this own provider protocol,
+   credentials, connection pools, gateway types, or technical retry/fallback?
+   (must be NO)
 3. **Gateway-coupling**: does this need a gateway/provider type in domain code?
    (must be NO)
 4. **Ownership**: is this Strategos memory, TruthMetal truth, or Robson trading

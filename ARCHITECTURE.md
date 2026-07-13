@@ -1,6 +1,6 @@
 # Thalamus Architecture
 
-**Version**: 0.2.0 | **Last Updated**: 2026-05-16 | **Phase**: Architecture
+**Version**: 0.3.0 | **Last Updated**: 2026-07-12 | **Phase**: Architecture and P0 contracts
 
 This document supersedes the 0.1.0 signal-mediation architecture. See
 [ADR-0001](docs/adr/ADR-0001-thalamus-as-semantic-control-layer.md). Read
@@ -25,7 +25,7 @@ server, A2A agent), reached through a replaceable data plane.
 |   pre-call mediation  --->  routing decision                 |
 |        ^                          |                          |
 |        |                          v                          |
-|   post-call validation  <---  delegate to data plane         |
+|   post-call validation  <---  BackendPort / backend adapter  |
 |                                                              |
 |   policy | context auth | risk | budget | audit | eval       |
 +----------------------------+---------------------------------+
@@ -45,15 +45,16 @@ server, A2A agent), reached through a replaceable data plane.
 
 ## Core architectural principles
 
-### 1. Control plane, not data plane
+### 1. Control plane with inline enforcement, not provider transport owner
 
-Thalamus decides and validates. It does not move bytes, hold connections, or
-proxy streams. Transport is delegated to the data plane through a port.
+Thalamus decides, validates, and may mediate approved model payloads inline
+through `BackendPort`. It does not own provider-specific protocol, credentials,
+connection pools, gateway types, or technical retry/fallback semantics.
 
 ```
-CORRECT: Thalamus selects model M under policy P, builds the envelope,
-         records the decision, hands the envelope to the backend port.
-WRONG:   Thalamus opens a socket to the provider and streams tokens.
+CORRECT: Thalamus selects model class M under policy P, builds the route
+         envelope, records the decision, and invokes BackendPort.
+WRONG:   thalamus-core imports a provider SDK or Agentgateway/LiteLLM type.
 ```
 
 ### 2. Gateway-agnostic at the product layer

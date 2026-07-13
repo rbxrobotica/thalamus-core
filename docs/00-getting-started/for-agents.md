@@ -1,6 +1,6 @@
 # Quick Start for AI Agents
 
-**Version**: 0.2.0 | **Last Updated**: 2026-05-16
+**Version**: 0.3.0 | **Last Updated**: 2026-07-12
 
 This supersedes the 0.1.0 quick start. See
 [ADR-0001](../adr/ADR-0001-thalamus-as-semantic-control-layer.md).
@@ -25,15 +25,16 @@ superseded. Trust [BOUNDARIES.md](../../BOUNDARIES.md) and ADR-0001.
 ## The control-boundary framework
 
 ```
-1. Control:          is this a decision/validation about an AI call?   want YES
-2. Data plane:       does this move bytes / proxy / transport-rate-limit? want NO
-3. Gateway-coupling: does this need a gateway type in domain code?       want NO
-4. Ownership:        is this Strategos/TruthMetal/Robson territory?      want NO
-5. Policy:           can this be policy instead of a code branch?        prefer YES
+1. Control:          is this a decision/validation about an AI call?      want YES
+2. Provider transport: does this own provider protocol/credentials/types? want NO
+3. Gateway-coupling: does this need a gateway type in domain code?        want NO
+4. Ownership:        is this Strategos/TruthMetal/Robson territory?       want NO
+5. Policy:           can this be policy instead of a code branch?         prefer YES
 ```
 
-Belongs in Thalamus only if Control=YES, Data plane=NO, Gateway-coupling=NO,
-Ownership=NO, and variation is Policy.
+Belongs in Thalamus only if Control=YES, provider transport ownership=NO,
+Gateway-coupling=NO, Ownership=NO, and variation is Policy. Inline model payload
+mediation is allowed only through `BackendPort`.
 
 ## Decision levels
 
@@ -46,8 +47,9 @@ Ownership=NO, and variation is Policy.
 ## Red flags (stop)
 
 - Putting a gateway/provider type into `thalamus-core` or `thalamus-server`.
-- Adding transport (connection pooling, streaming, MCP multiplexing) to the
-  control plane.
+- Adding provider transport ownership (provider SDKs, connection pooling,
+  gateway types, provider credentials, or provider-specific retry/fallback) to
+  the control plane.
 - Hardcoding policy as `if product == ...`.
 - Skipping post-call validation.
 - Storing strategic memory, ground truth, or trading invariants in Thalamus.

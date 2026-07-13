@@ -28,7 +28,7 @@ The Architecture Council ratified [`rbx-governance/docs/adr/ADR-0008-agentic-mcp
 
 This repository **is** the AI control plane named by ADR-0008. Several invariants are direct constraints on what may be added here:
 
-- **No transport** in `thalamus-core` or `thalamus-server`. No connection pools, no MCP multiplexing, no streaming proxies. That is the data plane (Agentgateway / LiteLLM / others) behind `BackendPort`.
+- **No provider transport ownership** in `thalamus-core` or `thalamus-server`. No provider SDKs, gateway domain types, provider credential ownership, connection pools, MCP multiplexing, or provider-specific retry/fallback logic. Inline model payload mediation is permitted only through `BackendPort` as an enforcement path.
 - **No gateway types** in domain code. `thalamus-core` and `thalamus-server` must never import an Agentgateway / LiteLLM / provider type. Only adapter crates (`thalamus-agentgateway-adapter`, future LiteLLM adapter, etc.) may know those types.
 - **Policy is data, not code branches.** Variation belongs in the policy engine; do not encode product-specific rules as `if`/`switch` in core or server.
 - **Pre-call decision + post-call validation are first-class.** Every AI-mediated call passes both, unless an exemption is recorded by policy.
