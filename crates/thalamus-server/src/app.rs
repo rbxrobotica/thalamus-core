@@ -113,6 +113,8 @@ pub fn build_with_ports(
 
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/healthz", get(routes::healthz))
+        .route("/readyz", get(routes::readyz))
         .route("/v1/decide", post(routes::decide))
         .route("/v1/pre-call", post(routes::pre_call))
         .route("/v1/post-call", post(routes::post_call))

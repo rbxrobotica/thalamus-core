@@ -176,6 +176,21 @@ async fn send_request(
     (status, body)
 }
 
+#[tokio::test]
+async fn healthz_and_readyz_are_served() {
+    let app = app::build(make_config(vec![test_policy()]));
+    let (status, body) = send_request(app, "GET", "/healthz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+
+    let app = app::build(make_config(vec![test_policy()]));
+    let (status, body) = send_request(app, "GET", "/readyz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["policy_loaded"], true);
+    assert_eq!(body["audit_reachable"], true);
+}
+
 // === Acceptance tests ===
 
 #[tokio::test]
