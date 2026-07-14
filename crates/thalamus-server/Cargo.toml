@@ -22,10 +22,12 @@ thalamus-eval = { path = "../thalamus-eval" }
 thalamus-litellm-adapter = { path = "../thalamus-litellm-adapter", optional = true }
 thalamus-agentgateway-adapter = { path = "../thalamus-agentgateway-adapter", optional = true }
 thalamus-langfuse-adapter = { path = "../thalamus-langfuse-adapter", optional = true }
+async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "1"
 ureq = { version = "3", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde"] }

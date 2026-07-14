@@ -1,4 +1,5 @@
 mod app;
+mod auth;
 mod config;
 mod ports;
 mod routes;
@@ -164,6 +165,37 @@ async fn main() {
         )
     } else {
         app::build(config)
+    };
+
+    // THALAMUS_RBX_API (default off): serve the gated /rbx/v1/* surface with
+    // the credential middleware. Phase 1 Gate A exercises identity/middleware
+    // only; LLM adapters are not wired in this mode (no provider key, no
+    // LiteLLM exposure). When off, `app` from the adapter branches is used
+    // unchanged and /rbx/v1/* is not mounted.
+    let app = if matches!(
+        std::env::var("THALAMUS_RBX_API")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "on" | "true" | "yes"
+    ) {
+        let introspection_url =
+            std::env::var("THALAMUS_TOKEN_INTROSPECTION_URL").unwrap_or_else(|_| {
+                eprintln!(
+                    "THALAMUS_RBX_API=on requires THALAMUS_TOKEN_INTROSPECTION_URL \
+                     (rbx-token-service /v1/delegation/introspect)"
+                );
+                std::process::exit(1);
+            });
+        let cfg = config::load_config(&config_path).unwrap_or_else(|e| {
+            eprintln!("failed to reload config from {}: {}", config_path, e);
+            std::process::exit(1);
+        });
+        let verifier: std::sync::Arc<dyn auth::CredentialVerifier + Send + Sync> =
+            std::sync::Arc::new(auth::OpaqueIntrospectionVerifier::new(introspection_url));
+        app::build_with_rbx_api(cfg, verifier)
+    } else {
+        app
     };
 
     let listener = tokio::net::TcpListener::bind(addr)

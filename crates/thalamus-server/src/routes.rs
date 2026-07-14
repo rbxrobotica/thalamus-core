@@ -9,6 +9,8 @@ use uuid::Uuid;
 use thalamus_core::{AuditId, BackendResponse, CallRequest, PolicyDecision, PreCallError};
 
 use crate::app::AppState;
+use crate::auth::VerifiedCaller;
+use axum::Extension;
 
 // === Request / Response types ===
 
@@ -140,6 +142,14 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
         "backend_configured": backend_configured,
     });
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// GET /rbx/v1/identity - gated by the credential middleware. Returns the
+/// validated caller, proving the presented opaque Thalamus session credential
+/// was accepted (ADR-0101). The `/rbx/v1/sessions` and `/rbx/v1/runs` routes
+/// land in Phase 3 behind the same `THALAMUS_RBX_API` flag.
+pub async fn rbx_identity(Extension(caller): Extension<VerifiedCaller>) -> impl IntoResponse {
+    (StatusCode::OK, Json(caller))
 }
 
 /// POST /v1/decide — policy decision only, no backend call.
