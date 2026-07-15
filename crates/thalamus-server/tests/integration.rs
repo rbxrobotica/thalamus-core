@@ -13,6 +13,10 @@ use thalamus_core::{
 };
 
 use thalamus_server::app;
+use thalamus_server::auth::{
+    AuthError, CredentialVerifier, OpaqueIntrospectionVerifier, StaticCredentialVerifier,
+    VerifiedCaller,
+};
 use thalamus_server::config::ServerConfig;
 
 // === Test helpers ===
@@ -174,6 +178,21 @@ async fn send_request(
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap_or(json!({}));
     (status, body)
+}
+
+#[tokio::test]
+async fn healthz_and_readyz_are_served() {
+    let app = app::build(make_config(vec![test_policy()]));
+    let (status, body) = send_request(app, "GET", "/healthz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+
+    let app = app::build(make_config(vec![test_policy()]));
+    let (status, body) = send_request(app, "GET", "/readyz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["policy_loaded"], true);
+    assert_eq!(body["audit_reachable"], true);
 }
 
 // === Acceptance tests ===
@@ -1071,4 +1090,144 @@ async fn concurrent_calls_with_slow_eval_do_not_serialize() {
     // All eval records eventually stored
     let count = eval_store.wait_for_count(n, 3000);
     assert_eq!(count, n, "expected {n} eval records, got {count}");
+}
+
+// === Gate A: credential middleware (/rbx/v1/*) ===
+
+fn rbx_caller(subject: &str, scopes: &[&str]) -> VerifiedCaller {
+    VerifiedCaller {
+        active: true,
+        subject: Some(subject.to_owned()),
+        session_id: Some("00000000-0000-0000-0000-000000000001".to_owned()),
+        jti: Some("jti-1".to_owned()),
+        audience: vec!["thalamus".to_owned()],
+        scopes: scopes.iter().map(|s| String::from(*s)).collect(),
+        client_app_id: Some("robson-code".to_owned()),
+        actor: None,
+        delegated_by: None,
+        mediator: Some("rbx-token-service".to_owned()),
+        expires_at: None,
+        reason: None,
+    }
+}
+
+fn rbx_app(verifier: Arc<dyn CredentialVerifier + Send + Sync>) -> axum::Router {
+    app::build_with_rbx_api(make_config(vec![test_policy()]), verifier)
+}
+
+async fn send_with_auth(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    bearer: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(b) = bearer {
+        builder = builder.header("authorization", format!("Bearer {b}"));
+    }
+    let request = builder.body::<Body>(Body::empty()).unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+    (status, body)
+}
+
+// Matrix case 1 + Leandro integration: valid credential accepted.
+#[tokio::test]
+async fn rbx_identity_accepts_valid_credential() {
+    let verifier = StaticCredentialVerifier::with_valid(
+        "rbxsess_leandro",
+        rbx_caller("ldamasio@gmail.com", &["kulinaryos:access"]),
+    );
+    let app = rbx_app(Arc::new(verifier));
+    let (status, body) =
+        send_with_auth(app, "GET", "/rbx/v1/identity", Some("rbxsess_leandro")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["subject"], "ldamasio@gmail.com");
+    assert_eq!(body["audience"], json!(["thalamus"]));
+}
+
+#[tokio::test]
+async fn rbx_identity_rejects_missing_bearer() {
+    let verifier = StaticCredentialVerifier::with_valid("rbxsess_x", rbx_caller("s", &[]));
+    let app = rbx_app(Arc::new(verifier));
+    let (status, body) = send_with_auth(app, "GET", "/rbx/v1/identity", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "policy_denied");
+}
+
+// Matrix cases 3 + 5: expired / revoked map to session_expired.
+#[tokio::test]
+async fn rbx_identity_rejects_expired_and_revoked_as_session_expired() {
+    for reason in ["expired", "revoked"] {
+        let verifier = StaticCredentialVerifier::always_inactive(reason);
+        let app = rbx_app(Arc::new(verifier));
+        let (status, body) = send_with_auth(app, "GET", "/rbx/v1/identity", Some("rbxsess")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "reason={reason}");
+        assert_eq!(body["error"]["code"], "session_expired", "reason={reason}");
+    }
+}
+
+// Matrix cases 1-negative / 6: unknown / missing_entitlement map to policy_denied.
+#[tokio::test]
+async fn rbx_identity_rejects_unknown_and_missing_entitlement() {
+    for reason in ["unknown", "missing_entitlement"] {
+        let verifier = StaticCredentialVerifier::always_inactive(reason);
+        let app = rbx_app(Arc::new(verifier));
+        let (status, body) = send_with_auth(app, "GET", "/rbx/v1/identity", Some("rbxsess")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "reason={reason}");
+        assert_eq!(body["error"]["code"], "policy_denied", "reason={reason}");
+    }
+}
+
+// THALAMUS_RBX_API off (no verifier): /rbx/v1/* is not mounted; /v1/* is
+// unaffected. Regression guard for "do not break /v1/call".
+#[tokio::test]
+async fn rbx_route_not_mounted_when_verifier_absent() {
+    let app = app::build(make_config(vec![test_policy()]));
+    let (status, _) = send_with_auth(app, "GET", "/rbx/v1/identity", Some("rbxsess")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// OpaqueIntrospectionVerifier against a mocked rbx-token-service introspect
+// endpoint (real HTTP path through ureq), active and inactive.
+#[tokio::test]
+async fn introspection_verifier_calls_token_service() {
+    let mut server = mockito::Server::new_async().await;
+    let url = format!("{}/v1/delegation/introspect", server.url());
+
+    let active_mock = server
+        .mock("POST", "/v1/delegation/introspect")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "active": true,
+                "subject": "ldamasio@gmail.com",
+                "audience": ["thalamus"],
+                "scopes": ["kulinaryos:access"],
+                "client_app_id": "robson-code",
+                "mediator": "rbx-token-service",
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let verifier = OpaqueIntrospectionVerifier::new(url.clone());
+    let caller = verifier.verify("rbxsess_leandro").await.unwrap();
+    assert!(caller.active);
+    assert_eq!(caller.subject.as_deref(), Some("ldamasio@gmail.com"));
+    active_mock.assert_async().await;
+
+    let inactive_mock = server
+        .mock("POST", "/v1/delegation/introspect")
+        .with_status(200)
+        .with_body(json!({ "active": false, "reason": "revoked" }).to_string())
+        .create_async()
+        .await;
+    let err = verifier.verify("rbxsess_dead").await.unwrap_err();
+    assert!(matches!(err, AuthError::Inactive(reason) if reason == "revoked"));
+    inactive_mock.assert_async().await;
 }

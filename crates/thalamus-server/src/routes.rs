@@ -9,6 +9,8 @@ use uuid::Uuid;
 use thalamus_core::{AuditId, BackendResponse, CallRequest, PolicyDecision, PreCallError};
 
 use crate::app::AppState;
+use crate::auth::VerifiedCaller;
+use axum::Extension;
 
 // === Request / Response types ===
 
@@ -114,6 +116,41 @@ pub struct ErrorResponse {
 }
 
 // === Handlers ===
+
+/// GET /healthz - liveness probe.
+pub async fn healthz() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "status": "ok" })),
+    )
+}
+
+/// GET /readyz - readiness probe.
+///
+/// First-slice semantics: every component is in-memory, so the service is
+/// ready as soon as it is wired. `policy_loaded` and `audit_reachable` are
+/// always true here (the ports are constructed in `build`); a durable Jaguar
+/// audit probe and a live backend probe arrive with Phase 2
+/// (`THALAMUS_DURABLE_AUDIT`).
+pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
+    let backend_configured = state.backend_port.is_some();
+    let body = serde_json::json!({
+        "ok": true,
+        "status": "ready",
+        "policy_loaded": true,
+        "audit_reachable": true,
+        "backend_configured": backend_configured,
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// GET /rbx/v1/identity - gated by the credential middleware. Returns the
+/// validated caller, proving the presented opaque Thalamus session credential
+/// was accepted (ADR-0101). The `/rbx/v1/sessions` and `/rbx/v1/runs` routes
+/// land in Phase 3 behind the same `THALAMUS_RBX_API` flag.
+pub async fn rbx_identity(Extension(caller): Extension<VerifiedCaller>) -> impl IntoResponse {
+    (StatusCode::OK, Json(caller))
+}
 
 /// POST /v1/decide — policy decision only, no backend call.
 pub async fn decide(
