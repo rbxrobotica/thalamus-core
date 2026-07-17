@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (Phase 2 — durable audit store on Jaguar)
+
+- `crates/thalamus-postgres-adapter`: authoritative Postgres audit store
+  (execution master plan §2). Hash-chained append-only `audit_events`
+  (per-stream `seq`, `previous_hash`/`event_hash`), content-derived
+  idempotency keys (retry/duplicate safe), and the full §2 schema
+  (`sessions`, `runs`, `tool_invocations`, `audit_events`, `approvals`,
+  `evidence_refs`, `payload_refs`, `monitoring_decisions`,
+  `repository_exceptions`, `budgets`, `capability_leases`,
+  `route_envelopes`) via embedded migrations owned by `thalamus_migrator`.
+- `thalamus-migrate` bin: migration runner (`THALAMUS_MIGRATE_DATABASE_URL`).
+- `thalamus-server` `postgres` feature: `THALAMUS_DATABASE_URL` wires the
+  durable store as authoritative (disable with `THALAMUS_DURABLE_AUDIT=off`).
+  Pre-call records persist in `route_envelopes`, so `/v1/post-call` and
+  `/v1/audit/{id}` survive restarts. Fail-closed: startup aborts if the store
+  is configured but unreachable; `/readyz` and the call routes return 503
+  when authoritative audit writes are unavailable. In-memory audit is no
+  longer authoritative when the durable store is wired.
+
 ## [0.2.0] - 2026-05-16
 
 ### Changed (BREAKING: definition pivot)

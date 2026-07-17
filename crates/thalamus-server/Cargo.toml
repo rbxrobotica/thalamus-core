@@ -11,6 +11,7 @@ dev = []
 litellm = ["thalamus-litellm-adapter"]
 agentgateway = ["thalamus-agentgateway-adapter"]
 langfuse = ["thalamus-langfuse-adapter"]
+postgres = ["thalamus-postgres-adapter"]
 
 [[bin]]
 name = "thalamus-server"
@@ -22,6 +23,7 @@ thalamus-eval = { path = "../thalamus-eval" }
 thalamus-litellm-adapter = { path = "../thalamus-litellm-adapter", optional = true }
 thalamus-agentgateway-adapter = { path = "../thalamus-agentgateway-adapter", optional = true }
 thalamus-langfuse-adapter = { path = "../thalamus-langfuse-adapter", optional = true }
+thalamus-postgres-adapter = { path = "../thalamus-postgres-adapter", optional = true }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }

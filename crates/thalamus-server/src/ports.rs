@@ -6,6 +6,7 @@ pub mod observability;
 pub mod policy;
 pub mod trace_exporter;
 
+#[allow(unused_imports)]
 pub use audit::InMemoryAuditPort;
 pub use context::StaticContextPort;
 pub use eval::ChannelEvalPort;
