@@ -764,15 +764,17 @@ pub async fn rbx_create_session(
     }
 }
 
-fn parse_uuid(raw: &str, what: &str) -> Result<Uuid, Response> {
-    Uuid::parse_str(raw).map_err(|_| {
-        typed_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            &format!("invalid {what} id"),
-            false,
-        )
-    })
+fn parse_uuid(raw: &str) -> Option<Uuid> {
+    Uuid::parse_str(raw).ok()
+}
+
+fn invalid_id(what: &str) -> Response {
+    typed_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        &format!("invalid {what} id"),
+        false,
+    )
 }
 
 /// POST /rbx/v1/sessions/{session_id}/runs — refused when the session is
@@ -784,9 +786,8 @@ pub async fn rbx_create_run(
     Path(session_id): Path<String>,
     body: Option<Json<CreateRunRequest>>,
 ) -> Response {
-    let session_id = match parse_uuid(&session_id, "session") {
-        Ok(id) => id,
-        Err(resp) => return resp,
+    let Some(session_id) = parse_uuid(&session_id) else {
+        return invalid_id("session");
     };
     let req = body.map(|Json(b)| b).unwrap_or_default();
     match state.session_store.create_run(
@@ -859,9 +860,8 @@ pub async fn rbx_close_session(
     Extension(caller): Extension<VerifiedCaller>,
     Path(session_id): Path<String>,
 ) -> Response {
-    let session_id = match parse_uuid(&session_id, "session") {
-        Ok(id) => id,
-        Err(resp) => return resp,
+    let Some(session_id) = parse_uuid(&session_id) else {
+        return invalid_id("session");
     };
     match state.session_store.close_session(&session_id) {
         Ok(Some(record)) => {
@@ -894,9 +894,8 @@ pub async fn rbx_cancel_run(
     Extension(caller): Extension<VerifiedCaller>,
     Path(run_id): Path<String>,
 ) -> Response {
-    let run_id = match parse_uuid(&run_id, "run") {
-        Ok(id) => id,
-        Err(resp) => return resp,
+    let Some(run_id) = parse_uuid(&run_id) else {
+        return invalid_id("run");
     };
     match state.session_store.cancel_run(&run_id) {
         Ok(Some(record)) => {
@@ -929,9 +928,8 @@ pub async fn rbx_session_limits(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Response {
-    let session_id = match parse_uuid(&session_id, "session") {
-        Ok(id) => id,
-        Err(resp) => return resp,
+    let Some(session_id) = parse_uuid(&session_id) else {
+        return invalid_id("session");
     };
     match state.session_store.session_limits(&session_id) {
         Ok(Some(limits)) => (StatusCode::OK, Json(limits)).into_response(),

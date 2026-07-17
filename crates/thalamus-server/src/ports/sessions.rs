@@ -32,6 +32,8 @@ pub enum CreateRunError {
         scope_type: String,
         scope_ref: String,
     },
+    /// Constructed by the durable store glue only.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     Store(String),
 }
 
