@@ -1231,3 +1231,236 @@ async fn introspection_verifier_calls_token_service() {
     assert!(matches!(err, AuthError::Inactive(reason) if reason == "revoked"));
     inactive_mock.assert_async().await;
 }
+
+// === Phase 3 slice 1: session/run lifecycle (/rbx/v1/sessions...) ===
+
+use thalamus_server::ports::sessions::{InMemorySessionStore, SharedSessionStore};
+
+fn rbx_lifecycle_app() -> (axum::Router, Arc<InMemorySessionStore>) {
+    let store = Arc::new(InMemorySessionStore::new());
+    let verifier = StaticCredentialVerifier::with_valid(
+        "rbxsess_leandro",
+        rbx_caller("ldamasio@gmail.com", &["kulinaryos:access"]),
+    );
+    let app = app::build_with_rbx_api_and_sessions(
+        make_config(vec![test_policy()]),
+        Arc::new(verifier),
+        store.clone() as SharedSessionStore,
+    );
+    (app, store)
+}
+
+async fn post_json_with_auth(
+    app: &axum::Router,
+    uri: &str,
+    bearer: Option<&str>,
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(b) = bearer {
+        builder = builder.header("authorization", format!("Bearer {b}"));
+    }
+    let request = builder.body(Body::from(body.to_string())).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+    (status, body)
+}
+
+fn session_request() -> Value {
+    json!({ "tenant": "rbx", "product": "kulinaryos", "workflow": "coding" })
+}
+
+#[tokio::test]
+async fn rbx_session_lifecycle_create_run_close() {
+    let (app, _store) = rbx_lifecycle_app();
+
+    // Create session: principal comes from the verified credential.
+    let (status, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(session["principal"], "ldamasio@gmail.com");
+    assert_eq!(session["status"], "open");
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+
+    // Create a run.
+    let (status, run) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/sessions/{session_id}/runs"),
+        Some("rbxsess_leandro"),
+        json!({ "model_alias": "glm-5.2" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(run["status"], "started");
+    let run_id = run["run_id"].as_str().unwrap().to_owned();
+
+    // Cancel the run.
+    let (status, cancelled) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/cancel"),
+        Some("rbxsess_leandro"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["status"], "cancelled");
+
+    // Close the session; new runs are then refused with session_closed.
+    let (status, closed) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/sessions/{session_id}/close"),
+        Some("rbxsess_leandro"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(closed["status"], "closed");
+
+    let (status, refused) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/sessions/{session_id}/runs"),
+        Some("rbxsess_leandro"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(refused["error"]["code"], "session_closed");
+}
+
+// §3 acceptance: budget-exceeded blocks new runs.
+#[tokio::test]
+async fn rbx_budget_exceeded_blocks_new_runs() {
+    let (app, store) = rbx_lifecycle_app();
+    store.set_budget("product", "rbx/kulinaryos", "total", Some(1000), 1000);
+
+    let (status, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+
+    let (status, refused) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/sessions/{session_id}/runs"),
+        Some("rbxsess_leandro"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refused["error"]["code"], "budget_exceeded");
+
+    // Limits endpoint reports the exhausted budget + 70% context policy.
+    let (status, limits) = send_with_auth(
+        app.clone(),
+        "GET",
+        &format!("/rbx/v1/sessions/{session_id}/limits"),
+        Some("rbxsess_leandro"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(limits["budgets"][0]["exhausted"], true);
+    assert_eq!(limits["context_utilization_limit"], 0.7);
+    assert_eq!(limits["context_policy_ref"], "context-utilization-70");
+}
+
+// JWT validation before session creation: no credential, no session.
+#[tokio::test]
+async fn rbx_session_creation_requires_credential() {
+    let (app, _store) = rbx_lifecycle_app();
+    let (status, body) =
+        post_json_with_auth(&app, "/rbx/v1/sessions", None, session_request()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "policy_denied");
+}
+
+// Idempotency keys make session/run creation retry-safe.
+#[tokio::test]
+async fn rbx_idempotent_session_and_run_creation() {
+    let (app, _store) = rbx_lifecycle_app();
+
+    let mut req = session_request();
+    req["idempotency_key"] = json!("idem-session-1");
+    let (_, first) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        req.clone(),
+    )
+    .await;
+    let (_, second) =
+        post_json_with_auth(&app, "/rbx/v1/sessions", Some("rbxsess_leandro"), req).await;
+    assert_eq!(first["session_id"], second["session_id"]);
+
+    let session_id = first["session_id"].as_str().unwrap().to_owned();
+    let run_req = json!({ "idempotency_key": "idem-run-1" });
+    let (_, run_a) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/sessions/{session_id}/runs"),
+        Some("rbxsess_leandro"),
+        run_req.clone(),
+    )
+    .await;
+    let (_, run_b) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/sessions/{session_id}/runs"),
+        Some("rbxsess_leandro"),
+        run_req,
+    )
+    .await;
+    assert_eq!(run_a["run_id"], run_b["run_id"]);
+}
+
+#[tokio::test]
+async fn rbx_unknown_session_and_run_are_typed_404() {
+    let (app, _store) = rbx_lifecycle_app();
+    let missing = uuid::Uuid::new_v4();
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/sessions/{missing}/runs"),
+        Some("rbxsess_leandro"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_session");
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{missing}/cancel"),
+        Some("rbxsess_leandro"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_run");
+}
+
+// §3 security: request bodies beyond the limit are rejected before handlers.
+#[tokio::test]
+async fn rbx_body_limit_rejects_oversized_payload() {
+    let (app, _store) = rbx_lifecycle_app();
+    let oversized = "x".repeat(300 * 1024);
+    let (status, _) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        json!({ "tenant": oversized, "product": "p", "workflow": "w" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}

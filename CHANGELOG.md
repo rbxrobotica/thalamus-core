@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (Phase 3 slice 1 — session/run lifecycle API)
+
+- Lifecycle domain types in `thalamus-core` (`SessionRecord`, `RunRecord`,
+  `SessionLimits`, `BudgetLine`, statuses) and a new `AuditEvent::Lifecycle`
+  variant: a session's whole lifecycle (created, runs, refusals, closed) forms
+  one hash chain keyed by session id.
+- `/rbx/v1` lifecycle endpoints behind the Gate A credential middleware:
+  `POST /sessions`, `POST /sessions/{id}/runs`, `POST /sessions/{id}/close`,
+  `GET /sessions/{id}/limits`, `POST /runs/{id}/cancel`. Principal and
+  delegation token id come from the verified credential, never the body.
+- Budget enforcement (§3 acceptance): run creation locks governing budget rows
+  (session/product/tenant scope) in one transaction and refuses with typed
+  `budget_exceeded` when exhausted; `limits` reports budget lines plus the
+  initial 70% context-utilization policy (`context-utilization-70`).
+- Idempotency keys for session/run creation (migration
+  `0002_lifecycle_idempotency`) — replays return the original row.
+- §3 security: 256 KiB body limit on the `/rbx/v1/*` surface; typed-error
+  responses (`unknown_session`, `session_closed`, `budget_exceeded`,
+  `store_unavailable`).
+- `SessionStore` port: in-memory by default, durable Postgres store
+  (Phase 2 schema) when `THALAMUS_DATABASE_URL` is wired.
+
 ### Added (Phase 2 — durable audit store on Jaguar)
 
 - `crates/thalamus-postgres-adapter`: authoritative Postgres audit store

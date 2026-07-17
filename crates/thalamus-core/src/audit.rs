@@ -28,4 +28,17 @@ pub enum AuditEvent {
         schema_valid: bool,
         timestamp: OffsetDateTime,
     },
+    /// Session/run lifecycle transition (master plan §3): session created or
+    /// closed, run created or cancelled, run refused (budget/closed-session).
+    /// The audit stream is the session id, so a session's full lifecycle is
+    /// one hash chain.
+    Lifecycle {
+        trace_id: TraceId,
+        audit_id: AuditId,
+        entity_type: String,
+        entity_id: String,
+        action: String,
+        principal: Option<String>,
+        timestamp: OffsetDateTime,
+    },
 }

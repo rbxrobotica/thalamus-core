@@ -639,6 +639,25 @@ pub async fn get_audit(
                     "schema_valid": schema_valid,
                 }),
             },
+            thalamus_core::AuditEvent::Lifecycle {
+                trace_id,
+                audit_id: _,
+                entity_type,
+                entity_id,
+                action,
+                principal,
+                timestamp,
+            } => AuditEventJson {
+                kind: "Lifecycle".to_owned(),
+                trace_id: trace_id.0.to_string(),
+                timestamp: timestamp.to_string(),
+                details: serde_json::json!({
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "action": action,
+                    "principal": principal,
+                }),
+            },
         })
         .collect();
 
@@ -648,6 +667,280 @@ pub async fn get_audit(
     };
 
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+// === /rbx/v1 session/run lifecycle (master plan §3, slice 1) ===
+//
+// All handlers run behind the credential middleware: the VerifiedCaller
+// extension is always present, and a session/run is never created for an
+// unverified caller. Principal and delegation token id come from the verified
+// credential, never from the request body.
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSessionRequest {
+    pub tenant: String,
+    pub product: String,
+    pub workflow: String,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CreateRunRequest {
+    #[serde(default)]
+    pub model_alias: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// P0 typed-error response (standard section 11 shape).
+fn typed_error(status: StatusCode, code: &str, message: &str, retryable: bool) -> Response {
+    let body = serde_json::json!({
+        "error": { "code": code, "message": message, "retryable": retryable }
+    });
+    (status, Json(body)).into_response()
+}
+
+fn store_error(message: &str) -> Response {
+    typed_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "store_unavailable",
+        message,
+        true,
+    )
+}
+
+/// Emit a lifecycle audit event. The audit stream is the session id, so one
+/// session's whole lifecycle forms a single hash chain in the durable store.
+fn emit_lifecycle(
+    state: &AppState,
+    session_id: &Uuid,
+    entity_type: &str,
+    entity_id: &Uuid,
+    action: &str,
+    principal: Option<&str>,
+) {
+    state.audit_port.emit(thalamus_core::AuditEvent::Lifecycle {
+        trace_id: thalamus_core::TraceId(Uuid::new_v4()),
+        audit_id: AuditId(*session_id),
+        entity_type: entity_type.to_owned(),
+        entity_id: entity_id.to_string(),
+        action: action.to_owned(),
+        principal: principal.map(str::to_owned),
+        timestamp: time::OffsetDateTime::now_utc(),
+    });
+}
+
+/// POST /rbx/v1/sessions — create a governed session for the verified caller.
+pub async fn rbx_create_session(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Json(req): Json<CreateSessionRequest>,
+) -> Response {
+    let input = crate::ports::sessions::NewSession {
+        tenant: req.tenant,
+        product: req.product,
+        workflow: req.workflow,
+        principal: caller.subject.clone(),
+        delegation_token_id: caller.jti.clone(),
+        idempotency_key: req.idempotency_key,
+    };
+    match state.session_store.create_session(&input) {
+        Ok(record) => {
+            emit_lifecycle(
+                &state,
+                &record.session_id,
+                "session",
+                &record.session_id,
+                "session_created",
+                record.principal.as_deref(),
+            );
+            if let Some(resp) = durable_audit_guard(&state) {
+                return resp;
+            }
+            (StatusCode::CREATED, Json(record)).into_response()
+        }
+        Err(err) => store_error(&err),
+    }
+}
+
+fn parse_uuid(raw: &str) -> Option<Uuid> {
+    Uuid::parse_str(raw).ok()
+}
+
+fn invalid_id(what: &str) -> Response {
+    typed_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        &format!("invalid {what} id"),
+        false,
+    )
+}
+
+/// POST /rbx/v1/sessions/{session_id}/runs — refused when the session is
+/// unknown/closed or a governing budget is exhausted (§3 acceptance:
+/// budget-exceeded blocks new runs).
+pub async fn rbx_create_run(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Path(session_id): Path<String>,
+    body: Option<Json<CreateRunRequest>>,
+) -> Response {
+    let Some(session_id) = parse_uuid(&session_id) else {
+        return invalid_id("session");
+    };
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match state.session_store.create_run(
+        &session_id,
+        req.model_alias.as_deref(),
+        req.idempotency_key.as_deref(),
+    ) {
+        Ok(record) => {
+            emit_lifecycle(
+                &state,
+                &session_id,
+                "run",
+                &record.run_id,
+                "run_created",
+                caller.subject.as_deref(),
+            );
+            if let Some(resp) = durable_audit_guard(&state) {
+                return resp;
+            }
+            (StatusCode::CREATED, Json(record)).into_response()
+        }
+        Err(crate::ports::sessions::CreateRunError::UnknownSession) => typed_error(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "no session with this id",
+            false,
+        ),
+        Err(crate::ports::sessions::CreateRunError::SessionClosed) => {
+            emit_lifecycle(
+                &state,
+                &session_id,
+                "run",
+                &session_id,
+                "run_refused_session_closed",
+                caller.subject.as_deref(),
+            );
+            typed_error(
+                StatusCode::CONFLICT,
+                "session_closed",
+                "session is closed",
+                false,
+            )
+        }
+        Err(crate::ports::sessions::CreateRunError::BudgetExceeded {
+            scope_type,
+            scope_ref,
+        }) => {
+            emit_lifecycle(
+                &state,
+                &session_id,
+                "run",
+                &session_id,
+                "run_refused_budget_exceeded",
+                caller.subject.as_deref(),
+            );
+            typed_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "budget_exceeded",
+                &format!("budget exhausted for {scope_type} {scope_ref}"),
+                false,
+            )
+        }
+        Err(crate::ports::sessions::CreateRunError::Store(err)) => store_error(&err),
+    }
+}
+
+/// POST /rbx/v1/sessions/{session_id}/close — idempotent.
+pub async fn rbx_close_session(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let Some(session_id) = parse_uuid(&session_id) else {
+        return invalid_id("session");
+    };
+    match state.session_store.close_session(&session_id) {
+        Ok(Some(record)) => {
+            emit_lifecycle(
+                &state,
+                &session_id,
+                "session",
+                &session_id,
+                "session_closed",
+                caller.subject.as_deref(),
+            );
+            if let Some(resp) = durable_audit_guard(&state) {
+                return resp;
+            }
+            (StatusCode::OK, Json(record)).into_response()
+        }
+        Ok(None) => typed_error(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "no session with this id",
+            false,
+        ),
+        Err(err) => store_error(&err),
+    }
+}
+
+/// POST /rbx/v1/runs/{run_id}/cancel — idempotent for finished runs.
+pub async fn rbx_cancel_run(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Path(run_id): Path<String>,
+) -> Response {
+    let Some(run_id) = parse_uuid(&run_id) else {
+        return invalid_id("run");
+    };
+    match state.session_store.cancel_run(&run_id) {
+        Ok(Some(record)) => {
+            emit_lifecycle(
+                &state,
+                &record.session_id,
+                "run",
+                &run_id,
+                "run_cancelled",
+                caller.subject.as_deref(),
+            );
+            if let Some(resp) = durable_audit_guard(&state) {
+                return resp;
+            }
+            (StatusCode::OK, Json(record)).into_response()
+        }
+        Ok(None) => typed_error(
+            StatusCode::NOT_FOUND,
+            "unknown_run",
+            "no run with this id",
+            false,
+        ),
+        Err(err) => store_error(&err),
+    }
+}
+
+/// GET /rbx/v1/sessions/{session_id}/limits — governing budgets + context
+/// policy (initial 70% utilization policy per §3 acceptance).
+pub async fn rbx_session_limits(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let Some(session_id) = parse_uuid(&session_id) else {
+        return invalid_id("session");
+    };
+    match state.session_store.session_limits(&session_id) {
+        Ok(Some(limits)) => (StatusCode::OK, Json(limits)).into_response(),
+        Ok(None) => typed_error(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "no session with this id",
+            false,
+        ),
+        Err(err) => store_error(&err),
+    }
 }
 
 // === Helpers ===

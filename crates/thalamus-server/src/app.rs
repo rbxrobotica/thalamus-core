@@ -22,6 +22,9 @@ pub struct AppState {
     pub audit_port: ports::audit::SharedAuditPort,
     /// Authoritative durable audit store (Phase 2). `None` = in-memory only.
     pub durable_audit: Option<ports::audit::SharedDurableAudit>,
+    /// Session/run lifecycle store (Phase 3). Postgres-backed when the durable
+    /// audit store is wired; in-memory otherwise.
+    pub session_store: ports::sessions::SharedSessionStore,
     pub eval_port: Arc<dyn thalamus_core::EvalPort + Send + Sync>,
     pub obs_port: Arc<dyn thalamus_core::ObservabilityPort + Send + Sync>,
     pub backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
@@ -43,7 +46,7 @@ pub struct AppState {
 pub fn build(config: ServerConfig) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
+    let (audit_port, audit_store, durable_audit, session_store) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
@@ -52,6 +55,7 @@ pub fn build(config: ServerConfig) -> Router {
     let state = Arc::new(AppState {
         policy_port,
         durable_audit,
+        session_store,
         context_port,
         audit_port,
         eval_port,
@@ -73,7 +77,7 @@ pub fn build_with_backend(
 ) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
+    let (audit_port, audit_store, durable_audit, session_store) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
@@ -81,6 +85,7 @@ pub fn build_with_backend(
     let state = Arc::new(AppState {
         policy_port,
         durable_audit,
+        session_store,
         context_port,
         audit_port,
         eval_port,
@@ -101,7 +106,7 @@ pub fn build_with_ports(
     backend: Arc<dyn BackendPort + Send + Sync>,
 ) -> Router {
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
+    let (audit_port, audit_store, durable_audit, session_store) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
@@ -109,6 +114,7 @@ pub fn build_with_ports(
     let state = Arc::new(AppState {
         policy_port,
         durable_audit,
+        session_store,
         context_port,
         audit_port,
         eval_port,
@@ -122,6 +128,9 @@ pub fn build_with_ports(
     build_router(state)
 }
 
+/// Body limit for the governed /rbx/v1/* surface (master plan §3 security).
+const RBX_BODY_LIMIT_BYTES: usize = 256 * 1024;
+
 fn build_router(state: Arc<AppState>) -> Router {
     let credential_verifier = state.credential_verifier.clone();
 
@@ -133,18 +142,36 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/post-call", post(routes::post_call))
         .route("/v1/call", post(routes::full_call))
         .route("/v1/audit/{id}", get(routes::get_audit))
-        .with_state(state);
+        .with_state(state.clone());
 
     // Gated /rbx/v1/* surface (THALAMUS_RBX_API). Mounted only when a
     // credential verifier is present. The auth middleware is scoped to this
     // sub-router, so the legacy /v1/* and /healthz routes are never affected.
+    // Credential validation runs before every handler: a session/run is never
+    // created for an unverified caller.
     if let Some(verifier) = credential_verifier {
         let rbx = Router::new()
             .route("/rbx/v1/identity", get(routes::rbx_identity))
+            .route("/rbx/v1/sessions", post(routes::rbx_create_session))
+            .route(
+                "/rbx/v1/sessions/{session_id}/runs",
+                post(routes::rbx_create_run),
+            )
+            .route(
+                "/rbx/v1/sessions/{session_id}/close",
+                post(routes::rbx_close_session),
+            )
+            .route(
+                "/rbx/v1/sessions/{session_id}/limits",
+                get(routes::rbx_session_limits),
+            )
+            .route("/rbx/v1/runs/{run_id}/cancel", post(routes::rbx_cancel_run))
             .layer(middleware::from_fn(move |req: Request, next: Next| {
                 let verifier = Arc::clone(&verifier);
                 async move { auth::require_credential(verifier, req, next).await }
-            }));
+            }))
+            .layer(axum::extract::DefaultBodyLimit::max(RBX_BODY_LIMIT_BYTES))
+            .with_state(state);
         router.merge(rbx)
     } else {
         router
@@ -166,7 +193,7 @@ pub fn build_with_rbx_api(
 ) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
+    let (audit_port, audit_store, durable_audit, session_store) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
@@ -174,6 +201,39 @@ pub fn build_with_rbx_api(
     let state = Arc::new(AppState {
         policy_port,
         durable_audit,
+        session_store,
+        context_port,
+        audit_port,
+        eval_port,
+        obs_port,
+        backend_port: None,
+        audit_store,
+        eval_store,
+        credential_verifier: Some(credential_verifier),
+    });
+
+    build_router(state)
+}
+
+/// Build an app serving `/rbx/v1/*` with an injected session store. Used by
+/// integration tests to seed budgets on an [`ports::sessions::InMemorySessionStore`].
+#[allow(dead_code, reason = "used by integration tests")]
+pub fn build_with_rbx_api_and_sessions(
+    config: ServerConfig,
+    credential_verifier: Arc<dyn auth::CredentialVerifier + Send + Sync>,
+    session_store: ports::sessions::SharedSessionStore,
+) -> Router {
+    let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
+    let context_port = Arc::new(ports::StaticContextPort::empty());
+    let (audit_port, audit_store, durable_audit, _default_sessions) = ports::audit::audit_wiring();
+    let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
+    let eval_store = eval_port.store().clone();
+    let obs_port = Arc::new(ports::LoggingObservabilityPort);
+
+    let state = Arc::new(AppState {
+        policy_port,
+        durable_audit,
+        session_store,
         context_port,
         audit_port,
         eval_port,
@@ -196,7 +256,7 @@ pub fn build_with_eval_sink(
 ) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
+    let (audit_port, audit_store, durable_audit, session_store) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new_with_sink(
         EVAL_CHANNEL_CAPACITY,
         eval_sink,
@@ -208,6 +268,7 @@ pub fn build_with_eval_sink(
     let state = Arc::new(AppState {
         policy_port,
         durable_audit,
+        session_store,
         context_port,
         audit_port,
         eval_port,
@@ -230,7 +291,7 @@ pub fn build_with_eval_inspection(
 ) -> (Router, thalamus_eval::EvalStore) {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
+    let (audit_port, audit_store, durable_audit, session_store) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
@@ -238,6 +299,7 @@ pub fn build_with_eval_inspection(
     let state = Arc::new(AppState {
         policy_port,
         durable_audit,
+        session_store,
         context_port,
         audit_port,
         eval_port,
