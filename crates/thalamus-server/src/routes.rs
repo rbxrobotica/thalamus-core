@@ -93,6 +93,10 @@ pub struct FullCallResponse {
     pub decision: String,
     pub post_call: PostCallResponse,
     pub backend_content: Option<String>,
+    /// Typed backend failure (additive; absent on success). Legacy clients
+    /// that only read `backend_content` keep working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,6 +470,7 @@ pub async fn full_call(
                 decision: format!("Deny: {} (ref: {})", reason, policy_ref),
                 post_call: post_resp,
                 backend_content: None,
+                backend_error: None,
             };
             return (StatusCode::OK, Json(resp)).into_response();
         }
@@ -488,6 +493,7 @@ pub async fn full_call(
                 ),
                 post_call: post_resp,
                 backend_content: None,
+                backend_error: None,
             };
             return (StatusCode::OK, Json(resp)).into_response();
         }
@@ -521,11 +527,32 @@ pub async fn full_call(
         }
     };
 
+    // Build and audit the route envelope BEFORE the backend executes (§3
+    // acceptance: the route envelope is audited for every model call).
+    let route = thalamus_core::RouteEnvelope::from_envelope(envelope);
+    state
+        .audit_port
+        .emit(thalamus_core::AuditEvent::RouteEnvelope {
+            trace_id: envelope.trace_id.clone(),
+            audit_id: outcome.audit_id.clone(),
+            model_alias: route.model_alias.clone(),
+            provider_pool: route.provider_pool.clone(),
+            region: route.region.clone(),
+            data_class: route.data_class.clone(),
+            capability_class: route.capability_class.clone(),
+            cost_class: route.cost_class.clone(),
+            timeout_ms: route.timeout_ms,
+            timestamp: time::OffsetDateTime::now_utc(),
+        });
+
     // Run the synchronous BackendPort off the async runtime so a slow data
-    // plane (real LLM latency) cannot starve the tokio worker.
-    let envelope_for_backend = envelope.clone();
-    let backend_response =
-        match tokio::task::spawn_blocking(move || backend.call(&envelope_for_backend)).await {
+    // plane (real LLM latency) cannot starve the tokio worker. Typed backend
+    // failures degrade to the legacy empty-response shape (post_call still
+    // runs, /v1/call clients are not broken) and surface additively in
+    // `backend_error`.
+    let cancel = thalamus_core::CancelToken::new();
+    let execution =
+        match tokio::task::spawn_blocking(move || backend.execute(&route, &cancel)).await {
             Ok(r) => r,
             Err(_join_err) => {
                 tracing::error!(
@@ -539,6 +566,36 @@ pub async fn full_call(
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response();
             }
         };
+
+    let (backend_response, backend_error) = match execution {
+        Ok(exec) => (
+            BackendResponse {
+                content: exec.content,
+                tokens_used: exec.usage.total_tokens,
+                latency_ms: Some(exec.latency_ms),
+            },
+            None,
+        ),
+        Err(err) => {
+            tracing::error!(
+                audit_id = %outcome.audit_id.0,
+                code = err.code(),
+                error = %err,
+                "backend execution failed"
+            );
+            (
+                BackendResponse {
+                    content: String::new(),
+                    tokens_used: None,
+                    latency_ms: None,
+                },
+                Some(serde_json::json!({
+                    "code": err.code(),
+                    "message": err.to_string(),
+                })),
+            )
+        }
+    };
 
     // post_call is non-bypassable on the Allow path
     let post_result = thalamus_core::post_call(
@@ -566,6 +623,7 @@ pub async fn full_call(
         decision: "Allow".to_owned(),
         post_call: post_resp,
         backend_content: Some(backend_response.content),
+        backend_error,
     };
 
     (StatusCode::OK, Json(resp)).into_response()
@@ -637,6 +695,31 @@ pub async fn get_audit(
                     "risk_class": format!("{:?}", risk_class),
                     "executable_by_agent": executable_by_agent,
                     "schema_valid": schema_valid,
+                }),
+            },
+            thalamus_core::AuditEvent::RouteEnvelope {
+                trace_id,
+                audit_id: _,
+                model_alias,
+                provider_pool,
+                region,
+                data_class,
+                capability_class,
+                cost_class,
+                timeout_ms,
+                timestamp,
+            } => AuditEventJson {
+                kind: "RouteEnvelope".to_owned(),
+                trace_id: trace_id.0.to_string(),
+                timestamp: timestamp.to_string(),
+                details: serde_json::json!({
+                    "model_alias": model_alias,
+                    "provider_pool": provider_pool,
+                    "region": region,
+                    "data_class": data_class,
+                    "capability_class": capability_class,
+                    "cost_class": cost_class,
+                    "timeout_ms": timeout_ms,
                 }),
             },
             thalamus_core::AuditEvent::Lifecycle {

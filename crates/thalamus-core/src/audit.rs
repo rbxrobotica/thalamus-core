@@ -28,6 +28,21 @@ pub enum AuditEvent {
         schema_valid: bool,
         timestamp: OffsetDateTime,
     },
+    /// Route envelope selected for a model call (master plan §3 acceptance:
+    /// the route envelope is audited for every model call, before the
+    /// backend executes).
+    RouteEnvelope {
+        trace_id: TraceId,
+        audit_id: AuditId,
+        model_alias: String,
+        provider_pool: Vec<String>,
+        region: Option<String>,
+        data_class: Option<String>,
+        capability_class: Option<String>,
+        cost_class: Option<String>,
+        timeout_ms: u64,
+        timestamp: OffsetDateTime,
+    },
     /// Session/run lifecycle transition (master plan §3): session created or
     /// closed, run created or cancelled, run refused (budget/closed-session).
     /// The audit stream is the session id, so a session's full lifecycle is

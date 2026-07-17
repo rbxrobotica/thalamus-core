@@ -4,6 +4,7 @@ pub mod flow;
 pub mod lifecycle;
 pub mod policy;
 pub mod ports;
+pub mod routing;
 
 pub use audit::AuditEvent;
 pub use domain::{
@@ -18,3 +19,4 @@ pub use lifecycle::{
 };
 pub use policy::{Budget, ContextGrant, Policy, PolicyEngine, RedactionAction, RedactionRule};
 pub use ports::{AuditPort, BackendPort, ContextPort, EvalPort, ObservabilityPort, PolicyPort};
+pub use routing::{BackendCallError, BackendExecution, BackendUsage, CancelToken, RouteEnvelope};

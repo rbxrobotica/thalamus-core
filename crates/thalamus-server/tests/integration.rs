@@ -1464,3 +1464,103 @@ async fn rbx_body_limit_rejects_oversized_payload() {
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+// === Phase 3 slice 2: route envelope audited per model call + typed backend errors ===
+
+#[tokio::test]
+async fn full_call_audits_route_envelope_before_backend() {
+    let backend = Arc::new(CountingBackendPort::new(BackendResponse {
+        content: "ok".to_owned(),
+        tokens_used: Some(10),
+        latency_ms: Some(5),
+    }));
+    let app = app::build_with_backend(make_config(vec![test_policy()]), backend);
+
+    let (status, body) = send_request(
+        app.clone(),
+        "POST",
+        "/v1/call",
+        Some(test_request_body("RBX", "test-product", "test-workflow")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let audit_id = body["post_call"]["audit_id"].as_str().unwrap().to_owned();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/audit/{audit_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let audit: Value = serde_json::from_slice(&bytes).unwrap();
+    let kinds: Vec<&str> = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        kinds.contains(&"RouteEnvelope"),
+        "route envelope must be audited for every model call, got {kinds:?}"
+    );
+    let route = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "RouteEnvelope")
+        .unwrap();
+    assert_eq!(route["details"]["model_alias"], "test-backend");
+    assert_eq!(route["details"]["timeout_ms"], 5000);
+}
+
+#[tokio::test]
+async fn full_call_surfaces_typed_backend_error_and_still_runs_post_call() {
+    // Legacy adapter failure signature: empty content -> typed Unavailable
+    // via the default execute() bridge; post_call still runs and the
+    // response stays 200 (compatibility preserved).
+    let backend = Arc::new(CountingBackendPort::new(BackendResponse {
+        content: String::new(),
+        tokens_used: None,
+        latency_ms: None,
+    }));
+    let app = app::build_with_backend(make_config(vec![test_policy()]), backend.clone());
+
+    let (status, body) = send_request(
+        app,
+        "POST",
+        "/v1/call",
+        Some(test_request_body("RBX", "test-product", "test-workflow")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(backend.call_count(), 1);
+    assert_eq!(body["backend_error"]["code"], "backend_unavailable");
+    assert!(
+        body["post_call"]["status"].is_string(),
+        "post_call must run"
+    );
+}
+
+#[tokio::test]
+async fn full_call_success_has_no_backend_error_field() {
+    let backend = Arc::new(CountingBackendPort::new(BackendResponse {
+        content: "ok".to_owned(),
+        tokens_used: Some(10),
+        latency_ms: Some(5),
+    }));
+    let app = app::build_with_backend(make_config(vec![test_policy()]), backend);
+    let (status, body) = send_request(
+        app,
+        "POST",
+        "/v1/call",
+        Some(test_request_body("RBX", "test-product", "test-workflow")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.get("backend_error").is_none(),
+        "additive field must be absent on success"
+    );
+    assert_eq!(body["backend_content"], "ok");
+}
