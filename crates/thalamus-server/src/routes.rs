@@ -142,13 +142,26 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
         Some(durable) => durable.probe() && durable.healthy(),
         None => true,
     };
-    let ok = audit_reachable;
+    let identity_reachable = match &state.credential_verifier {
+        Some(verifier) => verifier.probe().await,
+        None => true,
+    };
+    let ok = audit_reachable && identity_reachable;
+    let status = if !audit_reachable {
+        "audit_unavailable"
+    } else if !identity_reachable {
+        "identity_unavailable"
+    } else {
+        "ready"
+    };
     let body = serde_json::json!({
         "ok": ok,
-        "status": if ok { "ready" } else { "audit_unavailable" },
+        "status": status,
         "policy_loaded": true,
         "audit_reachable": audit_reachable,
         "durable_audit": state.durable_audit.is_some(),
+        "identity_verifier": state.credential_verifier.is_some(),
+        "identity_reachable": identity_reachable,
         "backend_configured": backend_configured,
     });
     let code = if ok {
@@ -580,7 +593,7 @@ pub async fn full_call(
             tracing::error!(
                 audit_id = %outcome.audit_id.0,
                 code = err.code(),
-                error = %err,
+                error = %crate::redact::redact(&err.to_string()),
                 "backend execution failed"
             );
             (
@@ -979,7 +992,7 @@ async fn stream_call_events(
             tracing::error!(
                 audit_id = %audit_id,
                 code = err.code(),
-                error = %err,
+                error = %crate::redact::redact(&err.to_string()),
                 "streaming backend execution failed"
             );
             let partial_usage = match &err {
@@ -1276,6 +1289,233 @@ pub async fn rbx_session_limits(
             "no session with this id",
             false,
         ),
+        Err(err) => store_error(&err),
+    }
+}
+
+// === /rbx/v1 governance records (§3 slice 4) ===
+
+#[derive(Debug, Deserialize)]
+pub struct ToolDecisionRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub tool: String,
+    /// `allowed` | `denied`
+    pub decision: String,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApprovalRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub subject: String,
+    /// `approved` | `rejected`
+    pub decision: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EvidenceRequest {
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub kind: String,
+    pub uri: String,
+    pub content_hash: String,
+}
+
+/// `Ok(None)` = absent, `Ok(Some)` = valid, `Err(what)` = present but invalid
+/// (caller responds with `invalid_id(what)`).
+fn parse_optional_uuid<'a>(raw: &Option<String>, what: &'a str) -> Result<Option<Uuid>, &'a str> {
+    match raw {
+        None => Ok(None),
+        Some(raw) => match parse_uuid(raw) {
+            Some(id) => Ok(Some(id)),
+            None => Err(what),
+        },
+    }
+}
+
+/// POST /rbx/v1/tool-decisions — record a governed tool-invocation decision.
+pub async fn rbx_tool_decision(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Json(req): Json<ToolDecisionRequest>,
+) -> Response {
+    let Some(session_id) = parse_uuid(&req.session_id) else {
+        return invalid_id("session");
+    };
+    let run_id = match parse_optional_uuid(&req.run_id, "run") {
+        Ok(id) => id,
+        Err(what) => return invalid_id(what),
+    };
+    if !matches!(req.decision.as_str(), "allowed" | "denied") {
+        return typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "decision must be 'allowed' or 'denied'",
+            false,
+        );
+    }
+    let input = crate::ports::sessions::ToolDecision {
+        session_id,
+        run_id,
+        tool: req.tool.clone(),
+        decision: req.decision.clone(),
+        metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
+    };
+    match state.session_store.record_tool_decision(&input) {
+        Ok(invocation_id) => {
+            emit_lifecycle(
+                &state,
+                &session_id,
+                "tool_invocation",
+                &invocation_id,
+                &format!("tool_{}:{}", req.decision, req.tool),
+                caller.subject.as_deref(),
+            );
+            if let Some(resp) = durable_audit_guard(&state) {
+                return resp;
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "invocation_id": invocation_id,
+                    "decision": req.decision,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) if err == "unknown_session" => typed_error(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "no session with this id",
+            false,
+        ),
+        Err(err) => store_error(&err),
+    }
+}
+
+/// POST /rbx/v1/approvals — record an approval. The approver is always the
+/// verified caller, never taken from the body.
+pub async fn rbx_approval(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Json(req): Json<ApprovalRequest>,
+) -> Response {
+    let session_id = match parse_optional_uuid(&req.session_id, "session") {
+        Ok(id) => id,
+        Err(what) => return invalid_id(what),
+    };
+    let run_id = match parse_optional_uuid(&req.run_id, "run") {
+        Ok(id) => id,
+        Err(what) => return invalid_id(what),
+    };
+    if !matches!(req.decision.as_str(), "approved" | "rejected") {
+        return typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "decision must be 'approved' or 'rejected'",
+            false,
+        );
+    }
+    let Some(approver) = caller.subject.clone() else {
+        return typed_error(
+            StatusCode::FORBIDDEN,
+            "policy_denied",
+            "approvals require a credential with a subject",
+            false,
+        );
+    };
+    let input = crate::ports::sessions::ApprovalInput {
+        session_id,
+        run_id,
+        subject: req.subject.clone(),
+        approver: approver.clone(),
+        decision: req.decision.clone(),
+        reason: req.reason.clone(),
+        metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
+    };
+    match state.session_store.record_approval(&input) {
+        Ok(approval_id) => {
+            let stream = session_id.unwrap_or(approval_id);
+            emit_lifecycle(
+                &state,
+                &stream,
+                "approval",
+                &approval_id,
+                &format!("approval_{}", req.decision),
+                Some(&approver),
+            );
+            if let Some(resp) = durable_audit_guard(&state) {
+                return resp;
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "approval_id": approval_id,
+                    "approver": approver,
+                    "decision": req.decision,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => store_error(&err),
+    }
+}
+
+/// POST /rbx/v1/evidence — record an evidence reference (pointer + hash;
+/// never the payload).
+pub async fn rbx_evidence(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Json(req): Json<EvidenceRequest>,
+) -> Response {
+    let run_id = match parse_optional_uuid(&req.run_id, "run") {
+        Ok(id) => id,
+        Err(what) => return invalid_id(what),
+    };
+    if req.uri.is_empty() || req.content_hash.is_empty() {
+        return typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "uri and content_hash are required",
+            false,
+        );
+    }
+    let input = crate::ports::sessions::EvidenceInput {
+        run_id,
+        kind: req.kind.clone(),
+        uri: req.uri.clone(),
+        content_hash: req.content_hash.clone(),
+    };
+    match state.session_store.record_evidence(&input) {
+        Ok(evidence_id) => {
+            let stream = run_id.unwrap_or(evidence_id);
+            emit_lifecycle(
+                &state,
+                &stream,
+                "evidence",
+                &evidence_id,
+                &format!("evidence_recorded:{}", req.kind),
+                caller.subject.as_deref(),
+            );
+            if let Some(resp) = durable_audit_guard(&state) {
+                return resp;
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "evidence_id": evidence_id })),
+            )
+                .into_response()
+        }
         Err(err) => store_error(&err),
     }
 }

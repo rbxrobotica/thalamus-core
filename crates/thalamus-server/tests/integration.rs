@@ -1734,3 +1734,137 @@ async fn call_stream_bridges_legacy_backends_as_single_chunk() {
     assert_eq!(chunks.len(), 1, "legacy bridge = one chunk");
     assert_eq!(chunks[0]["delta"], "inteiro");
 }
+
+// === Phase 3 slice 4: governance endpoints + rate limits + identity probe ===
+
+#[tokio::test]
+async fn rbx_governance_records_tool_decision_approval_evidence() {
+    let (app, _store) = rbx_lifecycle_app();
+
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+
+    // Tool decision.
+    let (status, body) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({ "session_id": session_id, "tool": "shell", "decision": "denied" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["invocation_id"].is_string());
+
+    // Approval: approver comes from the credential, not the body.
+    let (status, body) = post_json_with_auth(
+        &app,
+        "/rbx/v1/approvals",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id,
+            "subject": "patch:abc123",
+            "decision": "approved",
+            "approver": "attacker@evil.example"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["approver"], "ldamasio@gmail.com");
+
+    // Evidence: pointer + hash only.
+    let (status, body) = post_json_with_auth(
+        &app,
+        "/rbx/v1/evidence",
+        Some("rbxsess_leandro"),
+        json!({ "kind": "test-run", "uri": "s3://rbx-evidence/x", "content_hash": "deadbeef" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["evidence_id"].is_string());
+
+    // Unknown session refused for tool decisions.
+    let (status, body) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({ "session_id": uuid::Uuid::new_v4().to_string(), "tool": "shell", "decision": "allowed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_session");
+
+    // Invalid decision value refused.
+    let (status, _) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({ "session_id": session_id, "tool": "shell", "decision": "maybe" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn rbx_rate_limit_returns_typed_429_with_retry_after() {
+    use thalamus_server::rate_limit::RateLimiter;
+
+    let store = Arc::new(InMemorySessionStore::new());
+    let verifier = StaticCredentialVerifier::with_valid(
+        "rbxsess_leandro",
+        rbx_caller("ldamasio@gmail.com", &["kulinaryos:access"]),
+    );
+    let app = app::build_with_rbx_api_sessions_limiter(
+        make_config(vec![test_policy()]),
+        Arc::new(verifier),
+        store as SharedSessionStore,
+        Some(Arc::new(RateLimiter::new(2))),
+    );
+
+    for _ in 0..2 {
+        let (status, _) = send_with_auth(
+            app.clone(),
+            "GET",
+            "/rbx/v1/identity",
+            Some("rbxsess_leandro"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, body) = send_with_auth(
+        app.clone(),
+        "GET",
+        "/rbx/v1/identity",
+        Some("rbxsess_leandro"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "rate_limited");
+    assert_eq!(body["error"]["retryable"], true);
+
+    // Unauthenticated requests are rejected by auth before the limiter.
+    let (status, _) = send_with_auth(app, "GET", "/rbx/v1/identity", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn readyz_reports_identity_verifier_state() {
+    // Without a verifier: identity fields present, service ready.
+    let app = app::build(make_config(vec![test_policy()]));
+    let (status, body) = send_request(app, "GET", "/readyz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["identity_verifier"], false);
+    assert_eq!(body["identity_reachable"], true);
+
+    // With a static verifier (no upstream): reachable, ready.
+    let (app, _store) = rbx_lifecycle_app();
+    let (status, body) = send_request(app, "GET", "/readyz", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["identity_verifier"], true);
+    assert_eq!(body["identity_reachable"], true);
+}

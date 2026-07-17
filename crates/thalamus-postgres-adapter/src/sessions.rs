@@ -16,6 +16,17 @@ use thalamus_core::{
 
 use crate::{off_runtime, AuditStoreError, PostgresAudit};
 
+/// Approval record input (§3).
+pub struct ApprovalRecordInput<'a> {
+    pub session_id: Option<&'a Uuid>,
+    pub run_id: Option<&'a Uuid>,
+    pub subject: &'a str,
+    pub approver: &'a str,
+    pub decision: &'a str,
+    pub reason: Option<&'a str>,
+    pub metadata: &'a serde_json::Value,
+}
+
 /// Input for session creation.
 pub struct NewSessionInput {
     pub tenant: String,
@@ -246,6 +257,83 @@ impl PostgresAudit {
                 context_policy_ref: thalamus_core::DEFAULT_CONTEXT_POLICY_REF.to_owned(),
                 context_utilization_limit: thalamus_core::DEFAULT_CONTEXT_UTILIZATION_LIMIT,
             }))
+        })
+    }
+
+    /// Record a governed tool-invocation decision (§3). Returns `None` when
+    /// the session does not exist.
+    pub fn record_tool_decision(
+        &self,
+        session_id: &Uuid,
+        run_id: Option<&Uuid>,
+        tool: &str,
+        decision: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<Option<Uuid>, AuditStoreError> {
+        off_runtime(|| {
+            let mut conn = self.pool.get()?;
+            let mut tx = conn.transaction()?;
+            if session_by_id(&mut tx, session_id)?.is_none() {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let id = Uuid::new_v4();
+            tx.execute(
+                "INSERT INTO tool_invocations
+                    (invocation_id, run_id, tool, status, completed_at, metadata)
+                 VALUES ($1, $2, $3, $4, now(), $5)",
+                &[&id, &run_id, &tool, &decision, metadata],
+            )?;
+            tx.commit()?;
+            Ok(Some(id))
+        })
+    }
+
+    /// Record an approval (§3). The approver comes from the verified
+    /// credential upstream.
+    pub fn record_approval(
+        &self,
+        input: &ApprovalRecordInput<'_>,
+    ) -> Result<Uuid, AuditStoreError> {
+        off_runtime(|| {
+            let mut conn = self.pool.get()?;
+            let id = Uuid::new_v4();
+            conn.execute(
+                "INSERT INTO approvals
+                    (approval_id, session_id, run_id, subject, approver, decision, reason, metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &id,
+                    &input.session_id,
+                    &input.run_id,
+                    &input.subject,
+                    &input.approver,
+                    &input.decision,
+                    &input.reason,
+                    input.metadata,
+                ],
+            )?;
+            Ok(id)
+        })
+    }
+
+    /// Record an evidence reference (§3): pointer + content hash only.
+    pub fn record_evidence(
+        &self,
+        run_id: Option<&Uuid>,
+        kind: &str,
+        uri: &str,
+        content_hash: &str,
+    ) -> Result<Uuid, AuditStoreError> {
+        off_runtime(|| {
+            let mut conn = self.pool.get()?;
+            let id = Uuid::new_v4();
+            conn.execute(
+                "INSERT INTO evidence_refs (evidence_id, run_id, kind, uri, content_hash)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[&id, &run_id, &kind, &uri, &content_hash],
+            )?;
+            Ok(id)
         })
     }
 

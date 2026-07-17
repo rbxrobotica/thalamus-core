@@ -7,7 +7,7 @@
 //! persisted in `route_envelopes` so post-call validation survives restarts.
 
 mod sessions;
-pub use sessions::{CreateRunError, NewSessionInput};
+pub use sessions::{ApprovalRecordInput, CreateRunError, NewSessionInput};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

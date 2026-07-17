@@ -2,6 +2,8 @@ mod app;
 mod auth;
 mod config;
 mod ports;
+mod rate_limit;
+mod redact;
 mod routes;
 
 #[cfg(any(feature = "litellm", feature = "agentgateway", feature = "langfuse"))]

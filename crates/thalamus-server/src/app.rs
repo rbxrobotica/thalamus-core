@@ -25,6 +25,8 @@ pub struct AppState {
     /// Session/run lifecycle store (Phase 3). Postgres-backed when the durable
     /// audit store is wired; in-memory otherwise.
     pub session_store: ports::sessions::SharedSessionStore,
+    /// Rate limiter for /rbx/v1/* (§3 security). `None` = disabled.
+    pub rate_limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
     pub eval_port: Arc<dyn thalamus_core::EvalPort + Send + Sync>,
     pub obs_port: Arc<dyn thalamus_core::ObservabilityPort + Send + Sync>,
     pub backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
@@ -64,6 +66,7 @@ pub fn build(config: ServerConfig) -> Router {
         audit_store,
         eval_store,
         credential_verifier: None,
+        rate_limiter: default_rate_limiter(),
     });
 
     build_router(state)
@@ -94,6 +97,7 @@ pub fn build_with_backend(
         audit_store,
         eval_store,
         credential_verifier: None,
+        rate_limiter: default_rate_limiter(),
     });
 
     build_router(state)
@@ -123,6 +127,7 @@ pub fn build_with_ports(
         audit_store,
         eval_store,
         credential_verifier: None,
+        rate_limiter: default_rate_limiter(),
     });
 
     build_router(state)
@@ -130,6 +135,10 @@ pub fn build_with_ports(
 
 /// Body limit for the governed /rbx/v1/* surface (master plan §3 security).
 const RBX_BODY_LIMIT_BYTES: usize = 256 * 1024;
+
+fn default_rate_limiter() -> Option<Arc<crate::rate_limit::RateLimiter>> {
+    crate::rate_limit::RateLimiter::from_env().map(Arc::new)
+}
 
 fn build_router(state: Arc<AppState>) -> Router {
     let credential_verifier = state.credential_verifier.clone();
@@ -167,6 +176,18 @@ fn build_router(state: Arc<AppState>) -> Router {
                 get(routes::rbx_session_limits),
             )
             .route("/rbx/v1/runs/{run_id}/cancel", post(routes::rbx_cancel_run))
+            .route("/rbx/v1/tool-decisions", post(routes::rbx_tool_decision))
+            .route("/rbx/v1/approvals", post(routes::rbx_approval))
+            .route("/rbx/v1/evidence", post(routes::rbx_evidence))
+            // Innermost: rate limiting sees the VerifiedCaller inserted by
+            // the (outer) credential middleware.
+            .layer(middleware::from_fn({
+                let limiter = state.rate_limiter.clone();
+                move |req: Request, next: Next| {
+                    let limiter = limiter.clone();
+                    async move { crate::rate_limit::enforce(limiter, req, next).await }
+                }
+            }))
             .layer(middleware::from_fn(move |req: Request, next: Next| {
                 let verifier = Arc::clone(&verifier);
                 async move { auth::require_credential(verifier, req, next).await }
@@ -211,6 +232,7 @@ pub fn build_with_rbx_api(
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
+        rate_limiter: default_rate_limiter(),
     });
 
     build_router(state)
@@ -243,6 +265,41 @@ pub fn build_with_rbx_api_and_sessions(
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
+        rate_limiter: default_rate_limiter(),
+    });
+
+    build_router(state)
+}
+
+/// Build an app serving `/rbx/v1/*` with injected session store AND rate
+/// limiter (integration tests need deterministic limits without env races).
+#[allow(dead_code, reason = "used by integration tests")]
+pub fn build_with_rbx_api_sessions_limiter(
+    config: ServerConfig,
+    credential_verifier: Arc<dyn auth::CredentialVerifier + Send + Sync>,
+    session_store: ports::sessions::SharedSessionStore,
+    rate_limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
+) -> Router {
+    let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
+    let context_port = Arc::new(ports::StaticContextPort::empty());
+    let (audit_port, audit_store, durable_audit, _default_sessions) = ports::audit::audit_wiring();
+    let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
+    let eval_store = eval_port.store().clone();
+    let obs_port = Arc::new(ports::LoggingObservabilityPort);
+
+    let state = Arc::new(AppState {
+        policy_port,
+        durable_audit,
+        session_store,
+        context_port,
+        audit_port,
+        eval_port,
+        obs_port,
+        backend_port: None,
+        audit_store,
+        eval_store,
+        credential_verifier: Some(credential_verifier),
+        rate_limiter,
     });
 
     build_router(state)
@@ -278,6 +335,7 @@ pub fn build_with_eval_sink(
         audit_store,
         eval_store,
         credential_verifier: None,
+        rate_limiter: default_rate_limiter(),
     });
 
     build_router(state)
@@ -309,6 +367,7 @@ pub fn build_with_eval_inspection(
         audit_store,
         eval_store: eval_store.clone(),
         credential_verifier: None,
+        rate_limiter: default_rate_limiter(),
     });
 
     (build_router(state), eval_store)

@@ -89,6 +89,12 @@ impl AuthError {
 #[async_trait]
 pub trait CredentialVerifier: Send + Sync {
     async fn verify(&self, bearer: &str) -> Result<VerifiedCaller, AuthError>;
+
+    /// Liveness of the verifier's upstream (used by /readyz). Default: always
+    /// reachable (static/local verifiers have no upstream).
+    async fn probe(&self) -> bool {
+        true
+    }
 }
 
 /// Validates opaque credentials by calling the `rbx-token-service`
@@ -130,6 +136,22 @@ impl CredentialVerifier for OpaqueIntrospectionVerifier {
                 caller.reason.unwrap_or_else(|| "inactive".to_owned()),
             ))
         }
+    }
+
+    /// Reachability probe: any HTTP response from the introspection endpoint
+    /// (including 4xx for the dummy credential) counts as reachable; only a
+    /// transport failure does not.
+    async fn probe(&self) -> bool {
+        let url = self.introspection_url.clone();
+        tokio::task::spawn_blocking(move || {
+            match ureq::post(&url).send_json(serde_json::json!({ "credential": "probe" })) {
+                Ok(_) => true,
+                Err(ureq::Error::StatusCode(_)) => true,
+                Err(_) => false,
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
