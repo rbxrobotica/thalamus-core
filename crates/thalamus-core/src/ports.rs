@@ -1,11 +1,56 @@
 use crate::audit::AuditEvent;
 use crate::domain::{BackendResponse, CallRequest, ContextEntry, Envelope, PolicyDecision};
 use crate::policy::{ContextGrant, Policy};
+use crate::routing::{
+    BackendCallError, BackendExecution, BackendUsage, CancelToken, RouteEnvelope,
+};
 
 /// Stable port: backend execution. Implemented by data-plane adapters.
 /// Never a domain dependency.
 pub trait BackendPort {
     fn call(&self, envelope: &Envelope) -> BackendResponse;
+
+    /// Execute within a [`RouteEnvelope`] (§3): typed errors, usage, backend
+    /// metadata, timeout and cooperative cancellation. Adapters must refuse
+    /// execution that would cross any envelope constraint.
+    ///
+    /// The default implementation bridges legacy adapters through [`call`]:
+    /// no constraint validation, no mid-flight cancellation, empty content
+    /// mapped to `Unavailable` (the legacy failure signature).
+    fn execute(
+        &self,
+        route: &RouteEnvelope,
+        cancel: &CancelToken,
+    ) -> Result<BackendExecution, BackendCallError> {
+        if cancel.is_cancelled() {
+            return Err(BackendCallError::Cancelled {
+                partial_usage: BackendUsage::default(),
+            });
+        }
+        let response = self.call(&route.envelope);
+        if cancel.is_cancelled() {
+            return Err(BackendCallError::Cancelled {
+                partial_usage: BackendUsage {
+                    total_tokens: response.tokens_used,
+                    ..Default::default()
+                },
+            });
+        }
+        if response.content.is_empty() {
+            return Err(BackendCallError::Unavailable {
+                detail: "legacy adapter returned empty content".to_owned(),
+            });
+        }
+        Ok(BackendExecution {
+            usage: BackendUsage {
+                total_tokens: response.tokens_used,
+                ..Default::default()
+            },
+            latency_ms: response.latency_ms.unwrap_or_default(),
+            backend_metadata: serde_json::json!({ "adapter": "legacy-bridge" }),
+            content: response.content,
+        })
+    }
 }
 
 /// Stable port: authorized context retrieval.

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (Phase 3 slice 2 — BackendPort route envelope)
+
+- `RouteEnvelope`, `BackendExecution`, `BackendUsage`, `BackendCallError` and
+  `CancelToken` in `thalamus-core` (§3): the route envelope is the only
+  authority on provider pool, region, data class, capability class, cost
+  class and timeout; typed backend errors carry partial usage for
+  interrupted calls.
+- `BackendPort::execute(route, cancel)` with a compatibility bridge for
+  legacy adapters (empty content maps to typed `backend_unavailable`).
+- `AuditEvent::RouteEnvelope` emitted before every model call on `/v1/call`
+  (§3 acceptance: route envelope audited for every model call).
+- LiteLLM adapter implements `execute` with an internal
+  `BackendExecutionPlan`: provider-pool and model-alias crossings are refused
+  (`envelope_violation`) before any wire call; per-request timeout from the
+  route envelope; usage (prompt/completion/total) and backend metadata
+  returned; 429 maps to `backend_rate_limited`.
+- `/v1/call` compatibility preserved: typed backend failures surface in a new
+  additive `backend_error` field, post-call still runs, status stays 200.
+
 ### Added (Phase 3 slice 1 — session/run lifecycle API)
 
 - Lifecycle domain types in `thalamus-core` (`SessionRecord`, `RunRecord`,

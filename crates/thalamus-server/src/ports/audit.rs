@@ -170,6 +170,7 @@ impl AuditStore {
                 AuditEvent::PreCallDecision { audit_id: aid, .. } => aid == audit_id,
                 AuditEvent::PostCallOutcome { audit_id: aid, .. } => aid == audit_id,
                 AuditEvent::Lifecycle { audit_id: aid, .. } => aid == audit_id,
+                AuditEvent::RouteEnvelope { audit_id: aid, .. } => aid == audit_id,
             })
             .cloned()
             .collect()

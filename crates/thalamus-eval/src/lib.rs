@@ -385,7 +385,7 @@ mod tests {
 
         let retrieved = store.get("eval-test-1").unwrap();
         assert_eq!(retrieved.eval_ref, "eval-test-1");
-        assert_eq!(retrieved.schema_valid, true);
+        assert!(retrieved.schema_valid);
         assert_eq!(retrieved.risk_class, "Low");
     }
 

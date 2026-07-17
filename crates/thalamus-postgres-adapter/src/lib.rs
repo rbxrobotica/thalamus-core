@@ -353,6 +353,18 @@ impl EventMeta {
                 trace_id: trace_id.0.to_string(),
                 occurred_at: *timestamp,
             },
+            AuditEvent::RouteEnvelope {
+                trace_id,
+                audit_id,
+                timestamp,
+                ..
+            } => Self {
+                stream_id: audit_id.0.to_string(),
+                event_type: "RouteEnvelope".to_owned(),
+                audit_id: audit_id.0.to_string(),
+                trace_id: trace_id.0.to_string(),
+                occurred_at: *timestamp,
+            },
             AuditEvent::Lifecycle {
                 trace_id,
                 audit_id,
