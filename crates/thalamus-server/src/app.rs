@@ -19,7 +19,9 @@ const EVAL_CHANNEL_CAPACITY: usize = 256;
 pub struct AppState {
     pub policy_port: Arc<dyn thalamus_core::PolicyPort + Send + Sync>,
     pub context_port: Arc<dyn thalamus_core::ContextPort + Send + Sync>,
-    pub audit_port: Arc<ports::InMemoryAuditPort>,
+    pub audit_port: ports::audit::SharedAuditPort,
+    /// Authoritative durable audit store (Phase 2). `None` = in-memory only.
+    pub durable_audit: Option<ports::audit::SharedDurableAudit>,
     pub eval_port: Arc<dyn thalamus_core::EvalPort + Send + Sync>,
     pub obs_port: Arc<dyn thalamus_core::ObservabilityPort + Send + Sync>,
     pub backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
@@ -41,8 +43,7 @@ pub struct AppState {
 pub fn build(config: ServerConfig) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let audit_port = Arc::new(ports::InMemoryAuditPort::new());
-    let audit_store = audit_port.store();
+    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
@@ -50,6 +51,7 @@ pub fn build(config: ServerConfig) -> Router {
 
     let state = Arc::new(AppState {
         policy_port,
+        durable_audit,
         context_port,
         audit_port,
         eval_port,
@@ -71,14 +73,14 @@ pub fn build_with_backend(
 ) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let audit_port = Arc::new(ports::InMemoryAuditPort::new());
-    let audit_store = audit_port.store();
+    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
 
     let state = Arc::new(AppState {
         policy_port,
+        durable_audit,
         context_port,
         audit_port,
         eval_port,
@@ -99,14 +101,14 @@ pub fn build_with_ports(
     backend: Arc<dyn BackendPort + Send + Sync>,
 ) -> Router {
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let audit_port = Arc::new(ports::InMemoryAuditPort::new());
-    let audit_store = audit_port.store();
+    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
 
     let state = Arc::new(AppState {
         policy_port,
+        durable_audit,
         context_port,
         audit_port,
         eval_port,
@@ -164,14 +166,14 @@ pub fn build_with_rbx_api(
 ) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let audit_port = Arc::new(ports::InMemoryAuditPort::new());
-    let audit_store = audit_port.store();
+    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
 
     let state = Arc::new(AppState {
         policy_port,
+        durable_audit,
         context_port,
         audit_port,
         eval_port,
@@ -194,8 +196,7 @@ pub fn build_with_eval_sink(
 ) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let audit_port = Arc::new(ports::InMemoryAuditPort::new());
-    let audit_store = audit_port.store();
+    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new_with_sink(
         EVAL_CHANNEL_CAPACITY,
         eval_sink,
@@ -206,6 +207,7 @@ pub fn build_with_eval_sink(
 
     let state = Arc::new(AppState {
         policy_port,
+        durable_audit,
         context_port,
         audit_port,
         eval_port,
@@ -228,14 +230,14 @@ pub fn build_with_eval_inspection(
 ) -> (Router, thalamus_eval::EvalStore) {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
-    let audit_port = Arc::new(ports::InMemoryAuditPort::new());
-    let audit_store = audit_port.store();
+    let (audit_port, audit_store, durable_audit) = ports::audit::audit_wiring();
     let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
     let eval_store = eval_port.store().clone();
     let obs_port = Arc::new(ports::LoggingObservabilityPort);
 
     let state = Arc::new(AppState {
         policy_port,
+        durable_audit,
         context_port,
         audit_port,
         eval_port,

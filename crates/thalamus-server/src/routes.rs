@@ -127,21 +127,50 @@ pub async fn healthz() -> impl IntoResponse {
 
 /// GET /readyz - readiness probe.
 ///
-/// First-slice semantics: every component is in-memory, so the service is
-/// ready as soon as it is wired. `policy_loaded` and `audit_reachable` are
-/// always true here (the ports are constructed in `build`); a durable Jaguar
-/// audit probe and a live backend probe arrive with Phase 2
-/// (`THALAMUS_DURABLE_AUDIT`).
+/// When the durable audit store is wired (Phase 2, `THALAMUS_DATABASE_URL`),
+/// readiness requires a live Jaguar probe plus a healthy emit path — the
+/// pilot must not serve traffic without authoritative audit writes. Without
+/// a durable store, in-memory semantics apply and the service is ready as
+/// soon as it is wired.
 pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     let backend_configured = state.backend_port.is_some();
+    let audit_reachable = match &state.durable_audit {
+        Some(durable) => durable.probe() && durable.healthy(),
+        None => true,
+    };
+    let ok = audit_reachable;
     let body = serde_json::json!({
-        "ok": true,
-        "status": "ready",
+        "ok": ok,
+        "status": if ok { "ready" } else { "audit_unavailable" },
         "policy_loaded": true,
-        "audit_reachable": true,
+        "audit_reachable": audit_reachable,
+        "durable_audit": state.durable_audit.is_some(),
         "backend_configured": backend_configured,
     });
-    (StatusCode::OK, Json(body)).into_response()
+    let code = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(body)).into_response()
+}
+
+/// Structured 503 for a configured-but-unavailable authoritative audit store.
+fn audit_unavailable() -> Response {
+    let resp = ErrorResponse {
+        error: "authoritative audit store unavailable".to_owned(),
+        code: "AUDIT_UNAVAILABLE".to_owned(),
+    };
+    (StatusCode::SERVICE_UNAVAILABLE, Json(resp)).into_response()
+}
+
+/// Fail closed after flow emits: if the durable store is wired but the emit
+/// path is unhealthy, the response must not pretend the call was audited.
+fn durable_audit_guard(state: &AppState) -> Option<Response> {
+    match &state.durable_audit {
+        Some(durable) if !durable.healthy() => Some(audit_unavailable()),
+        _ => None,
+    }
 }
 
 /// GET /rbx/v1/identity - gated by the credential middleware. Returns the
@@ -208,13 +237,28 @@ pub async fn pre_call(
 
     match outcome {
         Ok(outcome) => {
-            // Store pre-call record for post-call correlation
+            if let Some(resp) = durable_audit_guard(&state) {
+                return resp;
+            }
+
+            // Store pre-call record for post-call correlation (durable when
+            // the Phase 2 store is wired; in-memory otherwise)
             if let Some(ref envelope) = outcome.envelope {
-                state.audit_store.store_pre_call_record(
-                    outcome.audit_id.clone(),
-                    envelope.clone(),
-                    outcome.policy.clone(),
-                );
+                match &state.durable_audit {
+                    Some(durable) => {
+                        if durable
+                            .store_pre_call_record(&outcome.audit_id, envelope, &outcome.policy)
+                            .is_err()
+                        {
+                            return audit_unavailable();
+                        }
+                    }
+                    None => state.audit_store.store_pre_call_record(
+                        outcome.audit_id.clone(),
+                        envelope.clone(),
+                        outcome.policy.clone(),
+                    ),
+                }
             }
 
             let envelope_json = outcome.envelope.as_ref().map(|e| EnvelopeJson {
@@ -293,15 +337,28 @@ pub async fn post_call(
         }
     };
 
-    let record = match state.audit_store.get_pre_call_record(&audit_id) {
-        Some(r) => r,
-        None => {
-            let resp = ErrorResponse {
-                error: format!("no pre-call record found for audit_id {}", req.audit_id),
-                code: "UNKNOWN_AUDIT_ID".to_owned(),
-            };
-            return (StatusCode::NOT_FOUND, Json(resp)).into_response();
-        }
+    let record = match &state.durable_audit {
+        Some(durable) => match durable.get_pre_call_record(&audit_id) {
+            Err(_) => return audit_unavailable(),
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                let resp = ErrorResponse {
+                    error: format!("no pre-call record found for audit_id {}", req.audit_id),
+                    code: "UNKNOWN_AUDIT_ID".to_owned(),
+                };
+                return (StatusCode::NOT_FOUND, Json(resp)).into_response();
+            }
+        },
+        None => match state.audit_store.get_pre_call_record(&audit_id) {
+            Some(r) => r,
+            None => {
+                let resp = ErrorResponse {
+                    error: format!("no pre-call record found for audit_id {}", req.audit_id),
+                    code: "UNKNOWN_AUDIT_ID".to_owned(),
+                };
+                return (StatusCode::NOT_FOUND, Json(resp)).into_response();
+            }
+        },
     };
 
     let response = BackendResponse {
@@ -318,6 +375,10 @@ pub async fn post_call(
         state.eval_port.as_ref(),
         state.obs_port.as_ref(),
     );
+
+    if let Some(resp) = durable_audit_guard(&state) {
+        return resp;
+    }
 
     let resp = PostCallResponse {
         status: format!("{:?}", result.status),
@@ -368,13 +429,27 @@ pub async fn full_call(
         }
     };
 
+    if let Some(resp) = durable_audit_guard(&state) {
+        return resp;
+    }
+
     // Store pre-call record for post-call correlation (Allow/AllowWithReview)
     if let Some(ref envelope) = outcome.envelope {
-        state.audit_store.store_pre_call_record(
-            outcome.audit_id.clone(),
-            envelope.clone(),
-            outcome.policy.clone(),
-        );
+        match &state.durable_audit {
+            Some(durable) => {
+                if durable
+                    .store_pre_call_record(&outcome.audit_id, envelope, &outcome.policy)
+                    .is_err()
+                {
+                    return audit_unavailable();
+                }
+            }
+            None => state.audit_store.store_pre_call_record(
+                outcome.audit_id.clone(),
+                envelope.clone(),
+                outcome.policy.clone(),
+            ),
+        }
     }
 
     match &outcome.decision {
@@ -475,6 +550,10 @@ pub async fn full_call(
         state.obs_port.as_ref(),
     );
 
+    if let Some(resp) = durable_audit_guard(&state) {
+        return resp;
+    }
+
     let post_resp = PostCallResponse {
         status: format!("{:?}", post_result.status),
         risk_class: format!("{:?}", post_result.risk_class),
@@ -508,7 +587,13 @@ pub async fn get_audit(
         }
     };
 
-    let events = state.audit_store.get_by_audit_id(&audit_id);
+    let events = match &state.durable_audit {
+        Some(durable) => match durable.events_by_audit_id(&audit_id) {
+            Ok(events) => events,
+            Err(_) => return audit_unavailable(),
+        },
+        None => state.audit_store.get_by_audit_id(&audit_id),
+    };
     let event_jsons: Vec<AuditEventJson> = events
         .iter()
         .map(|e| match e {
