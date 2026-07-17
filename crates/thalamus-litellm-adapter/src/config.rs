@@ -12,6 +12,10 @@ pub struct AdapterConfig {
     pub endpoint: String,
     pub model_map: HashMap<String, String>,
     pub timeout: Duration,
+    /// Bearer key for the LiteLLM proxy (`LITELLM_API_KEY`). DB-less LiteLLM
+    /// authenticates every call with the master key; the key never leaves
+    /// this adapter (callers authenticate to Thalamus, not to LiteLLM).
+    pub api_key: Option<String>,
 }
 
 impl AdapterConfig {
@@ -36,6 +40,7 @@ impl Default for AdapterConfig {
             endpoint: Self::default_endpoint(),
             model_map: HashMap::new(),
             timeout: Duration::from_secs(30),
+            api_key: None,
         }
     }
 }

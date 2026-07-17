@@ -61,11 +61,15 @@ impl LiteLLMAdapter {
 
         let start = std::time::Instant::now();
 
-        let response = self
+        let mut request = self
             .agent
             .post(&url)
             .header("x-trace-id", envelope.trace_id.0.to_string())
-            .header("x-audit-id", envelope.audit_id.0.to_string())
+            .header("x-audit-id", envelope.audit_id.0.to_string());
+        if let Some(key) = &self.config.api_key {
+            request = request.header("authorization", format!("Bearer {key}"));
+        }
+        let response = request
             .send_json(&request_body)
             .map_err(|e| map_ureq_error(e, start.elapsed()))?;
 
@@ -152,25 +156,27 @@ impl LiteLLMAdapter {
             }],
         };
         let start = std::time::Instant::now();
-        let response = agent
+        let mut request = agent
             .post(&plan.url)
             .header("x-trace-id", &plan.trace_id)
-            .header("x-audit-id", &plan.audit_id)
-            .send_json(&request_body)
-            .map_err(|e| match &e {
-                ureq::Error::Timeout(_) => BackendCallError::Timeout {
-                    partial_usage: BackendUsage::default(),
-                },
-                ureq::Error::StatusCode(429) => BackendCallError::RateLimited {
-                    retry_after_ms: None,
-                },
-                ureq::Error::StatusCode(code) => BackendCallError::Unavailable {
-                    detail: format!("backend returned status {code}"),
-                },
-                _ => BackendCallError::Unavailable {
-                    detail: e.to_string(),
-                },
-            })?;
+            .header("x-audit-id", &plan.audit_id);
+        if let Some(key) = &self.config.api_key {
+            request = request.header("authorization", format!("Bearer {key}"));
+        }
+        let response = request.send_json(&request_body).map_err(|e| match &e {
+            ureq::Error::Timeout(_) => BackendCallError::Timeout {
+                partial_usage: BackendUsage::default(),
+            },
+            ureq::Error::StatusCode(429) => BackendCallError::RateLimited {
+                retry_after_ms: None,
+            },
+            ureq::Error::StatusCode(code) => BackendCallError::Unavailable {
+                detail: format!("backend returned status {code}"),
+            },
+            _ => BackendCallError::Unavailable {
+                detail: e.to_string(),
+            },
+        })?;
 
         let parsed: ChatCompletionsResponse =
             response
@@ -267,25 +273,27 @@ impl BackendPort for LiteLLMAdapter {
             "stream_options": { "include_usage": true },
         });
         let start = std::time::Instant::now();
-        let response = agent
+        let mut request = agent
             .post(&plan.url)
             .header("x-trace-id", &plan.trace_id)
-            .header("x-audit-id", &plan.audit_id)
-            .send_json(&request_body)
-            .map_err(|e| match &e {
-                ureq::Error::Timeout(_) => BackendCallError::Timeout {
-                    partial_usage: BackendUsage::default(),
-                },
-                ureq::Error::StatusCode(429) => BackendCallError::RateLimited {
-                    retry_after_ms: None,
-                },
-                ureq::Error::StatusCode(code) => BackendCallError::Unavailable {
-                    detail: format!("backend returned status {code}"),
-                },
-                _ => BackendCallError::Unavailable {
-                    detail: e.to_string(),
-                },
-            })?;
+            .header("x-audit-id", &plan.audit_id);
+        if let Some(key) = &self.config.api_key {
+            request = request.header("authorization", format!("Bearer {key}"));
+        }
+        let response = request.send_json(&request_body).map_err(|e| match &e {
+            ureq::Error::Timeout(_) => BackendCallError::Timeout {
+                partial_usage: BackendUsage::default(),
+            },
+            ureq::Error::StatusCode(429) => BackendCallError::RateLimited {
+                retry_after_ms: None,
+            },
+            ureq::Error::StatusCode(code) => BackendCallError::Unavailable {
+                detail: format!("backend returned status {code}"),
+            },
+            _ => BackendCallError::Unavailable {
+                detail: e.to_string(),
+            },
+        })?;
 
         let reader = BufReader::new(response.into_body().into_reader());
         let mut content = String::new();
@@ -469,6 +477,7 @@ mod tests {
             endpoint: url.to_owned(),
             model_map: HashMap::new(),
             timeout: Duration::from_secs(5),
+            api_key: None,
         })
     }
 
@@ -527,6 +536,7 @@ mod execute_tests {
             endpoint: url.to_owned(),
             model_map,
             timeout: Duration::from_secs(5),
+            api_key: None,
         })
     }
 
@@ -687,6 +697,7 @@ mod streaming_tests {
             endpoint: url.to_owned(),
             model_map: HashMap::new(),
             timeout: Duration::from_secs(5),
+            api_key: None,
         })
     }
 
@@ -792,5 +803,60 @@ mod streaming_tests {
             matches!(err, BackendCallError::Cancelled { .. }),
             "got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use thalamus_core::RouteEnvelope;
+
+    #[test]
+    fn execute_sends_bearer_key_when_configured() {
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer sk-test-master")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "choices": [{ "message": { "content": "ok" } }],
+                    "usage": { "total_tokens": 2 }
+                })
+                .to_string(),
+            )
+            .create();
+        let adapter = LiteLLMAdapter::new(AdapterConfig {
+            endpoint: server.url(),
+            model_map: HashMap::new(),
+            timeout: Duration::from_secs(5),
+            api_key: Some("sk-test-master".to_owned()),
+        });
+        let envelope = {
+            use thalamus_core::*;
+            Envelope {
+                trace_id: TraceId(uuid::Uuid::new_v4()),
+                audit_id: AuditId(uuid::Uuid::new_v4()),
+                backend_handle: BackendHandle {
+                    id: "glm-5.2".to_owned(),
+                    backend_type: BackendType::Model,
+                },
+                prompt: "hi".to_owned(),
+                authorized_context: vec![],
+                redaction_applied: false,
+                policy_ref: "t".to_owned(),
+                budget: Budget {
+                    max_tokens: 10,
+                    max_latency_ms: 5000,
+                },
+            }
+        };
+        let route = RouteEnvelope::from_envelope(&envelope);
+        // The mock only matches with the header; success proves it was sent.
+        let exec = adapter
+            .execute(&route, &CancelToken::new())
+            .expect("authorized call succeeds");
+        assert_eq!(exec.content, "ok");
     }
 }
