@@ -752,6 +752,260 @@ pub async fn get_audit(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
+// === POST /v1/call/stream — SSE streaming variant of /v1/call (§3 slice 3) ===
+//
+// Event sequence: `decision` first; on Allow, `chunk` events carry content
+// deltas as the backend streams them, then `result` carries the post-call
+// summary + usage (or a typed `backend_error`). Deny/AllowWithReview produce
+// `decision` + `result` with no chunks and no backend call. Client disconnect
+// cancels the backend stream mid-flight through the CancelToken.
+
+/// POST /v1/call/stream — full round-trip with SSE streaming.
+pub async fn full_call_stream(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DecideRequest>,
+) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_stream::StreamExt;
+
+    let call_request = decide_to_call_request(&req);
+    let outcome = match thalamus_core::pre_call(
+        &call_request,
+        state.policy_port.as_ref(),
+        state.context_port.as_ref(),
+        state.audit_port.as_ref(),
+        state.obs_port.as_ref(),
+    ) {
+        Ok(o) => o,
+        Err(PreCallError::NoPermittedBackend {
+            tenant, product, ..
+        }) => {
+            let resp = ErrorResponse {
+                error: format!(
+                    "no permitted backends for tenant {} product {}",
+                    tenant, product
+                ),
+                code: "NO_PERMITTED_BACKENDS".to_owned(),
+            };
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(resp)).into_response();
+        }
+    };
+
+    if let Some(resp) = durable_audit_guard(&state) {
+        return resp;
+    }
+
+    if let Some(ref envelope) = outcome.envelope {
+        match &state.durable_audit {
+            Some(durable) => {
+                if durable
+                    .store_pre_call_record(&outcome.audit_id, envelope, &outcome.policy)
+                    .is_err()
+                {
+                    return audit_unavailable();
+                }
+            }
+            None => state.audit_store.store_pre_call_record(
+                outcome.audit_id.clone(),
+                envelope.clone(),
+                outcome.policy.clone(),
+            ),
+        }
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(32);
+    let state_task = Arc::clone(&state);
+    tokio::spawn(async move {
+        stream_call_events(state_task, outcome, tx).await;
+    });
+
+    Sse::new(ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn stream_call_events(
+    state: Arc<AppState>,
+    outcome: thalamus_core::PreCallOutcome,
+    tx: tokio::sync::mpsc::Sender<axum::response::sse::Event>,
+) {
+    use axum::response::sse::Event;
+
+    let audit_id = outcome.audit_id.0.to_string();
+    let (decision_str, terminal_status) = match &outcome.decision {
+        PolicyDecision::Allow => ("Allow", None),
+        PolicyDecision::Deny { .. } => ("Deny", Some("Denied")),
+        PolicyDecision::AllowWithReview { .. } => ("AllowWithReview", Some("NeedsHumanReview")),
+    };
+    let decision_event = Event::default().event("decision").data(
+        serde_json::json!({
+            "decision": decision_str,
+            "audit_id": audit_id,
+            "trace_id": outcome.trace_id.0.to_string(),
+            "policy_id": outcome.policy.id,
+        })
+        .to_string(),
+    );
+    if tx.send(decision_event).await.is_err() {
+        return;
+    }
+
+    // Deny / AllowWithReview: no backend call (structural enforcement).
+    if let Some(status) = terminal_status {
+        let _ = tx
+            .send(
+                Event::default().event("result").data(
+                    serde_json::json!({ "status": status, "audit_id": audit_id }).to_string(),
+                ),
+            )
+            .await;
+        return;
+    }
+
+    let Some(envelope) = outcome.envelope.clone() else {
+        let _ = tx
+            .send(
+                Event::default().event("error").data(
+                    serde_json::json!({
+                        "code": "INVARIANT_VIOLATION",
+                        "message": "allow decision produced no envelope",
+                    })
+                    .to_string(),
+                ),
+            )
+            .await;
+        return;
+    };
+    let Some(backend) = state.backend_port.as_ref().map(Arc::clone) else {
+        let _ = tx
+            .send(
+                Event::default().event("error").data(
+                    serde_json::json!({ "code": "NO_BACKEND", "message": "no backend configured" })
+                        .to_string(),
+                ),
+            )
+            .await;
+        return;
+    };
+
+    // §3 acceptance: route envelope audited before the backend executes.
+    let route = thalamus_core::RouteEnvelope::from_envelope(&envelope);
+    state
+        .audit_port
+        .emit(thalamus_core::AuditEvent::RouteEnvelope {
+            trace_id: envelope.trace_id.clone(),
+            audit_id: outcome.audit_id.clone(),
+            model_alias: route.model_alias.clone(),
+            provider_pool: route.provider_pool.clone(),
+            region: route.region.clone(),
+            data_class: route.data_class.clone(),
+            capability_class: route.capability_class.clone(),
+            cost_class: route.cost_class.clone(),
+            timeout_ms: route.timeout_ms,
+            timestamp: time::OffsetDateTime::now_utc(),
+        });
+
+    // Client disconnect drops the SSE receiver; the sink's failed send then
+    // cancels the backend stream mid-flight through the token.
+    let cancel = thalamus_core::CancelToken::new();
+    let cancel_for_sink = cancel.clone();
+    let tx_for_sink = tx.clone();
+    let execution = tokio::task::spawn_blocking(move || {
+        let mut sink = |delta: &str| {
+            let event = Event::default()
+                .event("chunk")
+                .data(serde_json::json!({ "delta": delta }).to_string());
+            if tx_for_sink.blocking_send(event).is_err() {
+                cancel_for_sink.cancel();
+            }
+        };
+        backend.execute_streaming(&route, &cancel_for_sink, &mut sink)
+    })
+    .await;
+
+    let execution = match execution {
+        Ok(r) => r,
+        Err(_join_err) => {
+            let _ = tx
+                .send(
+                    Event::default().event("error").data(
+                        serde_json::json!({
+                            "code": "BACKEND_TASK_FAILED",
+                            "message": "backend execution task failed",
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await;
+            return;
+        }
+    };
+
+    match execution {
+        Ok(exec) => {
+            let backend_response = BackendResponse {
+                content: exec.content,
+                tokens_used: exec.usage.total_tokens,
+                latency_ms: Some(exec.latency_ms),
+            };
+            // post_call is non-bypassable on the Allow path.
+            let post_result = thalamus_core::post_call(
+                &backend_response,
+                &envelope,
+                &outcome.policy,
+                state.audit_port.as_ref(),
+                state.eval_port.as_ref(),
+                state.obs_port.as_ref(),
+            );
+            let _ = tx
+                .send(
+                    Event::default().event("result").data(
+                        serde_json::json!({
+                            "status": format!("{:?}", post_result.status),
+                            "risk_class": format!("{:?}", post_result.risk_class),
+                            "executable_by_agent": post_result.executable_by_agent,
+                            "schema_valid": post_result.schema_valid,
+                            "audit_id": audit_id,
+                            "usage": exec.usage,
+                            "latency_ms": exec.latency_ms,
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await;
+        }
+        Err(err) => {
+            tracing::error!(
+                audit_id = %audit_id,
+                code = err.code(),
+                error = %err,
+                "streaming backend execution failed"
+            );
+            let partial_usage = match &err {
+                thalamus_core::BackendCallError::Timeout { partial_usage }
+                | thalamus_core::BackendCallError::Cancelled { partial_usage } => {
+                    Some(partial_usage.clone())
+                }
+                _ => None,
+            };
+            let _ = tx
+                .send(
+                    Event::default().event("error").data(
+                        serde_json::json!({
+                            "code": err.code(),
+                            "message": err.to_string(),
+                            "audit_id": audit_id,
+                            "partial_usage": partial_usage,
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await;
+        }
+    }
+}
+
 // === /rbx/v1 session/run lifecycle (master plan §3, slice 1) ===
 //
 // All handlers run behind the credential middleware: the VerifiedCaller

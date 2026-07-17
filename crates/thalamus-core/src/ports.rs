@@ -51,6 +51,24 @@ pub trait BackendPort {
             content: response.content,
         })
     }
+
+    /// Streaming execution (§3): content deltas are delivered through `sink`
+    /// as they arrive; the final [`BackendExecution`] carries the full
+    /// content and usage. Adapters must check `cancel` between chunks and
+    /// return [`BackendCallError::Cancelled`] with partial usage mid-flight.
+    ///
+    /// The default implementation bridges non-streaming adapters: one
+    /// [`execute`] call, whole content delivered as a single chunk.
+    fn execute_streaming(
+        &self,
+        route: &RouteEnvelope,
+        cancel: &CancelToken,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<BackendExecution, BackendCallError> {
+        let execution = self.execute(route, cancel)?;
+        sink(&execution.content);
+        Ok(execution)
+    }
 }
 
 /// Stable port: authorized context retrieval.

@@ -1564,3 +1564,173 @@ async fn full_call_success_has_no_backend_error_field() {
     );
     assert_eq!(body["backend_content"], "ok");
 }
+
+// === Phase 3 slice 3: SSE streaming endpoint (/v1/call/stream) ===
+
+use thalamus_core::{BackendCallError, BackendExecution, BackendUsage, CancelToken, RouteEnvelope};
+
+/// Scripted streaming backend: emits fixed deltas through the sink.
+struct ScriptedStreamingBackend {
+    deltas: Vec<&'static str>,
+}
+
+impl BackendPort for ScriptedStreamingBackend {
+    fn call(&self, _envelope: &Envelope) -> BackendResponse {
+        unreachable!("streaming test must use execute_streaming")
+    }
+
+    fn execute(
+        &self,
+        _route: &RouteEnvelope,
+        _cancel: &CancelToken,
+    ) -> Result<BackendExecution, BackendCallError> {
+        unreachable!("streaming test must use execute_streaming")
+    }
+
+    fn execute_streaming(
+        &self,
+        _route: &RouteEnvelope,
+        _cancel: &CancelToken,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<BackendExecution, BackendCallError> {
+        let mut content = String::new();
+        for delta in &self.deltas {
+            content.push_str(delta);
+            sink(delta);
+        }
+        Ok(BackendExecution {
+            content,
+            usage: BackendUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(3),
+                total_tokens: Some(8),
+            },
+            latency_ms: 7,
+            backend_metadata: serde_json::json!({ "adapter": "scripted" }),
+        })
+    }
+}
+
+async fn collect_sse(app: axum::Router, body: Value) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/call/stream")
+        .header("content-type", "application/json")
+        .body::<Body>(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn sse_events(raw: &str) -> Vec<(String, Value)> {
+    let mut events = Vec::new();
+    let mut name = String::new();
+    for line in raw.lines() {
+        if let Some(n) = line.strip_prefix("event: ") {
+            name = n.to_owned();
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            if let Ok(v) = serde_json::from_str(data) {
+                events.push((name.clone(), v));
+            }
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn call_stream_emits_decision_chunks_result_and_audits_route() {
+    let backend = Arc::new(ScriptedStreamingBackend {
+        deltas: vec!["Hel", "lo ", "mundo"],
+    });
+    let app = app::build_with_backend(make_config(vec![test_policy()]), backend);
+
+    let (status, raw) = collect_sse(
+        app.clone(),
+        test_request_body("RBX", "test-product", "test-workflow"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = sse_events(&raw);
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["decision", "chunk", "chunk", "chunk", "result"],
+        "raw SSE:\n{raw}"
+    );
+    assert_eq!(events[0].1["decision"], "Allow");
+    let deltas: String = events
+        .iter()
+        .filter(|(n, _)| n == "chunk")
+        .map(|(_, v)| v["delta"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(deltas, "Hello mundo");
+    let result = &events.last().unwrap().1;
+    assert_eq!(result["usage"]["total_tokens"], 8);
+    assert!(result["status"].is_string());
+
+    // Route envelope audited for the streamed call too.
+    let audit_id = events[0].1["audit_id"].as_str().unwrap();
+    let (_, audit) = send_request(app, "GET", &format!("/v1/audit/{audit_id}"), None).await;
+    let kinds: Vec<&str> = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"RouteEnvelope"), "got {kinds:?}");
+    assert!(
+        kinds.contains(&"PostCallOutcome"),
+        "post_call must run, got {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn call_stream_deny_has_no_chunks_and_no_backend_call() {
+    let backend = Arc::new(CountingBackendPort::new(BackendResponse {
+        content: "never".to_owned(),
+        tokens_used: None,
+        latency_ms: None,
+    }));
+    let app = app::build_with_backend(make_config(vec![test_policy()]), backend.clone());
+
+    // Unknown tenant/product resolves to a deny policy in ConfigPolicyPort.
+    let (status, raw) = collect_sse(
+        app,
+        test_request_body("unknown", "unknown-product", "unknown-workflow"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = sse_events(&raw);
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        !names.contains(&"chunk"),
+        "deny must produce no chunks, got {names:?}"
+    );
+    assert_eq!(backend.call_count(), 0, "deny must never call the backend");
+}
+
+#[tokio::test]
+async fn call_stream_bridges_legacy_backends_as_single_chunk() {
+    let backend = Arc::new(CountingBackendPort::new(BackendResponse {
+        content: "inteiro".to_owned(),
+        tokens_used: Some(4),
+        latency_ms: Some(2),
+    }));
+    let app = app::build_with_backend(make_config(vec![test_policy()]), backend);
+
+    let (_, raw) = collect_sse(
+        app,
+        test_request_body("RBX", "test-product", "test-workflow"),
+    )
+    .await;
+    let events = sse_events(&raw);
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|(n, _)| n == "chunk")
+        .map(|(_, v)| v)
+        .collect();
+    assert_eq!(chunks.len(), 1, "legacy bridge = one chunk");
+    assert_eq!(chunks[0]["delta"], "inteiro");
+}

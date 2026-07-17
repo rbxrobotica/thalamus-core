@@ -238,6 +238,131 @@ impl BackendPort for LiteLLMAdapter {
         result
     }
 
+    /// Streaming execution over the OpenAI-compatible SSE wire
+    /// (`"stream": true`). Deltas are forwarded to `sink` as they arrive;
+    /// the cancel token is checked between chunks and aborts the stream
+    /// mid-flight with whatever usage is known ([`BackendCallError::Cancelled`]).
+    fn execute_streaming(
+        &self,
+        route: &RouteEnvelope,
+        cancel: &CancelToken,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<BackendExecution, BackendCallError> {
+        use std::io::{BufRead, BufReader};
+
+        if cancel.is_cancelled() {
+            return Err(BackendCallError::Cancelled {
+                partial_usage: BackendUsage::default(),
+            });
+        }
+        let plan = self.plan(route)?;
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(plan.timeout))
+            .build()
+            .into();
+        let request_body = serde_json::json!({
+            "model": plan.wire_model,
+            "messages": [{ "role": "user", "content": plan.prompt }],
+            "stream": true,
+            "stream_options": { "include_usage": true },
+        });
+        let start = std::time::Instant::now();
+        let response = agent
+            .post(&plan.url)
+            .header("x-trace-id", &plan.trace_id)
+            .header("x-audit-id", &plan.audit_id)
+            .send_json(&request_body)
+            .map_err(|e| match &e {
+                ureq::Error::Timeout(_) => BackendCallError::Timeout {
+                    partial_usage: BackendUsage::default(),
+                },
+                ureq::Error::StatusCode(429) => BackendCallError::RateLimited {
+                    retry_after_ms: None,
+                },
+                ureq::Error::StatusCode(code) => BackendCallError::Unavailable {
+                    detail: format!("backend returned status {code}"),
+                },
+                _ => BackendCallError::Unavailable {
+                    detail: e.to_string(),
+                },
+            })?;
+
+        let reader = BufReader::new(response.into_body().into_reader());
+        let mut content = String::new();
+        let mut usage = BackendUsage::default();
+        let mut chunks = 0u32;
+        for line in reader.lines() {
+            if cancel.is_cancelled() {
+                return Err(BackendCallError::Cancelled {
+                    partial_usage: usage,
+                });
+            }
+            let line = line.map_err(|e| {
+                if content.is_empty() {
+                    BackendCallError::Unavailable {
+                        detail: e.to_string(),
+                    }
+                } else {
+                    // Stream broke mid-flight: surface as timeout-class with
+                    // whatever usage is known.
+                    BackendCallError::Timeout {
+                        partial_usage: usage.clone(),
+                    }
+                }
+            })?;
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data.trim() == "[DONE]" {
+                break;
+            }
+            let parsed: StreamChunk = match serde_json::from_str(data) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(BackendCallError::MalformedResponse {
+                        detail: format!("bad SSE chunk: {e}"),
+                    })
+                }
+            };
+            if let Some(u) = parsed.usage {
+                usage = BackendUsage {
+                    prompt_tokens: u.prompt_tokens.map(|t| t as u32),
+                    completion_tokens: u.completion_tokens.map(|t| t as u32),
+                    total_tokens: Some(u.total_tokens as u32),
+                };
+            }
+            if let Some(delta) = parsed
+                .choices
+                .first()
+                .and_then(|c| c.delta.as_ref())
+                .and_then(|d| d.content.as_deref())
+            {
+                if !delta.is_empty() {
+                    chunks += 1;
+                    content.push_str(delta);
+                    sink(delta);
+                }
+            }
+        }
+        if content.is_empty() {
+            return Err(BackendCallError::MalformedResponse {
+                detail: "stream produced no content".to_owned(),
+            });
+        }
+        Ok(BackendExecution {
+            content,
+            usage,
+            latency_ms: start.elapsed().as_millis() as u64,
+            backend_metadata: serde_json::json!({
+                "provider_pool": PROVIDER_POOL,
+                "wire_model": plan.wire_model,
+                "endpoint": self.config.endpoint,
+                "streamed": true,
+                "chunks": chunks,
+            }),
+        })
+    }
+
     fn call(&self, envelope: &Envelope) -> BackendResponse {
         match self.call_internal(envelope) {
             Ok(resp) => resp,
@@ -308,6 +433,28 @@ struct Usage {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+}
+
+// === Streaming wire types (OpenAI-compatible SSE) ===
+
+#[derive(serde::Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(serde::Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: Option<StreamDelta>,
+}
+
+#[derive(serde::Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 // === Unit tests ===
@@ -524,6 +671,125 @@ mod execute_tests {
                 err,
                 BackendCallError::Timeout { .. } | BackendCallError::Unavailable { .. }
             ),
+            "got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use thalamus_core::RouteEnvelope;
+
+    fn adapter_for(url: &str) -> LiteLLMAdapter {
+        LiteLLMAdapter::new(AdapterConfig {
+            endpoint: url.to_owned(),
+            model_map: HashMap::new(),
+            timeout: Duration::from_secs(5),
+        })
+    }
+
+    fn route() -> RouteEnvelope {
+        use thalamus_core::*;
+        let envelope = Envelope {
+            trace_id: TraceId(uuid::Uuid::new_v4()),
+            audit_id: AuditId(uuid::Uuid::new_v4()),
+            backend_handle: BackendHandle {
+                id: "glm-5.2".to_owned(),
+                backend_type: BackendType::Model,
+            },
+            prompt: "Hello".to_owned(),
+            authorized_context: vec![],
+            redaction_applied: false,
+            policy_ref: "test".to_owned(),
+            budget: Budget {
+                max_tokens: 1000,
+                max_latency_ms: 5000,
+            },
+        };
+        RouteEnvelope::from_envelope(&envelope)
+    }
+
+    fn sse_body() -> String {
+        [
+            r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{"content":"lo "}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{"content":"mundo"}}]}"#,
+            "",
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn streaming_delivers_deltas_and_final_usage() {
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse_body())
+            .create();
+        let adapter = adapter_for(&server.url());
+        let mut deltas: Vec<String> = Vec::new();
+        let exec = adapter
+            .execute_streaming(&route(), &CancelToken::new(), &mut |d| {
+                deltas.push(d.to_owned())
+            })
+            .expect("stream succeeds");
+        assert_eq!(deltas, vec!["Hel", "lo ", "mundo"]);
+        assert_eq!(exec.content, "Hello mundo");
+        assert_eq!(exec.usage.total_tokens, Some(8));
+        assert_eq!(exec.backend_metadata["streamed"], true);
+        assert_eq!(exec.backend_metadata["chunks"], 3);
+    }
+
+    #[test]
+    fn streaming_cancels_mid_flight_between_chunks() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Slow SSE server: two chunks with a pause, so cancellation lands
+        // between them. Proves the token aborts a stream already in flight.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf); // consume request
+            let chunk1 = "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n";
+            let chunk2 =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\ndata: [DONE]\n\n";
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                chunk1.len() + chunk2.len()
+            );
+            let _ = socket.write_all(chunk1.as_bytes());
+            let _ = socket.flush();
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = socket.write_all(chunk2.as_bytes());
+        });
+
+        let adapter = adapter_for(&format!("http://{addr}"));
+        let cancel = CancelToken::new();
+        let cancel_in_sink = cancel.clone();
+        let mut deltas: Vec<String> = Vec::new();
+        let err = adapter
+            .execute_streaming(&route(), &cancel, &mut |d| {
+                deltas.push(d.to_owned());
+                cancel_in_sink.cancel(); // simulate client disconnect after first delta
+            })
+            .expect_err("must cancel mid-flight");
+        assert_eq!(deltas, vec!["first"], "only the first chunk was delivered");
+        assert!(
+            matches!(err, BackendCallError::Cancelled { .. }),
             "got {err:?}"
         );
     }
