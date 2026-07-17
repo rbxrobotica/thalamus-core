@@ -1,0 +1,6 @@
+target/
+console/node_modules/
+sdks/typescript/node_modules/
+.git/
+.github/
+docs/
