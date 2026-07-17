@@ -456,6 +456,7 @@ fn make_litellm_adapter(mock_url: &str) -> Arc<dyn BackendPort + Send + Sync> {
         endpoint: mock_url.to_owned(),
         model_map: std::collections::HashMap::new(),
         timeout: Duration::from_secs(5),
+        api_key: None,
     };
     Arc::new(thalamus_litellm_adapter::LiteLLMAdapter::new(config))
 }

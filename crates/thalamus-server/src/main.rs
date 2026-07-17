@@ -40,6 +40,7 @@ async fn main() {
         });
         let adapter_config = thalamus_litellm_adapter::config::AdapterConfig {
             endpoint,
+            api_key: std::env::var("LITELLM_API_KEY").ok(),
             ..Default::default()
         };
         let backend: Arc<dyn BackendPort + Send + Sync> = Arc::new(
@@ -105,6 +106,7 @@ async fn main() {
         });
         let adapter_config = thalamus_litellm_adapter::config::AdapterConfig {
             endpoint,
+            api_key: std::env::var("LITELLM_API_KEY").ok(),
             ..Default::default()
         };
         let backend: Arc<dyn BackendPort + Send + Sync> = Arc::new(
