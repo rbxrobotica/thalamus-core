@@ -6,6 +6,9 @@
 //! so retries and duplicate emits are safe. Pre-call correlation records are
 //! persisted in `route_envelopes` so post-call validation survives restarts.
 
+mod sessions;
+pub use sessions::{CreateRunError, NewSessionInput};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -21,10 +24,16 @@ const EMIT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Embedded, ordered migrations. Applied by `run_migrations` (each inside its
 /// own transaction) and recorded in `schema_migrations`. Migrations are owned
 /// exclusively by the `thalamus_migrator` role.
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_audit_schema",
-    include_str!("../migrations/0001_audit_schema.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_audit_schema",
+        include_str!("../migrations/0001_audit_schema.sql"),
+    ),
+    (
+        "0002_lifecycle_idempotency",
+        include_str!("../migrations/0002_lifecycle_idempotency.sql"),
+    ),
+];
 
 /// The sync `postgres` client drives its own internal tokio runtime; calling
 /// it from a thread inside the server's async runtime panics ("cannot start a
@@ -340,6 +349,20 @@ impl EventMeta {
             } => Self {
                 stream_id: audit_id.0.to_string(),
                 event_type: "PostCallOutcome".to_owned(),
+                audit_id: audit_id.0.to_string(),
+                trace_id: trace_id.0.to_string(),
+                occurred_at: *timestamp,
+            },
+            AuditEvent::Lifecycle {
+                trace_id,
+                audit_id,
+                timestamp,
+                ..
+            } => Self {
+                // Lifecycle streams chain on the audit id (= session id), so
+                // one session's whole lifecycle forms a single hash chain.
+                stream_id: audit_id.0.to_string(),
+                event_type: "Lifecycle".to_owned(),
                 audit_id: audit_id.0.to_string(),
                 trace_id: trace_id.0.to_string(),
                 occurred_at: *timestamp,

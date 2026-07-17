@@ -66,7 +66,12 @@ impl DurableAuditStore for thalamus_postgres_adapter::PostgresAudit {
 /// is set (disable explicitly with `THALAMUS_DURABLE_AUDIT=off`). Startup
 /// fails fast when the durable store is configured but unreachable: the pilot
 /// must not run without authoritative audit writes.
-pub fn audit_wiring() -> (SharedAuditPort, AuditStore, Option<SharedDurableAudit>) {
+pub fn audit_wiring() -> (
+    SharedAuditPort,
+    AuditStore,
+    Option<SharedDurableAudit>,
+    crate::ports::sessions::SharedSessionStore,
+) {
     let mem = Arc::new(InMemoryAuditPort::new());
     let store = mem.store();
 
@@ -78,7 +83,7 @@ pub fn audit_wiring() -> (SharedAuditPort, AuditStore, Option<SharedDurableAudit
             Ok(pg) => {
                 let pg: Arc<thalamus_postgres_adapter::PostgresAudit> = Arc::new(pg);
                 tracing::info!("durable audit store enabled (Postgres authoritative)");
-                return (pg.clone(), store, Some(pg));
+                return (pg.clone(), store, Some(pg.clone()), pg);
             }
             Err(err) => {
                 eprintln!("fatal: durable audit store configured but unreachable: {err}");
@@ -87,7 +92,8 @@ pub fn audit_wiring() -> (SharedAuditPort, AuditStore, Option<SharedDurableAudit
         }
     }
 
-    (mem, store, None)
+    let sessions = Arc::new(crate::ports::sessions::InMemorySessionStore::new());
+    (mem, store, None, sessions)
 }
 
 #[cfg(feature = "postgres")]
@@ -163,6 +169,7 @@ impl AuditStore {
             .filter(|e| match e {
                 AuditEvent::PreCallDecision { audit_id: aid, .. } => aid == audit_id,
                 AuditEvent::PostCallOutcome { audit_id: aid, .. } => aid == audit_id,
+                AuditEvent::Lifecycle { audit_id: aid, .. } => aid == audit_id,
             })
             .cloned()
             .collect()

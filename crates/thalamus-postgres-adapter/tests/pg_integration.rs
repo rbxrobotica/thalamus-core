@@ -186,3 +186,134 @@ fn route_envelope_roundtrip_survives_reconnect() {
     assert_eq!(record.envelope.prompt, "prompt");
     assert_eq!(record.policy.id, "policy-test");
 }
+
+// === Phase 3 slice 1: session/run lifecycle on the durable store ===
+
+use thalamus_core::{RunStatus, SessionStatus};
+use thalamus_postgres_adapter::{CreateRunError, NewSessionInput};
+
+fn new_session_input(idempotency_key: Option<&str>) -> NewSessionInput {
+    NewSessionInput {
+        tenant: format!("t-{}", Uuid::new_v4()),
+        product: "kulinaryos".to_owned(),
+        workflow: "coding".to_owned(),
+        principal: Some("ldamasio@gmail.com".to_owned()),
+        delegation_token_id: Some("jti-1".to_owned()),
+        idempotency_key: idempotency_key.map(str::to_owned),
+    }
+}
+
+#[test]
+fn session_run_lifecycle_and_closed_session_refusal() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let session = store
+        .create_session(&new_session_input(None))
+        .expect("create session");
+    assert_eq!(session.status, SessionStatus::Open);
+
+    let run = store
+        .create_run(&session.session_id, Some("glm-5.2"), None)
+        .expect("create run");
+    assert_eq!(run.status, RunStatus::Started);
+    assert_eq!(run.session_id, session.session_id);
+
+    let cancelled = store
+        .cancel_run(&run.run_id)
+        .expect("cancel")
+        .expect("run exists");
+    assert_eq!(cancelled.status, RunStatus::Cancelled);
+    assert!(cancelled.finished_at.is_some());
+
+    let closed = store
+        .close_session(&session.session_id)
+        .expect("close")
+        .expect("session exists");
+    assert_eq!(closed.status, SessionStatus::Closed);
+
+    let refused = store.create_run(&session.session_id, None, None);
+    assert!(matches!(refused, Err(CreateRunError::SessionClosed)));
+}
+
+#[test]
+fn budget_exhaustion_blocks_runs_and_shows_in_limits() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let input = new_session_input(None);
+    let product_scope = format!("{}/{}", input.tenant, input.product);
+    let session = store.create_session(&input).expect("create session");
+
+    // Provision a product budget with headroom, consume it, then verify.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("psql");
+    client
+        .execute(
+            "INSERT INTO budgets (scope_type, scope_ref, period, max_tokens)
+             VALUES ('product', $1, 'total', 500)",
+            &[&product_scope],
+        )
+        .expect("seed budget");
+
+    let run = store.create_run(&session.session_id, None, None);
+    assert!(run.is_ok(), "budget with headroom must allow runs");
+
+    store
+        .record_usage(&session.session_id, 500)
+        .expect("record usage");
+
+    let refused = store.create_run(&session.session_id, None, None);
+    assert!(
+        matches!(
+            refused,
+            Err(CreateRunError::BudgetExceeded { ref scope_type, .. }) if scope_type == "product"
+        ),
+        "exhausted budget must refuse runs, got {refused:?}"
+    );
+
+    let limits = store
+        .session_limits(&session.session_id)
+        .expect("limits")
+        .expect("session exists");
+    let line = limits
+        .budgets
+        .iter()
+        .find(|b| b.scope_ref == product_scope)
+        .expect("budget line present");
+    assert!(line.exhausted);
+    assert_eq!(line.consumed_tokens, 500);
+    assert_eq!(limits.context_utilization_limit, 0.7);
+}
+
+#[test]
+fn idempotent_session_and_run_creation_survive_replay() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let key = format!("idem-{}", Uuid::new_v4());
+    let input = new_session_input(Some(&key));
+    let first = store.create_session(&input).expect("first");
+    let second = store.create_session(&input).expect("replay");
+    assert_eq!(first.session_id, second.session_id);
+
+    let run_key = format!("idem-run-{}", Uuid::new_v4());
+    let run_a = store
+        .create_run(&first.session_id, None, Some(&run_key))
+        .expect("first run");
+    let run_b = store
+        .create_run(&first.session_id, None, Some(&run_key))
+        .expect("replayed run");
+    assert_eq!(run_a.run_id, run_b.run_id);
+}
