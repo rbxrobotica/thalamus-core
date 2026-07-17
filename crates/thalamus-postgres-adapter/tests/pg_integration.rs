@@ -317,3 +317,89 @@ fn idempotent_session_and_run_creation_survive_replay() {
         .expect("replayed run");
     assert_eq!(run_a.run_id, run_b.run_id);
 }
+
+// === Phase 3 slice 4: governance records on the durable store ===
+
+#[test]
+fn governance_records_persist_on_postgres() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let session = store
+        .create_session(&new_session_input(None))
+        .expect("session");
+    let run = store
+        .create_run(&session.session_id, None, None)
+        .expect("run");
+
+    let invocation = store
+        .record_tool_decision(
+            &session.session_id,
+            Some(&run.run_id),
+            "shell",
+            "denied",
+            &serde_json::json!({ "cmd": "redacted" }),
+        )
+        .expect("tool decision")
+        .expect("session exists");
+
+    let missing = store
+        .record_tool_decision(
+            &Uuid::new_v4(),
+            None,
+            "shell",
+            "allowed",
+            &serde_json::json!({}),
+        )
+        .expect("no store error");
+    assert!(missing.is_none(), "unknown session must be refused");
+
+    let approval = store
+        .record_approval(&thalamus_postgres_adapter::ApprovalRecordInput {
+            session_id: Some(&session.session_id),
+            run_id: Some(&run.run_id),
+            subject: "patch:abc",
+            approver: "ldamasio@gmail.com",
+            decision: "approved",
+            reason: Some("looks good"),
+            metadata: &serde_json::json!({}),
+        })
+        .expect("approval");
+
+    let evidence = store
+        .record_evidence(
+            Some(&run.run_id),
+            "test-run",
+            "s3://rbx-evidence/x",
+            "deadbeef",
+        )
+        .expect("evidence");
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("psql");
+    let inv: i64 = client
+        .query_one(
+            "SELECT count(*) FROM tool_invocations WHERE invocation_id = $1 AND status = 'denied'",
+            &[&invocation],
+        )
+        .unwrap()
+        .get(0);
+    let appr: i64 = client
+        .query_one(
+            "SELECT count(*) FROM approvals WHERE approval_id = $1 AND approver = 'ldamasio@gmail.com'",
+            &[&approval],
+        )
+        .unwrap()
+        .get(0);
+    let evid: i64 = client
+        .query_one(
+            "SELECT count(*) FROM evidence_refs WHERE evidence_id = $1 AND content_hash = 'deadbeef'",
+            &[&evidence],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!((inv, appr, evid), (1, 1, 1));
+}

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (Phase 3 slice 4 — governance endpoints + §3 security)
+
+- `POST /rbx/v1/tool-decisions`, `POST /rbx/v1/approvals`,
+  `POST /rbx/v1/evidence` behind the credential middleware, persisted on the
+  Phase 2 schema (`tool_invocations`, `approvals`, `evidence_refs`) with
+  lifecycle audit events. The approver always comes from the verified
+  credential — an `approver` field in the body is ignored. Evidence carries
+  pointer + content hash only, never the payload.
+- Rate limiting on `/rbx/v1/*` per subject and client app
+  (`THALAMUS_RBX_RATE_LIMIT` requests/min per key, default 120, `off`
+  disables): typed `rate_limited` 429 with `Retry-After`.
+- Secret redaction before operational logs (`Bearer`/JWT/`sk-`/`rbxsess_`/
+  key-value tokens masked in backend-error log lines).
+- `/readyz` now probes the identity verifier upstream
+  (`identity_verifier` / `identity_reachable`; 503 `identity_unavailable`
+  when the introspection endpoint is unreachable).
+
 ### Added (Phase 3 slice 3 — SSE streaming + mid-flight cancel)
 
 - `BackendPort::execute_streaming(route, cancel, sink)`: content deltas
