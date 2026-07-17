@@ -141,6 +141,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/pre-call", post(routes::pre_call))
         .route("/v1/post-call", post(routes::post_call))
         .route("/v1/call", post(routes::full_call))
+        .route("/v1/call/stream", post(routes::full_call_stream))
         .route("/v1/audit/{id}", get(routes::get_audit))
         .with_state(state.clone());
 

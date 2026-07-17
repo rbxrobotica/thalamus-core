@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (Phase 3 slice 3 — SSE streaming + mid-flight cancel)
+
+- `BackendPort::execute_streaming(route, cancel, sink)`: content deltas
+  through a sink, cancel token checked between chunks, partial usage on
+  cancellation/timeout. Default impl bridges non-streaming adapters as a
+  single chunk.
+- LiteLLM adapter streams over the OpenAI-compatible SSE wire
+  (`stream: true` + `stream_options.include_usage`); a cancelled token
+  aborts the stream mid-flight with whatever usage is known; a broken
+  stream after first content surfaces as timeout-class with partial usage.
+- `POST /v1/call/stream`: SSE endpoint with `decision` → `chunk`* →
+  `result` (post-call summary + usage) event sequence; typed `error`
+  events carry `partial_usage`; Deny/AllowWithReview produce no chunks and
+  never call the backend; client disconnect cancels the backend stream
+  through the token; the route envelope is audited before execution.
+
 ### Added (Phase 3 slice 2 — BackendPort route envelope)
 
 - `RouteEnvelope`, `BackendExecution`, `BackendUsage`, `BackendCallError` and
