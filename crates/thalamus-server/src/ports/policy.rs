@@ -40,14 +40,25 @@ impl PolicyPort for ConfigPolicyPort {
                 redaction_rules: vec![],
                 audit_required: false,
                 risk_threshold: thalamus_core::RiskLevel::Low,
+                require_run_correlation: false,
             })
     }
 
-    fn evaluate(&self, _request: &CallRequest, policy: &Policy) -> PolicyDecision {
+    fn evaluate(&self, request: &CallRequest, policy: &Policy) -> PolicyDecision {
         if policy.id == "no-match" {
             return PolicyDecision::Deny {
                 reason: "no matching policy".to_owned(),
                 policy_ref: "no-match".to_owned(),
+            };
+        }
+        // SLICE-T1: tenants flagged require_run_correlation only accept calls
+        // arriving through the run-bound governed surface; the uncorrelated
+        // legacy /v1/call path is denied before any backend contact.
+        if policy.require_run_correlation && !request.run_correlated {
+            return PolicyDecision::Deny {
+                reason: "uncorrelated_call: this tenant requires run-bound governed calls"
+                    .to_owned(),
+                policy_ref: policy.id.clone(),
             };
         }
         // Empty permitted_backends is handled by select_backend returning

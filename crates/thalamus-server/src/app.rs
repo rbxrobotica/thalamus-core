@@ -176,6 +176,11 @@ fn build_router(state: Arc<AppState>) -> Router {
                 get(routes::rbx_session_limits),
             )
             .route("/rbx/v1/runs/{run_id}/cancel", post(routes::rbx_cancel_run))
+            .route("/rbx/v1/runs/{run_id}/calls", post(routes::rbx_run_call))
+            .route(
+                "/rbx/v1/runs/{run_id}/calls/stream",
+                post(routes::rbx_run_call_stream),
+            )
             .route("/rbx/v1/tool-decisions", post(routes::rbx_tool_decision))
             .route("/rbx/v1/approvals", post(routes::rbx_approval))
             .route("/rbx/v1/evidence", post(routes::rbx_evidence))
@@ -263,6 +268,40 @@ pub fn build_with_rbx_api_and_sessions(
         eval_port,
         obs_port,
         backend_port: None,
+        audit_store,
+        eval_store,
+        credential_verifier: Some(credential_verifier),
+        rate_limiter: default_rate_limiter(),
+    });
+
+    build_router(state)
+}
+
+/// Build an app serving `/rbx/v1/*` with injected session store AND backend
+/// port (run-bound governed call tests, SLICE-T1).
+#[allow(dead_code, reason = "used by integration tests")]
+pub fn build_with_rbx_api_sessions_backend(
+    config: ServerConfig,
+    credential_verifier: Arc<dyn auth::CredentialVerifier + Send + Sync>,
+    session_store: ports::sessions::SharedSessionStore,
+    backend: Arc<dyn thalamus_core::BackendPort + Send + Sync>,
+) -> Router {
+    let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
+    let context_port = Arc::new(ports::StaticContextPort::empty());
+    let (audit_port, audit_store, durable_audit, _default_sessions) = ports::audit::audit_wiring();
+    let eval_port = Arc::new(ports::ChannelEvalPort::new(EVAL_CHANNEL_CAPACITY));
+    let eval_store = eval_port.store().clone();
+    let obs_port = Arc::new(ports::LoggingObservabilityPort);
+
+    let state = Arc::new(AppState {
+        policy_port,
+        durable_audit,
+        session_store,
+        context_port,
+        audit_port,
+        eval_port,
+        obs_port,
+        backend_port: Some(backend),
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),

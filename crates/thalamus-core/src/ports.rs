@@ -69,6 +69,28 @@ pub trait BackendPort {
         sink(&execution.content);
         Ok(execution)
     }
+
+    /// Chat-structured streaming execution for run-bound calls: each backend
+    /// chunk is delivered verbatim as an OpenAI-compatible
+    /// `chat.completion.chunk` JSON object (content deltas, tool_call
+    /// argument deltas, finish_reason, usage), so a compatibility facade can
+    /// forward them without re-synthesis.
+    ///
+    /// The default implementation bridges text-only adapters: content deltas
+    /// from [`execute_streaming`] are wrapped into minimal chunk objects.
+    fn execute_streaming_chat(
+        &self,
+        route: &RouteEnvelope,
+        cancel: &CancelToken,
+        on_chunk: &mut dyn FnMut(&serde_json::Value),
+    ) -> Result<BackendExecution, BackendCallError> {
+        let mut forward = |delta: &str| {
+            on_chunk(&serde_json::json!({
+                "choices": [{ "index": 0, "delta": { "content": delta }, "finish_reason": null }]
+            }));
+        };
+        self.execute_streaming(route, cancel, &mut forward)
+    }
 }
 
 /// Stable port: authorized context retrieval.

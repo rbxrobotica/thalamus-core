@@ -72,6 +72,11 @@ pub struct CallRequest {
     pub prompt: String,
     pub requested_backend: Option<BackendHandle>,
     pub budget_hint: Option<BudgetHint>,
+    /// True only when the call arrived through the run-bound governed surface
+    /// (`/rbx/v1/runs/{run_id}/calls`), set by the server, never by callers.
+    /// Policies with `require_run_correlation` deny uncorrelated calls.
+    #[serde(default)]
+    pub run_correlated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +97,13 @@ pub struct Envelope {
     pub redaction_applied: bool,
     pub policy_ref: String,
     pub budget: crate::policy::Budget,
+    /// Structured chat payload (`chat.completions.v1`: messages, tools,
+    /// tool_choice, max_tokens) for run-bound calls. When present, adapters
+    /// execute it instead of wrapping `prompt` in a single user message;
+    /// `prompt` then holds the serialized payload for policy scanning and
+    /// post-call validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_payload: Option<serde_json::Value>,
 }
 
 // === Context ===

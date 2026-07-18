@@ -25,6 +25,87 @@ struct BackendExecutionPlan {
     trace_id: String,
     audit_id: String,
     prompt: String,
+    /// Structured `chat.completions.v1` payload for run-bound calls. When
+    /// present the wire request is built from it (allowlisted fields only)
+    /// instead of wrapping `prompt` in a single user message.
+    chat_payload: Option<serde_json::Value>,
+    /// Policy budget in tokens; clamps any client-supplied max_tokens.
+    budget_max_tokens: u32,
+}
+
+/// Build the wire body for a chat-structured call: only contract fields the
+/// approved client uses (messages, tools, tool_choice, max_tokens) cross the
+/// wire; the model is always the resolved wire model, never client-supplied.
+fn chat_request_body(plan: &BackendExecutionPlan, stream: bool) -> serde_json::Value {
+    let payload = plan.chat_payload.as_ref().expect("chat plan has payload");
+    let mut body = serde_json::json!({
+        "model": plan.wire_model,
+        "messages": payload.get("messages").cloned().unwrap_or_else(|| serde_json::json!([])),
+    });
+    let obj = body.as_object_mut().expect("body is an object");
+    if let Some(tools) = payload.get("tools") {
+        obj.insert("tools".to_owned(), tools.clone());
+    }
+    if let Some(tool_choice) = payload.get("tool_choice") {
+        obj.insert("tool_choice".to_owned(), tool_choice.clone());
+    }
+    let requested = payload.get("max_tokens").and_then(|v| v.as_u64());
+    let budget = u64::from(plan.budget_max_tokens);
+    let effective = match requested {
+        Some(req) if budget > 0 => req.min(budget),
+        Some(req) => req,
+        None if budget > 0 => budget,
+        None => 0,
+    };
+    if effective > 0 {
+        obj.insert("max_tokens".to_owned(), serde_json::json!(effective));
+    }
+    if stream {
+        obj.insert("stream".to_owned(), serde_json::json!(true));
+        obj.insert(
+            "stream_options".to_owned(),
+            serde_json::json!({ "include_usage": true }),
+        );
+    }
+    body
+}
+
+/// Parse an OpenAI-shape usage object (`prompt_tokens` / `completion_tokens`
+/// / `total_tokens`) from a JSON value.
+fn parse_usage_value(usage: Option<&serde_json::Value>) -> Option<BackendUsage> {
+    let u = usage?.as_object()?;
+    let field = |name: &str| u.get(name).and_then(|v| v.as_u64()).map(|t| t as u32);
+    Some(BackendUsage {
+        prompt_tokens: field("prompt_tokens"),
+        completion_tokens: field("completion_tokens"),
+        total_tokens: field("total_tokens"),
+    })
+}
+
+/// Incrementally assembled tool call from streamed argument deltas.
+#[derive(Default)]
+struct StreamedToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Map a ureq transport/status error to the typed backend error.
+fn map_wire_error(e: &ureq::Error) -> BackendCallError {
+    match e {
+        ureq::Error::Timeout(_) => BackendCallError::Timeout {
+            partial_usage: BackendUsage::default(),
+        },
+        ureq::Error::StatusCode(429) => BackendCallError::RateLimited {
+            retry_after_ms: None,
+        },
+        ureq::Error::StatusCode(code) => BackendCallError::Unavailable {
+            detail: format!("backend returned status {code}"),
+        },
+        _ => BackendCallError::Unavailable {
+            detail: e.to_string(),
+        },
+    }
 }
 
 /// BackendPort adapter for the LiteLLM OpenAI-compatible data plane.
@@ -135,6 +216,8 @@ impl LiteLLMAdapter {
             trace_id: route.envelope.trace_id.0.to_string(),
             audit_id: route.envelope.audit_id.0.to_string(),
             prompt: route.envelope.prompt.clone(),
+            chat_payload: route.envelope.chat_payload.clone(),
+            budget_max_tokens: route.envelope.budget.max_tokens,
         })
     }
 
@@ -148,12 +231,13 @@ impl LiteLLMAdapter {
             .timeout_global(Some(plan.timeout))
             .build()
             .into();
-        let request_body = ChatCompletionsRequest {
-            model: plan.wire_model.clone(),
-            messages: vec![Message {
-                role: "user".to_owned(),
-                content: plan.prompt.clone(),
-            }],
+        let request_body = if plan.chat_payload.is_some() {
+            chat_request_body(plan, false)
+        } else {
+            serde_json::json!({
+                "model": plan.wire_model,
+                "messages": [{ "role": "user", "content": plan.prompt }],
+            })
         };
         let start = std::time::Instant::now();
         let mut request = agent
@@ -163,22 +247,11 @@ impl LiteLLMAdapter {
         if let Some(key) = &self.config.api_key {
             request = request.header("authorization", format!("Bearer {key}"));
         }
-        let response = request.send_json(&request_body).map_err(|e| match &e {
-            ureq::Error::Timeout(_) => BackendCallError::Timeout {
-                partial_usage: BackendUsage::default(),
-            },
-            ureq::Error::StatusCode(429) => BackendCallError::RateLimited {
-                retry_after_ms: None,
-            },
-            ureq::Error::StatusCode(code) => BackendCallError::Unavailable {
-                detail: format!("backend returned status {code}"),
-            },
-            _ => BackendCallError::Unavailable {
-                detail: e.to_string(),
-            },
-        })?;
+        let response = request
+            .send_json(&request_body)
+            .map_err(|e| map_wire_error(&e))?;
 
-        let parsed: ChatCompletionsResponse =
+        let parsed: serde_json::Value =
             response
                 .into_body()
                 .read_json()
@@ -186,25 +259,34 @@ impl LiteLLMAdapter {
                     detail: e.to_string(),
                 })?;
 
-        let content = parsed
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone())
-            .unwrap_or_default();
-        if content.is_empty() {
+        let message = parsed
+            .pointer("/choices/0/message")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let text = message
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let tool_calls = message.get("tool_calls").filter(|t| !t.is_null()).cloned();
+        // A chat response may legitimately carry only tool calls; the audited
+        // content then holds their serialization so post-call validates a
+        // non-empty payload. Legacy prompt calls keep requiring text.
+        let content = if !text.is_empty() {
+            text
+        } else if let Some(ref calls) = tool_calls {
+            calls.to_string()
+        } else {
             return Err(BackendCallError::MalformedResponse {
                 detail: "empty content in response".to_owned(),
             });
-        }
+        };
 
-        let usage = parsed
-            .usage
-            .map(|u| BackendUsage {
-                prompt_tokens: u.prompt_tokens.map(|t| t as u32),
-                completion_tokens: u.completion_tokens.map(|t| t as u32),
-                total_tokens: Some(u.total_tokens as u32),
-            })
-            .unwrap_or_default();
+        let usage = parse_usage_value(parsed.get("usage")).unwrap_or_default();
+        let finish_reason = parsed
+            .pointer("/choices/0/finish_reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
 
         Ok(BackendExecution {
             content,
@@ -214,6 +296,8 @@ impl LiteLLMAdapter {
                 "provider_pool": PROVIDER_POOL,
                 "wire_model": plan.wire_model,
                 "endpoint": self.config.endpoint,
+                "finish_reason": finish_reason,
+                "message": if plan.chat_payload.is_some() { message } else { serde_json::Value::Null },
             }),
         })
     }
@@ -371,6 +455,166 @@ impl BackendPort for LiteLLMAdapter {
         })
     }
 
+    /// Chat-structured streaming for run-bound calls: every SSE chunk is
+    /// forwarded verbatim as parsed JSON (content deltas, tool_call argument
+    /// deltas, finish_reason, usage), while text and tool calls are assembled
+    /// for the audited final content. Cancellation is checked between chunks.
+    fn execute_streaming_chat(
+        &self,
+        route: &RouteEnvelope,
+        cancel: &CancelToken,
+        on_chunk: &mut dyn FnMut(&serde_json::Value),
+    ) -> Result<BackendExecution, BackendCallError> {
+        use std::io::{BufRead, BufReader};
+
+        if cancel.is_cancelled() {
+            return Err(BackendCallError::Cancelled {
+                partial_usage: BackendUsage::default(),
+            });
+        }
+        let plan = self.plan(route)?;
+        if plan.chat_payload.is_none() {
+            // Text-only envelope: fall back to the wrapping default.
+            let mut forward = |delta: &str| {
+                on_chunk(&serde_json::json!({
+                    "choices": [{ "index": 0, "delta": { "content": delta }, "finish_reason": null }]
+                }));
+            };
+            return self.execute_streaming(route, cancel, &mut forward);
+        }
+
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(plan.timeout))
+            .build()
+            .into();
+        let request_body = chat_request_body(&plan, true);
+        let start = std::time::Instant::now();
+        let mut request = agent
+            .post(&plan.url)
+            .header("x-trace-id", &plan.trace_id)
+            .header("x-audit-id", &plan.audit_id);
+        if let Some(key) = &self.config.api_key {
+            request = request.header("authorization", format!("Bearer {key}"));
+        }
+        let response = request
+            .send_json(&request_body)
+            .map_err(|e| map_wire_error(&e))?;
+
+        let reader = BufReader::new(response.into_body().into_reader());
+        let mut content = String::new();
+        let mut tool_calls: Vec<StreamedToolCall> = Vec::new();
+        let mut usage = BackendUsage::default();
+        let mut finish_reason: Option<String> = None;
+        let mut chunks = 0u32;
+        for line in reader.lines() {
+            if cancel.is_cancelled() {
+                return Err(BackendCallError::Cancelled {
+                    partial_usage: usage,
+                });
+            }
+            let line = line.map_err(|e| {
+                if chunks == 0 {
+                    BackendCallError::Unavailable {
+                        detail: e.to_string(),
+                    }
+                } else {
+                    BackendCallError::Timeout {
+                        partial_usage: usage.clone(),
+                    }
+                }
+            })?;
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data.trim() == "[DONE]" {
+                break;
+            }
+            let parsed: serde_json::Value =
+                serde_json::from_str(data).map_err(|e| BackendCallError::MalformedResponse {
+                    detail: format!("bad SSE chunk: {e}"),
+                })?;
+            chunks += 1;
+            if let Some(u) = parse_usage_value(parsed.get("usage")) {
+                usage = u;
+            }
+            if let Some(reason) = parsed
+                .pointer("/choices/0/finish_reason")
+                .and_then(|v| v.as_str())
+            {
+                finish_reason = Some(reason.to_owned());
+            }
+            if let Some(delta) = parsed.pointer("/choices/0/delta") {
+                if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                    content.push_str(text);
+                }
+                if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                    for call in calls {
+                        let index =
+                            call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                        while tool_calls.len() <= index {
+                            tool_calls.push(StreamedToolCall::default());
+                        }
+                        let slot = &mut tool_calls[index];
+                        if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                            slot.id = id.to_owned();
+                        }
+                        if let Some(name) = call.pointer("/function/name").and_then(|v| v.as_str())
+                        {
+                            slot.name = name.to_owned();
+                        }
+                        if let Some(args) =
+                            call.pointer("/function/arguments").and_then(|v| v.as_str())
+                        {
+                            slot.arguments.push_str(args);
+                        }
+                    }
+                }
+            }
+            on_chunk(&parsed);
+        }
+
+        let assembled_calls: Vec<serde_json::Value> = tool_calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                })
+            })
+            .collect();
+        // Pure tool-call responses have no text; audit their serialization as
+        // the call content so post-call validates a non-empty payload.
+        let final_content = if !content.is_empty() {
+            content
+        } else if !assembled_calls.is_empty() {
+            serde_json::Value::Array(assembled_calls.clone()).to_string()
+        } else {
+            return Err(BackendCallError::MalformedResponse {
+                detail: "stream produced no content".to_owned(),
+            });
+        };
+
+        Ok(BackendExecution {
+            content: final_content,
+            usage,
+            latency_ms: start.elapsed().as_millis() as u64,
+            backend_metadata: serde_json::json!({
+                "provider_pool": PROVIDER_POOL,
+                "wire_model": plan.wire_model,
+                "endpoint": self.config.endpoint,
+                "streamed": true,
+                "chunks": chunks,
+                "finish_reason": finish_reason,
+                "tool_calls": if assembled_calls.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::Array(assembled_calls)
+                },
+            }),
+        })
+    }
+
     fn call(&self, envelope: &Envelope) -> BackendResponse {
         match self.call_internal(envelope) {
             Ok(resp) => resp,
@@ -498,6 +742,7 @@ mod tests {
                 max_tokens: 1000,
                 max_latency_ms: 5000,
             },
+            chat_payload: None,
         }
     }
 
@@ -557,6 +802,7 @@ mod execute_tests {
                 max_tokens: 1000,
                 max_latency_ms: 5000,
             },
+            chat_payload: None,
         };
         let _ = url;
         RouteEnvelope::from_envelope(&envelope)
@@ -718,6 +964,7 @@ mod streaming_tests {
                 max_tokens: 1000,
                 max_latency_ms: 5000,
             },
+            chat_payload: None,
         };
         RouteEnvelope::from_envelope(&envelope)
     }
@@ -850,6 +1097,7 @@ mod auth_tests {
                     max_tokens: 10,
                     max_latency_ms: 5000,
                 },
+                chat_payload: None,
             }
         };
         let route = RouteEnvelope::from_envelope(&envelope);

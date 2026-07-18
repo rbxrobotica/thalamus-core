@@ -74,6 +74,7 @@ impl PolicyPort for FakeReviewPolicyPort {
                 redaction_rules: vec![],
                 audit_required: false,
                 risk_threshold: RiskLevel::Low,
+                require_run_correlation: false,
             }
         }
     }
@@ -114,6 +115,7 @@ fn test_policy() -> Policy {
         redaction_rules: vec![],
         audit_required: true,
         risk_threshold: RiskLevel::Medium,
+        require_run_correlation: false,
     }
 }
 
@@ -132,6 +134,7 @@ fn empty_backend_policy() -> Policy {
         redaction_rules: vec![],
         audit_required: false,
         risk_threshold: RiskLevel::Low,
+        require_run_correlation: false,
     }
 }
 
@@ -448,6 +451,7 @@ fn litellm_policy() -> Policy {
         redaction_rules: vec![],
         audit_required: true,
         risk_threshold: RiskLevel::Medium,
+        require_run_correlation: false,
     }
 }
 
@@ -754,6 +758,7 @@ fn agentgateway_policy() -> Policy {
         redaction_rules: vec![],
         audit_required: true,
         risk_threshold: RiskLevel::Medium,
+        require_run_correlation: false,
     }
 }
 
@@ -927,6 +932,7 @@ async fn backend_swap_agentgateway_produces_same_flow_as_litellm() {
         redaction_rules: vec![],
         audit_required: true,
         risk_threshold: RiskLevel::Low,
+        require_run_correlation: false,
     };
 
     let success_body = serde_json::json!({
@@ -1235,7 +1241,7 @@ async fn introspection_verifier_calls_token_service() {
 
 // === Phase 3 slice 1: session/run lifecycle (/rbx/v1/sessions...) ===
 
-use thalamus_server::ports::sessions::{InMemorySessionStore, SharedSessionStore};
+use thalamus_server::ports::sessions::{InMemorySessionStore, SessionStore, SharedSessionStore};
 
 fn rbx_lifecycle_app() -> (axum::Router, Arc<InMemorySessionStore>) {
     let store = Arc::new(InMemorySessionStore::new());
@@ -1273,7 +1279,12 @@ async fn post_json_with_auth(
 }
 
 fn session_request() -> Value {
-    json!({ "tenant": "rbx", "product": "kulinaryos", "workflow": "coding" })
+    json!({
+        "tenant": "rbx",
+        "product": "kulinaryos",
+        "workflow": "coding",
+        "governance_mode": "governed_llm_access",
+    })
 }
 
 #[tokio::test]
@@ -1903,4 +1914,498 @@ async fn rbx_api_mode_keeps_legacy_call_backend_wired() {
     // readyz reflects the wired backend.
     let (_, ready) = send_request(app, "GET", "/readyz", None).await;
     assert_eq!(ready["backend_configured"], true);
+}
+
+// === SLICE-T1: run-bound governed calls (/rbx/v1/runs/{run_id}/calls) ===
+//
+// Rejection matrix (Gate D): run of another principal, closed run/session,
+// expired credential, uncorrelated legacy call under require_run_correlation,
+// second execution on the same run, exhausted budget, client-supplied model.
+
+fn kulinaryos_policy(require_run_correlation: bool) -> Policy {
+    Policy {
+        id: "kulinaryos-policy".to_owned(),
+        tenant: "rbx".to_owned(),
+        product: "kulinaryos".to_owned(),
+        workflow: "coding".to_owned(),
+        permitted_backends: vec![BackendHandle {
+            id: "test-backend".to_owned(),
+            backend_type: BackendType::Model,
+        }],
+        budget: Budget {
+            max_tokens: 1000,
+            max_latency_ms: 5000,
+        },
+        context_grants: vec![],
+        redaction_rules: vec![],
+        audit_required: true,
+        risk_threshold: RiskLevel::Medium,
+        require_run_correlation,
+    }
+}
+
+fn run_call_app(
+    policy: Policy,
+    backend: Arc<dyn BackendPort + Send + Sync>,
+) -> (axum::Router, Arc<InMemorySessionStore>) {
+    let store = Arc::new(InMemorySessionStore::new());
+    let mallory = {
+        let mut caller = rbx_caller("mallory@example.com", &[]);
+        caller.jti = Some("jti-mallory".to_owned());
+        caller
+    };
+    let verifier = StaticCredentialVerifier::with_valid(
+        "rbxsess_leandro",
+        rbx_caller("ldamasio@gmail.com", &["kulinaryos:access"]),
+    )
+    .and_valid("rbxsess_mallory", mallory);
+    let app = app::build_with_rbx_api_sessions_backend(
+        make_config(vec![policy]),
+        Arc::new(verifier),
+        store.clone() as SharedSessionStore,
+        backend,
+    );
+    (app, store)
+}
+
+async fn create_session_and_run(app: &axum::Router) -> (String, String) {
+    let (status, session) = post_json_with_auth(
+        app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+    let (status, run) = post_json_with_auth(
+        app,
+        &format!("/rbx/v1/sessions/{session_id}/runs"),
+        Some("rbxsess_leandro"),
+        json!({ "model_alias": "test-backend" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let run_id = run["run_id"].as_str().unwrap().to_owned();
+    (session_id, run_id)
+}
+
+fn chat_call_body() -> Value {
+    json!({
+        "intent": "chat",
+        "payload_kind": "chat.completions.v1",
+        "payload": { "messages": [{ "role": "user", "content": "hello governed world" }] },
+    })
+}
+
+fn counting_backend() -> Arc<CountingBackendPort> {
+    Arc::new(CountingBackendPort::new(BackendResponse {
+        content: "governed ok".to_owned(),
+        tokens_used: Some(50),
+        latency_ms: Some(10),
+    }))
+}
+
+#[tokio::test]
+async fn run_call_executes_and_finishes_run_with_usage() {
+    let backend = counting_backend();
+    let (app, store) = run_call_app(kulinaryos_policy(false), backend.clone());
+    let (session_id, run_id) = create_session_and_run(&app).await;
+    store.set_budget("session", &session_id, "day", Some(1000), 0);
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["decision"], "Allow");
+    assert_eq!(body["content"], "governed ok");
+    assert_eq!(body["session_id"], session_id);
+    assert!(body["audit_id"].is_string());
+    assert_eq!(backend.call_count(), 1);
+
+    // Run is finalized: completed + executed (1:1 claim consumed).
+    let (run, _) = store
+        .run_with_session(&run_id.parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(format!("{:?}", run.status), "Completed");
+    assert_eq!(run.execution_state, "executed");
+
+    // Usage from the backend consumed the governing budget (I9).
+    let (_, limits) = send_with_auth(
+        app,
+        "GET",
+        &format!("/rbx/v1/sessions/{session_id}/limits"),
+        Some("rbxsess_leandro"),
+    )
+    .await;
+    assert_eq!(limits["budgets"][0]["consumed_tokens"], 50);
+}
+
+#[tokio::test]
+async fn run_call_rejects_foreign_principal_as_not_found() {
+    let backend = counting_backend();
+    let (app, store) = run_call_app(kulinaryos_policy(false), backend.clone());
+    let (_, run_id) = create_session_and_run(&app).await;
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_mallory"),
+        chat_call_body(),
+    )
+    .await;
+    // Anti-enumeration: indistinguishable from an unknown run.
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["error"]["code"], "not_found");
+    assert_eq!(backend.call_count(), 0);
+
+    // The run was NOT claimed: the owner can still execute it.
+    let (run, _) = store
+        .run_with_session(&run_id.parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.execution_state, "pending");
+}
+
+#[tokio::test]
+async fn run_call_rejects_closed_run_and_closed_session() {
+    let backend = counting_backend();
+    let (app, _store) = run_call_app(kulinaryos_policy(false), backend.clone());
+
+    // Cancelled run -> run_closed.
+    let (_, run_id) = create_session_and_run(&app).await;
+    let (status, _) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/cancel"),
+        Some("rbxsess_leandro"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "run_closed");
+
+    // Closed session -> session_closed.
+    let (session_id, run_id) = create_session_and_run(&app).await;
+    let (status, _) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/sessions/{session_id}/close"),
+        Some("rbxsess_leandro"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "session_closed");
+    assert_eq!(backend.call_count(), 0);
+}
+
+#[tokio::test]
+async fn run_call_rejects_expired_credential() {
+    let store = Arc::new(InMemorySessionStore::new());
+    let verifier = StaticCredentialVerifier::always_inactive("expired");
+    let app = app::build_with_rbx_api_sessions_backend(
+        make_config(vec![kulinaryos_policy(false)]),
+        Arc::new(verifier),
+        store as SharedSessionStore,
+        counting_backend(),
+    );
+    let run_id = uuid::Uuid::new_v4();
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_dead"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "session_expired");
+}
+
+#[tokio::test]
+async fn run_call_rejects_second_execution_on_same_run() {
+    let backend = counting_backend();
+    let (app, _store) = run_call_app(kulinaryos_policy(false), backend.clone());
+    let (_, run_id) = create_session_and_run(&app).await;
+
+    let (status, _) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "run_already_executed");
+    assert_eq!(backend.call_count(), 1, "backend must not run twice");
+}
+
+#[tokio::test]
+async fn run_call_rejects_exhausted_budget_with_429() {
+    let backend = counting_backend();
+    let (app, store) = run_call_app(kulinaryos_policy(false), backend.clone());
+    let (session_id, run_id) = create_session_and_run(&app).await;
+    store.set_budget("session", &session_id, "day", Some(10), 10);
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "budget_exceeded");
+    assert_eq!(backend.call_count(), 0);
+}
+
+#[tokio::test]
+async fn run_call_rejects_client_supplied_model_and_bad_payload_kind() {
+    let backend = counting_backend();
+    let (app, _store) = run_call_app(kulinaryos_policy(false), backend.clone());
+    let (_, run_id) = create_session_and_run(&app).await;
+
+    let mut with_model = chat_call_body();
+    with_model["payload"]["model"] = json!("gpt-4o");
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        with_model,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+
+    let mut bad_kind = chat_call_body();
+    bad_kind["payload_kind"] = json!("prompt.v0");
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        bad_kind,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(backend.call_count(), 0);
+}
+
+#[tokio::test]
+async fn run_call_denies_unmatched_policy_and_finalizes_run() {
+    // Policy for another tenant: the session's tenant resolves to no-match.
+    let backend = counting_backend();
+    let (app, store) = run_call_app(test_policy(), backend.clone());
+    let (_, run_id) = create_session_and_run(&app).await;
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"]["code"], "policy_denied");
+    assert_eq!(backend.call_count(), 0, "deny never reaches the backend");
+
+    // The claimed run is finalized as failed, never left dangling.
+    let (run, _) = store
+        .run_with_session(&run_id.parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(format!("{:?}", run.status), "Failed");
+    assert_eq!(run.execution_state, "executed");
+}
+
+#[tokio::test]
+async fn uncorrelated_legacy_call_denied_when_policy_requires_correlation() {
+    let backend = counting_backend();
+    let (app, store) = run_call_app(kulinaryos_policy(true), backend.clone());
+
+    // Legacy /v1/call for the same tenant/product/workflow: denied before
+    // any backend contact.
+    let legacy_body = json!({
+        "tenant": "rbx",
+        "product": "kulinaryos",
+        "user": "test-user",
+        "workflow": "coding",
+        "intent": "chat",
+        "prompt": "hello",
+        "requested_backend": { "id": "test-backend", "backend_type": "Model" },
+    });
+    let (status, resp) = send_request(app.clone(), "POST", "/v1/call", Some(legacy_body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let decision = resp["decision"].as_str().unwrap();
+    assert!(
+        decision.starts_with("Deny") && decision.contains("uncorrelated_call"),
+        "got: {decision}"
+    );
+    assert_eq!(backend.call_count(), 0);
+
+    // The run-bound governed path stays allowed under the same policy.
+    let (session_id, run_id) = create_session_and_run(&app).await;
+    store.set_budget("session", &session_id, "day", Some(1000), 0);
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(backend.call_count(), 1);
+}
+
+/// Scripted chat-streaming backend: emits verbatim chat.completion.chunk
+/// objects (content delta, streamed tool_call arguments, finish_reason) the
+/// way the LiteLLM adapter does for run-bound calls.
+struct ScriptedChatBackend {
+    chunks: Vec<Value>,
+}
+
+impl BackendPort for ScriptedChatBackend {
+    fn call(&self, _envelope: &Envelope) -> BackendResponse {
+        BackendResponse {
+            content: String::new(),
+            tokens_used: None,
+            latency_ms: None,
+        }
+    }
+
+    fn execute_streaming_chat(
+        &self,
+        _route: &RouteEnvelope,
+        _cancel: &CancelToken,
+        on_chunk: &mut dyn FnMut(&Value),
+    ) -> Result<BackendExecution, BackendCallError> {
+        for chunk in &self.chunks {
+            on_chunk(chunk);
+        }
+        Ok(BackendExecution {
+            content: "[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"filePath\\\":\\\"x\\\"}\"}}]".to_owned(),
+            usage: BackendUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(3),
+                total_tokens: Some(8),
+            },
+            latency_ms: 7,
+            backend_metadata: serde_json::json!({ "finish_reason": "tool_calls" }),
+        })
+    }
+}
+
+#[tokio::test]
+async fn run_call_stream_passes_chunks_verbatim_and_finalizes_run() {
+    let chunks = vec![
+        json!({ "choices": [{ "index": 0, "delta": { "role": "assistant", "tool_calls": [{ "index": 0, "id": "call_1", "type": "function", "function": { "name": "read", "arguments": "" } }] }, "finish_reason": null }] }),
+        json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "{\"filePath\":\"x\"}" } }] }, "finish_reason": null }] }),
+        json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+    ];
+    let backend = Arc::new(ScriptedChatBackend {
+        chunks: chunks.clone(),
+    });
+    let (app, store) = run_call_app(kulinaryos_policy(true), backend);
+    let (_, run_id) = create_session_and_run(&app).await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/rbx/v1/runs/{run_id}/calls/stream"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer rbxsess_leandro")
+        .body::<Body>(Body::from(
+            serde_json::to_string(&chat_call_body()).unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
+
+    let events = sse_events(&raw);
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["decision", "chunk", "chunk", "chunk", "result"],
+        "raw SSE:\n{raw}"
+    );
+    assert_eq!(events[0].1["decision"], "Allow");
+    assert_eq!(events[0].1["run_id"], run_id);
+    // Verbatim passthrough: the wire chunks are exactly what the backend sent.
+    for (i, chunk) in chunks.iter().enumerate() {
+        assert_eq!(&events[i + 1].1, chunk, "chunk {i} altered in transit");
+    }
+    let result = &events.last().unwrap().1;
+    assert_eq!(result["finish_reason"], "tool_calls");
+    assert_eq!(result["usage"]["total_tokens"], 8);
+
+    let (run, _) = store
+        .run_with_session(&run_id.parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(format!("{:?}", run.status), "Completed");
+    assert_eq!(run.execution_state, "executed");
+}
+
+#[tokio::test]
+async fn run_call_rejects_model_not_permitted_by_policy() {
+    let backend = counting_backend();
+    let (app, _store) = run_call_app(kulinaryos_policy(false), backend.clone());
+    let (status, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session_id = session["session_id"].as_str().unwrap();
+    let (status, run) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/sessions/{session_id}/runs"),
+        Some("rbxsess_leandro"),
+        json!({ "model_alias": "forbidden-model" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let run_id = run["run_id"].as_str().unwrap();
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        &format!("/rbx/v1/runs/{run_id}/calls"),
+        Some("rbxsess_leandro"),
+        chat_call_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert_eq!(body["error"]["code"], "model_not_permitted");
+    assert_eq!(backend.call_count(), 0);
 }

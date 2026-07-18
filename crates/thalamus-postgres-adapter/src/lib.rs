@@ -7,7 +7,7 @@
 //! persisted in `route_envelopes` so post-call validation survives restarts.
 
 mod sessions;
-pub use sessions::{ApprovalRecordInput, CreateRunError, NewSessionInput};
+pub use sessions::{ApprovalRecordInput, ClaimRunError, CreateRunError, NewSessionInput};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -32,6 +32,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0002_lifecycle_idempotency",
         include_str!("../migrations/0002_lifecycle_idempotency.sql"),
+    ),
+    (
+        "0003_governed_calls",
+        include_str!("../migrations/0003_governed_calls.sql"),
     ),
 ];
 
@@ -239,7 +243,29 @@ impl PostgresAudit {
         envelope: &Envelope,
         policy: &Policy,
     ) -> Result<(), AuditStoreError> {
-        off_runtime(|| self.store_route_envelope_inner(audit_id, envelope, policy))
+        off_runtime(|| self.store_route_envelope_inner(audit_id, envelope, policy, None, None))
+    }
+
+    /// Correlated variant for run-bound governed calls: the stored record
+    /// carries the owning session and run, so every model call is joinable to
+    /// its identity/session/run chain (SLICE-T1 invariant I8).
+    pub fn store_route_envelope_correlated(
+        &self,
+        audit_id: &AuditId,
+        envelope: &Envelope,
+        policy: &Policy,
+        session_id: &uuid::Uuid,
+        run_id: &uuid::Uuid,
+    ) -> Result<(), AuditStoreError> {
+        off_runtime(|| {
+            self.store_route_envelope_inner(
+                audit_id,
+                envelope,
+                policy,
+                Some(session_id),
+                Some(run_id),
+            )
+        })
     }
 
     fn store_route_envelope_inner(
@@ -247,11 +273,14 @@ impl PostgresAudit {
         audit_id: &AuditId,
         envelope: &Envelope,
         policy: &Policy,
+        session_id: Option<&uuid::Uuid>,
+        run_id: Option<&uuid::Uuid>,
     ) -> Result<(), AuditStoreError> {
         let mut conn = self.pool.get()?;
         conn.execute(
-            "INSERT INTO route_envelopes (audit_id, envelope, policy, policy_ref, model_alias)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO route_envelopes
+                (audit_id, envelope, policy, policy_ref, model_alias, session_id, run_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (audit_id) DO NOTHING",
             &[
                 &audit_id.0.to_string(),
@@ -259,6 +288,8 @@ impl PostgresAudit {
                 &serde_json::to_value(policy)?,
                 &envelope.policy_ref,
                 &envelope.backend_handle.id,
+                &session_id,
+                &run_id,
             ],
         )?;
         Ok(())

@@ -18,6 +18,16 @@ pub trait DurableAuditStore: AuditPort + Send + Sync {
         envelope: &Envelope,
         policy: &Policy,
     ) -> Result<(), String>;
+    /// Correlated variant for run-bound governed calls (SLICE-T1): the stored
+    /// record carries the owning session and run ids.
+    fn store_pre_call_record_correlated(
+        &self,
+        audit_id: &AuditId,
+        envelope: &Envelope,
+        policy: &Policy,
+        session_id: &uuid::Uuid,
+        run_id: &uuid::Uuid,
+    ) -> Result<(), String>;
     fn get_pre_call_record(&self, audit_id: &AuditId) -> Result<Option<PreCallRecord>, String>;
 }
 
@@ -46,6 +56,18 @@ impl DurableAuditStore for thalamus_postgres_adapter::PostgresAudit {
         policy: &Policy,
     ) -> Result<(), String> {
         self.store_route_envelope(audit_id, envelope, policy)
+            .map_err(|e| e.to_string())
+    }
+
+    fn store_pre_call_record_correlated(
+        &self,
+        audit_id: &AuditId,
+        envelope: &Envelope,
+        policy: &Policy,
+        session_id: &uuid::Uuid,
+        run_id: &uuid::Uuid,
+    ) -> Result<(), String> {
+        self.store_route_envelope_correlated(audit_id, envelope, policy, session_id, run_id)
             .map_err(|e| e.to_string())
     }
 

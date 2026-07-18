@@ -177,6 +177,13 @@ impl StaticCredentialVerifier {
         }
     }
 
+    /// Additionally accept `token` for `caller` (builder, tests with more
+    /// than one principal).
+    pub fn and_valid(mut self, token: &str, caller: VerifiedCaller) -> Self {
+        self.valid.insert(token.to_owned(), caller);
+        self
+    }
+
     /// Reject every credential with this inactive reason (e.g. `expired`,
     /// `revoked`, `missing_entitlement`).
     pub fn always_inactive(reason: &str) -> Self {
