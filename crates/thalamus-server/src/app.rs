@@ -202,9 +202,9 @@ fn build_router(state: Arc<AppState>) -> Router {
 
 /// Build an app that also serves the gated `/rbx/v1/*` surface with the given
 /// credential verifier (`THALAMUS_RBX_API=on`). Used by `main` (real
-/// introspection verifier) and by integration tests (static verifier). No
-/// backend adapter is wired: Phase 1 Gate A exercises identity/middleware only;
-/// LLM routing through the adapters lands in Phase 3.
+/// introspection verifier) and by integration tests (static verifier). The
+/// backend adapter is wired by the caller so the legacy /v1/call surface
+/// keeps working when the governed surface is enabled.
 #[allow(
     dead_code,
     reason = "used by main when THALAMUS_RBX_API=on and by tests"
@@ -212,6 +212,7 @@ fn build_router(state: Arc<AppState>) -> Router {
 pub fn build_with_rbx_api(
     config: ServerConfig,
     credential_verifier: Arc<dyn auth::CredentialVerifier + Send + Sync>,
+    backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
 ) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
@@ -228,7 +229,7 @@ pub fn build_with_rbx_api(
         audit_port,
         eval_port,
         obs_port,
-        backend_port: None,
+        backend_port,
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),

@@ -197,7 +197,29 @@ async fn main() {
         });
         let verifier: std::sync::Arc<dyn auth::CredentialVerifier + Send + Sync> =
             std::sync::Arc::new(auth::OpaqueIntrospectionVerifier::new(introspection_url));
-        app::build_with_rbx_api(cfg, verifier)
+        // Keep the data plane wired in governed mode: the legacy /v1/call
+        // surface must not lose its backend when /rbx/v1/* is enabled.
+        #[cfg(feature = "litellm")]
+        let rbx_backend: Option<
+            std::sync::Arc<dyn thalamus_core::BackendPort + Send + Sync>,
+        > = {
+            let endpoint = std::env::var("LITELLM_ENDPOINT").unwrap_or_else(|_| {
+                thalamus_litellm_adapter::config::AdapterConfig::default_endpoint()
+            });
+            let adapter_config = thalamus_litellm_adapter::config::AdapterConfig {
+                endpoint,
+                api_key: std::env::var("LITELLM_API_KEY").ok(),
+                ..Default::default()
+            };
+            Some(std::sync::Arc::new(
+                thalamus_litellm_adapter::LiteLLMAdapter::new(adapter_config),
+            ))
+        };
+        #[cfg(not(feature = "litellm"))]
+        let rbx_backend: Option<
+            std::sync::Arc<dyn thalamus_core::BackendPort + Send + Sync>,
+        > = None;
+        app::build_with_rbx_api(cfg, verifier, rbx_backend)
     } else {
         app
     };
