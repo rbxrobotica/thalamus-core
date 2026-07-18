@@ -1033,6 +1033,9 @@ pub struct CreateSessionRequest {
     pub tenant: String,
     pub product: String,
     pub workflow: String,
+    /// Required (Gate D acceptance): every governed session records the mode
+    /// it was created under. `governed_llm_access` for external agents.
+    pub governance_mode: String,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -1089,12 +1092,23 @@ pub async fn rbx_create_session(
     Extension(caller): Extension<VerifiedCaller>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Response {
+    if req.governance_mode != thalamus_core::GOVERNANCE_MODE_LLM_ACCESS
+        && req.governance_mode != thalamus_core::GOVERNANCE_MODE_WORKSPACE
+    {
+        return typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "governance_mode must be governed_llm_access or governed_workspace",
+            false,
+        );
+    }
     let input = crate::ports::sessions::NewSession {
         tenant: req.tenant,
         product: req.product,
         workflow: req.workflow,
         principal: caller.subject.clone(),
         delegation_token_id: caller.jti.clone(),
+        governance_mode: req.governance_mode,
         idempotency_key: req.idempotency_key,
     };
     match state.session_store.create_session(&input) {
@@ -1524,8 +1538,693 @@ pub async fn rbx_evidence(
 
 // === Helpers ===
 
+// === /rbx/v1/runs/{run_id}/calls — run-bound governed calls (SLICE-T1, Gate D) ===
+//
+// The ONLY way to execute a model call on the governed surface. The server
+// derives tenant/product/workflow/user from the session record and the model
+// from the run record; the request body carries intent + a structured
+// `chat.completions.v1` payload only. Invariant chain, in order: verified
+// credential (middleware) -> run exists -> caller owns the session (404
+// anti-enumeration + ownership_violation audit) -> session open + run active
+// -> atomic 1:1 execution claim -> budget -> policy (deny never reaches the
+// backend) -> correlated route envelope audited -> execution -> post-call ->
+// run finished + usage recorded.
+
+/// The only payload kind the governed call surface accepts in P0.
+pub const PAYLOAD_KIND_CHAT_V1: &str = "chat.completions.v1";
+
+#[derive(Debug, Deserialize)]
+pub struct RunCallRequest {
+    pub intent: String,
+    pub payload_kind: String,
+    pub payload: serde_json::Value,
+}
+
+/// Everything resolved before backend execution of a run-bound call.
+struct PreparedRunCall {
+    session: thalamus_core::SessionRecord,
+    run_id: Uuid,
+    outcome: thalamus_core::PreCallOutcome,
+    envelope: thalamus_core::Envelope,
+    route: thalamus_core::RouteEnvelope,
+}
+
+/// Refusal body for the governed call surface: typed error + audit id when a
+/// decision was already recorded.
+fn run_call_refusal(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    audit_id: Option<&str>,
+) -> Response {
+    let body = serde_json::json!({
+        "error": { "code": code, "message": message, "retryable": false },
+        "audit_id": audit_id,
+    });
+    (status, Json(body)).into_response()
+}
+
+/// Mark a claimed run as failed with a refusal reason (best-effort: the
+/// refusal response is authoritative even if the store write fails).
+fn fail_claimed_run(state: &AppState, run_id: &Uuid, reason: &str, audit_id: Option<&str>) {
+    let outcome = serde_json::json!({ "refusal": reason, "audit_id": audit_id });
+    if let Err(err) = state
+        .session_store
+        .finish_run_execution(run_id, "failed", &outcome)
+    {
+        tracing::error!(%run_id, error = %crate::redact::redact(&err), "failed to finalize refused run");
+    }
+}
+
+/// Validate + authorize + claim + decide a run-bound call. Every refusal
+/// returns the full typed response; on success the backend is ready to
+/// execute within the audited route envelope.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready axum Response returned straight to the client"
+)]
+fn prepare_run_call(
+    state: &Arc<AppState>,
+    caller: &VerifiedCaller,
+    raw_run_id: &str,
+    req: &RunCallRequest,
+) -> Result<PreparedRunCall, Response> {
+    if req.payload_kind != PAYLOAD_KIND_CHAT_V1 {
+        return Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("payload_kind must be {PAYLOAD_KIND_CHAT_V1}"),
+            false,
+        ));
+    }
+    let Some(payload) = req.payload.as_object() else {
+        return Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "payload must be an object",
+            false,
+        ));
+    };
+    if payload.contains_key("model") {
+        return Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "payload.model is not allowed: the model comes from the run",
+            false,
+        ));
+    }
+    if payload
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_none_or(|m| m.is_empty())
+    {
+        return Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "payload.messages must be a non-empty array",
+            false,
+        ));
+    }
+    let Some(run_id) = parse_uuid(raw_run_id) else {
+        return Err(invalid_id("run"));
+    };
+    if let Some(resp) = durable_audit_guard(state) {
+        return Err(resp);
+    }
+
+    // Ownership before any state change (I2/I4): a caller must never be able
+    // to claim, probe or fail another principal's run. Mismatches and unknown
+    // runs are indistinguishable (404) to prevent run-id enumeration.
+    let lookup = state
+        .session_store
+        .run_with_session(&run_id)
+        .map_err(|e| store_error(&e))?;
+    let Some((_, owner_session)) = lookup else {
+        return Err(typed_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "unknown run",
+            false,
+        ));
+    };
+    let caller_subject = caller.subject.as_deref();
+    if caller_subject.is_none() || owner_session.principal.as_deref() != caller_subject {
+        emit_lifecycle(
+            state,
+            &owner_session.session_id,
+            "call",
+            &run_id,
+            "ownership_violation",
+            caller_subject,
+        );
+        tracing::warn!(
+            %run_id,
+            session = %owner_session.session_id,
+            "run-bound call refused: caller does not own the session"
+        );
+        return Err(typed_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "unknown run",
+            false,
+        ));
+    }
+
+    // Atomic 1:1 execution claim (I5/I6) + budget re-check under lock (I9).
+    let (run, session) =
+        state
+            .session_store
+            .claim_run_execution(&run_id)
+            .map_err(|err| match err {
+                crate::ports::sessions::ClaimRunError::UnknownRun => {
+                    typed_error(StatusCode::NOT_FOUND, "not_found", "unknown run", false)
+                }
+                crate::ports::sessions::ClaimRunError::SessionClosed => typed_error(
+                    StatusCode::CONFLICT,
+                    "session_closed",
+                    "session is closed",
+                    false,
+                ),
+                crate::ports::sessions::ClaimRunError::RunNotActive => typed_error(
+                    StatusCode::CONFLICT,
+                    "run_closed",
+                    "run is not active",
+                    false,
+                ),
+                crate::ports::sessions::ClaimRunError::AlreadyExecuted => typed_error(
+                    StatusCode::CONFLICT,
+                    "run_already_executed",
+                    "a call was already executed on this run",
+                    false,
+                ),
+                crate::ports::sessions::ClaimRunError::BudgetExceeded {
+                    scope_type,
+                    scope_ref,
+                } => typed_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "budget_exceeded",
+                    &format!("budget exhausted for {scope_type} {scope_ref}"),
+                    false,
+                ),
+                crate::ports::sessions::ClaimRunError::Store(err) => store_error(&err),
+            })?;
+
+    // Policy sees the serialized payload; the model request comes from the
+    // run record, never from the payload (validated above).
+    let requested_backend = run
+        .model_alias
+        .as_ref()
+        .map(|alias| thalamus_core::BackendHandle {
+            id: alias.clone(),
+            backend_type: thalamus_core::BackendType::Model,
+        });
+    let call_request = CallRequest {
+        tenant: session.tenant.clone(),
+        product: session.product.clone(),
+        user: session.principal.clone().unwrap_or_default(),
+        workflow: session.workflow.clone(),
+        intent: req.intent.clone(),
+        prompt: req.payload.to_string(),
+        requested_backend,
+        budget_hint: None,
+        run_correlated: true,
+    };
+
+    let outcome = match thalamus_core::pre_call(
+        &call_request,
+        state.policy_port.as_ref(),
+        state.context_port.as_ref(),
+        state.audit_port.as_ref(),
+        state.obs_port.as_ref(),
+    ) {
+        Ok(o) => o,
+        Err(PreCallError::NoPermittedBackend { .. }) => {
+            fail_claimed_run(state, &run_id, "no_permitted_backends", None);
+            return Err(typed_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no_permitted_backends",
+                "policy permits no backends for this session",
+                false,
+            ));
+        }
+    };
+    let audit_id = outcome.audit_id.0.to_string();
+
+    match &outcome.decision {
+        PolicyDecision::Deny { reason, .. } => {
+            let reason = reason.clone();
+            fail_claimed_run(state, &run_id, "policy_denied", Some(&audit_id));
+            emit_lifecycle(
+                state,
+                &session.session_id,
+                "call",
+                &outcome.audit_id.0,
+                "call_denied",
+                session.principal.as_deref(),
+            );
+            return Err(run_call_refusal(
+                StatusCode::FORBIDDEN,
+                "policy_denied",
+                &reason,
+                Some(&audit_id),
+            ));
+        }
+        PolicyDecision::AllowWithReview { review_reason, .. } => {
+            let reason = review_reason.clone();
+            fail_claimed_run(state, &run_id, "needs_human_review", Some(&audit_id));
+            return Err(run_call_refusal(
+                StatusCode::FORBIDDEN,
+                "needs_human_review",
+                &reason,
+                Some(&audit_id),
+            ));
+        }
+        PolicyDecision::Allow => {}
+    }
+
+    let Some(mut envelope) = outcome.envelope.clone() else {
+        fail_claimed_run(state, &run_id, "invariant_violation", Some(&audit_id));
+        return Err(typed_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invariant_violation",
+            "allow decision produced no envelope",
+            true,
+        ));
+    };
+    // select_backend falls back to the first permitted backend; for run-bound
+    // calls the run's model must be honored or refused, never substituted.
+    if let Some(alias) = run.model_alias.as_deref() {
+        if envelope.backend_handle.id != alias {
+            fail_claimed_run(state, &run_id, "model_not_permitted", Some(&audit_id));
+            return Err(run_call_refusal(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "model_not_permitted",
+                &format!("run model '{alias}' is not permitted by policy"),
+                Some(&audit_id),
+            ));
+        }
+    }
+    envelope.chat_payload = Some(req.payload.clone());
+
+    // Correlated pre-call record: the durable row carries session + run ids
+    // so the call is joinable to its lifecycle chain (I8).
+    match &state.durable_audit {
+        Some(durable) => {
+            let stored = durable
+                .store_pre_call_record_correlated(
+                    &outcome.audit_id,
+                    &envelope,
+                    &outcome.policy,
+                    &session.session_id,
+                    &run_id,
+                )
+                .is_ok();
+            if !stored {
+                fail_claimed_run(state, &run_id, "audit_unavailable", Some(&audit_id));
+                return Err(audit_unavailable());
+            }
+        }
+        None => state.audit_store.store_pre_call_record(
+            outcome.audit_id.clone(),
+            envelope.clone(),
+            outcome.policy.clone(),
+        ),
+    }
+
+    let route = thalamus_core::RouteEnvelope::from_envelope(&envelope);
+    state
+        .audit_port
+        .emit(thalamus_core::AuditEvent::RouteEnvelope {
+            trace_id: envelope.trace_id.clone(),
+            audit_id: outcome.audit_id.clone(),
+            model_alias: route.model_alias.clone(),
+            provider_pool: route.provider_pool.clone(),
+            region: route.region.clone(),
+            data_class: route.data_class.clone(),
+            capability_class: route.capability_class.clone(),
+            cost_class: route.cost_class.clone(),
+            timeout_ms: route.timeout_ms,
+            timestamp: time::OffsetDateTime::now_utc(),
+        });
+    emit_lifecycle(
+        state,
+        &session.session_id,
+        "call",
+        &outcome.audit_id.0,
+        "call_started",
+        session.principal.as_deref(),
+    );
+
+    Ok(PreparedRunCall {
+        session,
+        run_id,
+        outcome,
+        envelope,
+        route,
+    })
+}
+
+/// Finalize an executed run-bound call: post-call validation, run state,
+/// budget usage and the lifecycle audit trail.
+fn finalize_run_call(
+    state: &Arc<AppState>,
+    prepared: &PreparedRunCall,
+    execution: &Result<thalamus_core::BackendExecution, thalamus_core::BackendCallError>,
+) -> Option<thalamus_core::PostCallResult> {
+    let audit_id = prepared.outcome.audit_id.0.to_string();
+    match execution {
+        Ok(exec) => {
+            let backend_response = BackendResponse {
+                content: exec.content.clone(),
+                tokens_used: exec.usage.total_tokens,
+                latency_ms: Some(exec.latency_ms),
+            };
+            let post_result = thalamus_core::post_call(
+                &backend_response,
+                &prepared.envelope,
+                &prepared.outcome.policy,
+                state.audit_port.as_ref(),
+                state.eval_port.as_ref(),
+                state.obs_port.as_ref(),
+            );
+            let outcome_meta = serde_json::json!({
+                "audit_id": audit_id,
+                "usage": exec.usage,
+                "latency_ms": exec.latency_ms,
+                "post_call_status": format!("{:?}", post_result.status),
+            });
+            if let Err(err) = state.session_store.finish_run_execution(
+                &prepared.run_id,
+                "completed",
+                &outcome_meta,
+            ) {
+                tracing::error!(run_id = %prepared.run_id, error = %crate::redact::redact(&err), "failed to finalize run");
+            }
+            if let Some(tokens) = exec.usage.total_tokens {
+                if let Err(err) = state
+                    .session_store
+                    .record_usage(&prepared.session.session_id, i64::from(tokens))
+                {
+                    tracing::error!(
+                        session = %prepared.session.session_id,
+                        error = %crate::redact::redact(&err),
+                        "failed to record usage"
+                    );
+                }
+            }
+            emit_lifecycle(
+                state,
+                &prepared.session.session_id,
+                "call",
+                &prepared.outcome.audit_id.0,
+                "call_completed",
+                prepared.session.principal.as_deref(),
+            );
+            Some(post_result)
+        }
+        Err(err) => {
+            let cancelled = matches!(err, thalamus_core::BackendCallError::Cancelled { .. });
+            let final_status = if cancelled { "cancelled" } else { "failed" };
+            let partial_usage = match err {
+                thalamus_core::BackendCallError::Timeout { partial_usage }
+                | thalamus_core::BackendCallError::Cancelled { partial_usage } => {
+                    Some(partial_usage.clone())
+                }
+                _ => None,
+            };
+            let outcome_meta = serde_json::json!({
+                "audit_id": audit_id,
+                "backend_error": err.code(),
+                "partial_usage": partial_usage,
+            });
+            if let Err(store_err) = state.session_store.finish_run_execution(
+                &prepared.run_id,
+                final_status,
+                &outcome_meta,
+            ) {
+                tracing::error!(run_id = %prepared.run_id, error = %crate::redact::redact(&store_err), "failed to finalize run");
+            }
+            if let Some(tokens) = partial_usage.as_ref().and_then(|u| u.total_tokens) {
+                let _ = state
+                    .session_store
+                    .record_usage(&prepared.session.session_id, i64::from(tokens));
+            }
+            emit_lifecycle(
+                state,
+                &prepared.session.session_id,
+                "call",
+                &prepared.outcome.audit_id.0,
+                if cancelled {
+                    "call_cancelled"
+                } else {
+                    "call_failed"
+                },
+                prepared.session.principal.as_deref(),
+            );
+            None
+        }
+    }
+}
+
+/// POST /rbx/v1/runs/{run_id}/calls — non-streaming run-bound governed call.
+pub async fn rbx_run_call(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Path(run_id): Path<String>,
+    Json(req): Json<RunCallRequest>,
+) -> Response {
+    let prepared = match prepare_run_call(&state, &caller, &run_id, &req) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let backend = match state.backend_port.as_ref() {
+        Some(b) => Arc::clone(b),
+        None => {
+            fail_claimed_run(&state, &prepared.run_id, "no_backend", None);
+            return typed_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_backend",
+                "no backend configured",
+                true,
+            );
+        }
+    };
+
+    let route = prepared.route.clone();
+    let cancel = thalamus_core::CancelToken::new();
+    let execution =
+        match tokio::task::spawn_blocking(move || backend.execute(&route, &cancel)).await {
+            Ok(r) => r,
+            Err(_join_err) => {
+                fail_claimed_run(&state, &prepared.run_id, "backend_task_failed", None);
+                return typed_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "backend_task_failed",
+                    "backend execution task failed",
+                    true,
+                );
+            }
+        };
+
+    let post_result = finalize_run_call(&state, &prepared, &execution);
+    if let Some(resp) = durable_audit_guard(&state) {
+        return resp;
+    }
+
+    let audit_id = prepared.outcome.audit_id.0.to_string();
+    match execution {
+        Ok(exec) => {
+            let post = post_result.expect("post_call ran on success");
+            let body = serde_json::json!({
+                "decision": "Allow",
+                "audit_id": audit_id,
+                "trace_id": prepared.outcome.trace_id.0.to_string(),
+                "session_id": prepared.session.session_id,
+                "run_id": prepared.run_id,
+                "content": exec.content,
+                "finish_reason": exec.backend_metadata.get("finish_reason"),
+                "message": exec.backend_metadata.get("message"),
+                "usage": exec.usage,
+                "latency_ms": exec.latency_ms,
+                "post_call": {
+                    "status": format!("{:?}", post.status),
+                    "risk_class": format!("{:?}", post.risk_class),
+                    "executable_by_agent": post.executable_by_agent,
+                    "schema_valid": post.schema_valid,
+                },
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(err) => {
+            tracing::error!(
+                audit_id = %audit_id,
+                code = err.code(),
+                error = %crate::redact::redact(&err.to_string()),
+                "run-bound backend execution failed"
+            );
+            run_call_refusal(
+                StatusCode::BAD_GATEWAY,
+                err.code(),
+                &err.to_string(),
+                Some(&audit_id),
+            )
+        }
+    }
+}
+
+/// POST /rbx/v1/runs/{run_id}/calls/stream — SSE run-bound governed call.
+/// All refusals happen BEFORE the stream starts (plain typed JSON responses);
+/// only an allowed, claimed call opens the SSE. Event sequence:
+/// `decision` -> `chunk`* (verbatim chat.completion.chunk objects) ->
+/// `result` (or `error`). Client disconnect cancels the backend mid-flight
+/// and finalizes the run as cancelled.
+pub async fn rbx_run_call_stream(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Path(run_id): Path<String>,
+    Json(req): Json<RunCallRequest>,
+) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_stream::StreamExt;
+
+    let prepared = match prepare_run_call(&state, &caller, &run_id, &req) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let Some(backend) = state.backend_port.as_ref().map(Arc::clone) else {
+        fail_claimed_run(&state, &prepared.run_id, "no_backend", None);
+        return typed_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_backend",
+            "no backend configured",
+            true,
+        );
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(32);
+    let state_task = Arc::clone(&state);
+    tokio::spawn(async move {
+        let audit_id = prepared.outcome.audit_id.0.to_string();
+        let decision_event = Event::default().event("decision").data(
+            serde_json::json!({
+                "decision": "Allow",
+                "audit_id": audit_id,
+                "trace_id": prepared.outcome.trace_id.0.to_string(),
+                "session_id": prepared.session.session_id,
+                "run_id": prepared.run_id,
+                "policy_id": prepared.outcome.policy.id,
+            })
+            .to_string(),
+        );
+        if tx.send(decision_event).await.is_err() {
+            // Client vanished before execution: release the claim as
+            // cancelled without touching the backend.
+            let execution = Err(thalamus_core::BackendCallError::Cancelled {
+                partial_usage: thalamus_core::BackendUsage::default(),
+            });
+            finalize_run_call(&state_task, &prepared, &execution);
+            return;
+        }
+
+        let route = prepared.route.clone();
+        let cancel = thalamus_core::CancelToken::new();
+        let cancel_for_sink = cancel.clone();
+        let tx_for_sink = tx.clone();
+        let execution = tokio::task::spawn_blocking(move || {
+            let mut on_chunk = |chunk: &serde_json::Value| {
+                let event = Event::default().event("chunk").data(chunk.to_string());
+                if tx_for_sink.blocking_send(event).is_err() {
+                    cancel_for_sink.cancel();
+                }
+            };
+            backend.execute_streaming_chat(&route, &cancel_for_sink, &mut on_chunk)
+        })
+        .await;
+
+        let execution = match execution {
+            Ok(r) => r,
+            Err(_join_err) => {
+                fail_claimed_run(&state_task, &prepared.run_id, "backend_task_failed", None);
+                let _ = tx
+                    .send(
+                        Event::default().event("error").data(
+                            serde_json::json!({
+                                "code": "BACKEND_TASK_FAILED",
+                                "message": "backend execution task failed",
+                                "audit_id": audit_id,
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        let post_result = finalize_run_call(&state_task, &prepared, &execution);
+        match execution {
+            Ok(exec) => {
+                let post = post_result.expect("post_call ran on success");
+                let _ = tx
+                    .send(
+                        Event::default().event("result").data(
+                            serde_json::json!({
+                                "status": format!("{:?}", post.status),
+                                "risk_class": format!("{:?}", post.risk_class),
+                                "executable_by_agent": post.executable_by_agent,
+                                "schema_valid": post.schema_valid,
+                                "audit_id": audit_id,
+                                "run_id": prepared.run_id,
+                                "finish_reason": exec.backend_metadata.get("finish_reason"),
+                                "usage": exec.usage,
+                                "latency_ms": exec.latency_ms,
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await;
+            }
+            Err(err) => {
+                tracing::error!(
+                    audit_id = %audit_id,
+                    code = err.code(),
+                    error = %crate::redact::redact(&err.to_string()),
+                    "run-bound streaming execution failed"
+                );
+                let partial_usage = match &err {
+                    thalamus_core::BackendCallError::Timeout { partial_usage }
+                    | thalamus_core::BackendCallError::Cancelled { partial_usage } => {
+                        Some(partial_usage.clone())
+                    }
+                    _ => None,
+                };
+                let _ = tx
+                    .send(
+                        Event::default().event("error").data(
+                            serde_json::json!({
+                                "code": err.code(),
+                                "message": err.to_string(),
+                                "audit_id": audit_id,
+                                "run_id": prepared.run_id,
+                                "partial_usage": partial_usage,
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await;
+            }
+        }
+    });
+
+    Sse::new(ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 fn decide_to_call_request(req: &DecideRequest) -> CallRequest {
     CallRequest {
+        run_correlated: false,
         tenant: req.tenant.clone(),
         product: req.product.clone(),
         user: req.user.clone(),

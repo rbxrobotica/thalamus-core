@@ -154,6 +154,7 @@ fn route_envelope_roundtrip_survives_reconnect() {
             max_tokens: 1000,
             max_latency_ms: 30_000,
         },
+        chat_payload: None,
     };
     let policy = thalamus_core::Policy {
         id: "policy-test".to_owned(),
@@ -166,6 +167,7 @@ fn route_envelope_roundtrip_survives_reconnect() {
         redaction_rules: vec![],
         audit_required: true,
         risk_threshold: RiskLevel::High,
+        require_run_correlation: false,
     };
 
     {
@@ -200,6 +202,7 @@ fn new_session_input(idempotency_key: Option<&str>) -> NewSessionInput {
         workflow: "coding".to_owned(),
         principal: Some("ldamasio@gmail.com".to_owned()),
         delegation_token_id: Some("jti-1".to_owned()),
+        governance_mode: "governed_llm_access".to_owned(),
         idempotency_key: idempotency_key.map(str::to_owned),
     }
 }
@@ -403,4 +406,66 @@ fn governance_records_persist_on_postgres() {
         .unwrap()
         .get(0);
     assert_eq!((inv, appr, evid), (1, 1, 1));
+}
+
+// === SLICE-T1: run-bound governed calls (durable claim + correlation) ===
+
+use thalamus_postgres_adapter::ClaimRunError;
+
+#[test]
+fn run_execution_claim_is_one_to_one_and_records_governance_mode() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let session = store
+        .create_session(&new_session_input(None))
+        .expect("create session");
+    assert_eq!(session.governance_mode, "governed_llm_access");
+
+    let run = store
+        .create_run(&session.session_id, Some("glm-test"), None)
+        .expect("create run");
+    assert_eq!(run.execution_state, "pending");
+
+    // First claim wins and re-reads the pair under lock.
+    let (claimed, owner) = store
+        .claim_run_execution(&run.run_id)
+        .expect("first claim succeeds");
+    assert_eq!(claimed.execution_state, "executing");
+    assert_eq!(owner.session_id, session.session_id);
+
+    // Second claim is refused: 1:1 run <-> call.
+    let second = store.claim_run_execution(&run.run_id);
+    assert!(matches!(second, Err(ClaimRunError::AlreadyExecuted)));
+
+    store
+        .finish_run_execution(
+            &run.run_id,
+            "completed",
+            &serde_json::json!({ "audit_id": "test" }),
+        )
+        .expect("finish");
+    let (finished, _) = store
+        .run_with_session(&run.run_id)
+        .expect("lookup")
+        .expect("run exists");
+    assert_eq!(finished.status, RunStatus::Completed);
+    assert_eq!(finished.execution_state, "executed");
+    assert!(finished.finished_at.is_some());
+
+    // A claim on a terminal-but-executed run still reports the 1:1 violation.
+    let after = store.claim_run_execution(&run.run_id);
+    assert!(matches!(after, Err(ClaimRunError::AlreadyExecuted)));
+
+    // Cancelled-before-execution runs report run_not_active instead.
+    let run2 = store
+        .create_run(&session.session_id, None, None)
+        .expect("create run2");
+    store.cancel_run(&run2.run_id).expect("cancel");
+    let refused = store.claim_run_execution(&run2.run_id);
+    assert!(matches!(refused, Err(ClaimRunError::RunNotActive)));
 }

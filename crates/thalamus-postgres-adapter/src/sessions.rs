@@ -34,7 +34,28 @@ pub struct NewSessionInput {
     pub workflow: String,
     pub principal: Option<String>,
     pub delegation_token_id: Option<String>,
+    pub governance_mode: String,
     pub idempotency_key: Option<String>,
+}
+
+/// Why an execution claim on a run was refused (1:1 run <-> call invariant).
+#[derive(Debug, thiserror::Error)]
+pub enum ClaimRunError {
+    #[error("unknown run")]
+    UnknownRun,
+    #[error("session is closed")]
+    SessionClosed,
+    #[error("run is not active")]
+    RunNotActive,
+    #[error("run already executed")]
+    AlreadyExecuted,
+    #[error("budget exhausted for {scope_type} {scope_ref}")]
+    BudgetExceeded {
+        scope_type: String,
+        scope_ref: String,
+    },
+    #[error(transparent)]
+    Store(#[from] AuditStoreError),
 }
 
 /// Why a run was refused.
@@ -77,8 +98,8 @@ impl PostgresAudit {
             tx.execute(
                 "INSERT INTO sessions
                     (session_id, tenant, product, workflow, principal,
-                     delegation_token_id, idempotency_key)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                     delegation_token_id, governance_mode, idempotency_key)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &session_id,
                     &input.tenant,
@@ -86,6 +107,7 @@ impl PostgresAudit {
                     &input.workflow,
                     &input.principal,
                     &input.delegation_token_id,
+                    &input.governance_mode,
                     &input.idempotency_key,
                 ],
             )?;
@@ -363,6 +385,110 @@ impl PostgresAudit {
             Ok(())
         })
     }
+
+    /// Load a run together with its owning session (ownership checks I2/I4).
+    pub fn run_with_session(
+        &self,
+        run_id: &Uuid,
+    ) -> Result<Option<(RunRecord, SessionRecord)>, AuditStoreError> {
+        off_runtime(|| {
+            let mut conn = self.pool.get()?;
+            let mut tx = conn.transaction()?;
+            let Some(run) = run_by_id(&mut tx, run_id)? else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let session = session_by_id(&mut tx, &run.session_id)?
+                .expect("run row references an existing session");
+            tx.commit()?;
+            Ok(Some((run, session)))
+        })
+    }
+
+    /// Atomically claim a run for execution (1:1 run <-> call): only a
+    /// `pending` claim on an active run under an open session succeeds, and
+    /// governing budgets are re-checked under lock at claim time. Returns the
+    /// claimed run + owning session.
+    pub fn claim_run_execution(
+        &self,
+        run_id: &Uuid,
+    ) -> Result<(RunRecord, SessionRecord), ClaimRunError> {
+        off_runtime(|| {
+            let mut conn = self.pool.get().map_err(AuditStoreError::from)?;
+            let mut tx = conn.transaction().map_err(AuditStoreError::from)?;
+
+            let row = tx
+                .query_opt(
+                    "SELECT session_id, status, execution_state FROM runs
+                     WHERE run_id = $1 FOR UPDATE",
+                    &[run_id],
+                )
+                .map_err(AuditStoreError::from)?;
+            let Some(row) = row else {
+                return Err(ClaimRunError::UnknownRun);
+            };
+            let session_id: Uuid = row.get(0);
+            let status: String = row.get(1);
+            let execution_state: String = row.get(2);
+
+            let session = session_by_id(&mut tx, &session_id)
+                .map_err(AuditStoreError::from)?
+                .expect("run row references an existing session");
+            if session.status == SessionStatus::Closed {
+                return Err(ClaimRunError::SessionClosed);
+            }
+            // An executed run reports run_already_executed even after its
+            // status turned terminal: the 1:1 violation is the more precise
+            // refusal.
+            if execution_state != "pending" {
+                return Err(ClaimRunError::AlreadyExecuted);
+            }
+            if status != "started" {
+                return Err(ClaimRunError::RunNotActive);
+            }
+
+            if let Some((scope_type, scope_ref)) =
+                exhausted_budget(&mut tx, &session_id, &session.tenant, &session.product)
+                    .map_err(AuditStoreError::from)?
+            {
+                return Err(ClaimRunError::BudgetExceeded {
+                    scope_type,
+                    scope_ref,
+                });
+            }
+
+            tx.execute(
+                "UPDATE runs SET execution_state = 'executing' WHERE run_id = $1",
+                &[run_id],
+            )
+            .map_err(AuditStoreError::from)?;
+            let run = run_by_id(&mut tx, run_id)
+                .map_err(AuditStoreError::from)?
+                .expect("run row locked above");
+            tx.commit().map_err(AuditStoreError::from)?;
+            Ok((run, session))
+        })
+    }
+
+    /// Finish a claimed execution: final run status (`completed` / `failed` /
+    /// `cancelled`), `execution_state = executed`, outcome metadata merged.
+    pub fn finish_run_execution(
+        &self,
+        run_id: &Uuid,
+        final_status: &str,
+        outcome: &serde_json::Value,
+    ) -> Result<(), AuditStoreError> {
+        off_runtime(|| {
+            let mut conn = self.pool.get()?;
+            conn.execute(
+                "UPDATE runs SET status = $2, execution_state = 'executed',
+                        finished_at = now(), metadata = metadata || $3
+                 WHERE run_id = $1",
+                &[run_id, &final_status, outcome],
+            )?;
+            Ok(())
+        })
+    }
 }
 
 fn session_by_id(
@@ -371,7 +497,8 @@ fn session_by_id(
 ) -> Result<Option<SessionRecord>, postgres::Error> {
     let row = tx.query_opt(
         "SELECT session_id, tenant, product, workflow, principal,
-                delegation_token_id, status, retention_class, created_at, updated_at
+                delegation_token_id, status, governance_mode, retention_class,
+                created_at, updated_at
          FROM sessions WHERE session_id = $1",
         &[id],
     )?;
@@ -383,15 +510,16 @@ fn session_by_id(
         principal: row.get(4),
         delegation_token_id: row.get(5),
         status: parse_session_status(row.get::<_, String>(6).as_str()),
-        retention_class: row.get(7),
-        created_at: row.get::<_, OffsetDateTime>(8),
-        updated_at: row.get::<_, OffsetDateTime>(9),
+        governance_mode: row.get(7),
+        retention_class: row.get(8),
+        created_at: row.get::<_, OffsetDateTime>(9),
+        updated_at: row.get::<_, OffsetDateTime>(10),
     }))
 }
 
 fn run_by_id(tx: &mut Transaction<'_>, id: &Uuid) -> Result<Option<RunRecord>, postgres::Error> {
     let row = tx.query_opt(
-        "SELECT run_id, session_id, status, model_alias, backend_id,
+        "SELECT run_id, session_id, status, execution_state, model_alias, backend_id,
                 started_at, finished_at, metadata
          FROM runs WHERE run_id = $1",
         &[id],
@@ -400,11 +528,12 @@ fn run_by_id(tx: &mut Transaction<'_>, id: &Uuid) -> Result<Option<RunRecord>, p
         run_id: row.get(0),
         session_id: row.get(1),
         status: parse_run_status(row.get::<_, String>(2).as_str()),
-        model_alias: row.get(3),
-        backend_id: row.get(4),
-        started_at: row.get::<_, OffsetDateTime>(5),
-        finished_at: row.get::<_, Option<OffsetDateTime>>(6),
-        metadata: row.get(7),
+        execution_state: row.get(3),
+        model_alias: row.get(4),
+        backend_id: row.get(5),
+        started_at: row.get::<_, OffsetDateTime>(6),
+        finished_at: row.get::<_, Option<OffsetDateTime>>(7),
+        metadata: row.get(8),
     }))
 }
 

@@ -187,6 +187,7 @@ mod tests {
                 max_tokens: 1000,
                 max_latency_ms: 5000,
             },
+            chat_payload: None,
         }
     }
 

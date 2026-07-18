@@ -347,6 +347,7 @@ mod tests {
             redaction_rules: vec![],
             audit_required: true,
             risk_threshold: thalamus_core::RiskLevel::Medium,
+            require_run_correlation: false,
         }
     }
 

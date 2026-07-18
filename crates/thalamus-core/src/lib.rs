@@ -14,8 +14,10 @@ pub use domain::{
 };
 pub use flow::{post_call, pre_call, PreCallError, PreCallOutcome};
 pub use lifecycle::{
-    BudgetLine, RunRecord, RunStatus, SessionLimits, SessionRecord, SessionStatus,
-    DEFAULT_CONTEXT_POLICY_REF, DEFAULT_CONTEXT_UTILIZATION_LIMIT,
+    default_governance_mode, default_run_execution_state, BudgetLine, RunRecord, RunStatus,
+    SessionLimits, SessionRecord, SessionStatus, DEFAULT_CONTEXT_POLICY_REF,
+    DEFAULT_CONTEXT_UTILIZATION_LIMIT, GOVERNANCE_MODE_LLM_ACCESS, GOVERNANCE_MODE_WORKSPACE,
+    RUN_EXECUTION_EXECUTED, RUN_EXECUTION_EXECUTING, RUN_EXECUTION_PENDING,
 };
 pub use policy::{Budget, ContextGrant, Policy, PolicyEngine, RedactionAction, RedactionRule};
 pub use ports::{AuditPort, BackendPort, ContextPort, EvalPort, ObservabilityPort, PolicyPort};

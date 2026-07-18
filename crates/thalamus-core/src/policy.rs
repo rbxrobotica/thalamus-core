@@ -16,6 +16,11 @@ pub struct Policy {
     pub redaction_rules: Vec<RedactionRule>,
     pub audit_required: bool,
     pub risk_threshold: RiskLevel,
+    /// When true, only run-bound calls (`/rbx/v1/runs/{run_id}/calls`) are
+    /// allowed for this tenant/product/workflow: the legacy uncorrelated
+    /// `/v1/call` surface is denied before any backend contact.
+    #[serde(default)]
+    pub require_run_correlation: bool,
 }
 
 // === Budget ===

@@ -20,6 +20,8 @@ pub struct NewSession {
     pub workflow: String,
     pub principal: Option<String>,
     pub delegation_token_id: Option<String>,
+    /// Validated governance mode (ADR-0403); immutable after creation.
+    pub governance_mode: String,
     pub idempotency_key: Option<String>,
 }
 
@@ -34,6 +36,22 @@ pub enum CreateRunError {
     },
     /// Constructed by the durable store glue only.
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    Store(String),
+}
+
+/// Why an execution claim on a run was refused (1:1 run <-> call invariant,
+/// SLICE-T1). Mirrors the durable store's error; the in-memory store applies
+/// the same semantics.
+#[derive(Debug)]
+pub enum ClaimRunError {
+    UnknownRun,
+    SessionClosed,
+    RunNotActive,
+    AlreadyExecuted,
+    BudgetExceeded {
+        scope_type: String,
+        scope_ref: String,
+    },
     Store(String),
 }
 
@@ -86,6 +104,26 @@ pub trait SessionStore: Send + Sync {
     fn record_approval(&self, input: &ApprovalInput) -> Result<Uuid, String>;
     /// Record an evidence reference. Returns the evidence id.
     fn record_evidence(&self, input: &EvidenceInput) -> Result<Uuid, String>;
+    /// Load a run together with its owning session (ownership checks I2/I4).
+    fn run_with_session(&self, run_id: &Uuid)
+        -> Result<Option<(RunRecord, SessionRecord)>, String>;
+    /// Atomically claim a run for execution: only a `pending` claim on an
+    /// active run under an open session succeeds; governing budgets are
+    /// re-checked at claim time. Returns the claimed run + owning session.
+    fn claim_run_execution(
+        &self,
+        run_id: &Uuid,
+    ) -> Result<(RunRecord, SessionRecord), ClaimRunError>;
+    /// Finish a claimed execution with a final status
+    /// (`completed`/`failed`/`cancelled`) and outcome metadata.
+    fn finish_run_execution(
+        &self,
+        run_id: &Uuid,
+        final_status: &str,
+        outcome: &serde_json::Value,
+    ) -> Result<(), String>;
+    /// Add consumed tokens to every budget governing this session.
+    fn record_usage(&self, session_id: &Uuid, tokens: i64) -> Result<(), String>;
 }
 
 pub type SharedSessionStore = Arc<dyn SessionStore + Send + Sync>;
@@ -184,6 +222,7 @@ impl SessionStore for InMemorySessionStore {
             principal: input.principal.clone(),
             delegation_token_id: input.delegation_token_id.clone(),
             status: SessionStatus::Open,
+            governance_mode: input.governance_mode.clone(),
             retention_class: "standard".to_owned(),
             created_at: now,
             updated_at: now,
@@ -239,6 +278,7 @@ impl SessionStore for InMemorySessionStore {
             run_id: Uuid::new_v4(),
             session_id: *session_id,
             status: RunStatus::Started,
+            execution_state: thalamus_core::RUN_EXECUTION_PENDING.to_owned(),
             model_alias: model_alias.map(str::to_owned),
             backend_id: None,
             started_at: OffsetDateTime::now_utc(),
@@ -287,6 +327,98 @@ impl SessionStore for InMemorySessionStore {
         Ok(id)
     }
 
+    fn run_with_session(
+        &self,
+        run_id: &Uuid,
+    ) -> Result<Option<(RunRecord, SessionRecord)>, String> {
+        let state = self.state.lock().unwrap();
+        Ok(state.runs.get(run_id).map(|run| {
+            let session = state.sessions[&run.session_id].clone();
+            (run.clone(), session)
+        }))
+    }
+
+    fn claim_run_execution(
+        &self,
+        run_id: &Uuid,
+    ) -> Result<(RunRecord, SessionRecord), ClaimRunError> {
+        let mut state = self.state.lock().unwrap();
+        let Some(run) = state.runs.get(run_id).cloned() else {
+            return Err(ClaimRunError::UnknownRun);
+        };
+        let session = state.sessions[&run.session_id].clone();
+        if session.status == SessionStatus::Closed {
+            return Err(ClaimRunError::SessionClosed);
+        }
+        // An executed run reports run_already_executed even after its status
+        // turned terminal: the 1:1 violation is the more precise refusal.
+        if run.execution_state != thalamus_core::RUN_EXECUTION_PENDING {
+            return Err(ClaimRunError::AlreadyExecuted);
+        }
+        if run.status != RunStatus::Started {
+            return Err(ClaimRunError::RunNotActive);
+        }
+        if let Some(budget) = governing(
+            &state.budgets,
+            &run.session_id,
+            &session.tenant,
+            &session.product,
+        )
+        .into_iter()
+        .find(|b| b.max_tokens.is_some_and(|max| b.consumed_tokens >= max))
+        {
+            return Err(ClaimRunError::BudgetExceeded {
+                scope_type: budget.scope_type.clone(),
+                scope_ref: budget.scope_ref.clone(),
+            });
+        }
+        let run = state.runs.get_mut(run_id).expect("run present above");
+        run.execution_state = thalamus_core::RUN_EXECUTION_EXECUTING.to_owned();
+        Ok((run.clone(), session))
+    }
+
+    fn finish_run_execution(
+        &self,
+        run_id: &Uuid,
+        final_status: &str,
+        outcome: &serde_json::Value,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(run) = state.runs.get_mut(run_id) {
+            run.status = match final_status {
+                "completed" => RunStatus::Completed,
+                "cancelled" => RunStatus::Cancelled,
+                _ => RunStatus::Failed,
+            };
+            run.execution_state = thalamus_core::RUN_EXECUTION_EXECUTED.to_owned();
+            run.finished_at = Some(OffsetDateTime::now_utc());
+            if let (Some(meta), Some(new)) = (run.metadata.as_object_mut(), outcome.as_object()) {
+                for (k, v) in new {
+                    meta.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_usage(&self, session_id: &Uuid, tokens: i64) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        let Some(session) = state.sessions.get(session_id).cloned() else {
+            return Ok(());
+        };
+        let session_ref = session_id.to_string();
+        let product_ref = format!("{}/{}", session.tenant, session.product);
+        for budget in state.budgets.iter_mut() {
+            let governs = (budget.scope_type == "session" && budget.scope_ref == session_ref)
+                || (budget.scope_type == "product" && budget.scope_ref == product_ref)
+                || (budget.scope_type == "tenant" && budget.scope_ref == session.tenant);
+            if governs {
+                budget.consumed_tokens += tokens;
+            }
+        }
+        Ok(())
+    }
+
     fn session_limits(&self, id: &Uuid) -> Result<Option<SessionLimits>, String> {
         let state = self.state.lock().unwrap();
         let Some(session) = state.sessions.get(id) else {
@@ -326,6 +458,7 @@ impl SessionStore for thalamus_postgres_adapter::PostgresAudit {
                 workflow: input.workflow.clone(),
                 principal: input.principal.clone(),
                 delegation_token_id: input.delegation_token_id.clone(),
+                governance_mode: input.governance_mode.clone(),
                 idempotency_key: input.idempotency_key.clone(),
             },
         )
@@ -418,5 +551,63 @@ impl SessionStore for thalamus_postgres_adapter::PostgresAudit {
             &input.content_hash,
         )
         .map_err(|e| e.to_string())
+    }
+
+    fn run_with_session(
+        &self,
+        run_id: &Uuid,
+    ) -> Result<Option<(RunRecord, SessionRecord)>, String> {
+        thalamus_postgres_adapter::PostgresAudit::run_with_session(self, run_id)
+            .map_err(|e| e.to_string())
+    }
+
+    fn claim_run_execution(
+        &self,
+        run_id: &Uuid,
+    ) -> Result<(RunRecord, SessionRecord), ClaimRunError> {
+        thalamus_postgres_adapter::PostgresAudit::claim_run_execution(self, run_id).map_err(|e| {
+            match e {
+                thalamus_postgres_adapter::ClaimRunError::UnknownRun => ClaimRunError::UnknownRun,
+                thalamus_postgres_adapter::ClaimRunError::SessionClosed => {
+                    ClaimRunError::SessionClosed
+                }
+                thalamus_postgres_adapter::ClaimRunError::RunNotActive => {
+                    ClaimRunError::RunNotActive
+                }
+                thalamus_postgres_adapter::ClaimRunError::AlreadyExecuted => {
+                    ClaimRunError::AlreadyExecuted
+                }
+                thalamus_postgres_adapter::ClaimRunError::BudgetExceeded {
+                    scope_type,
+                    scope_ref,
+                } => ClaimRunError::BudgetExceeded {
+                    scope_type,
+                    scope_ref,
+                },
+                thalamus_postgres_adapter::ClaimRunError::Store(err) => {
+                    ClaimRunError::Store(err.to_string())
+                }
+            }
+        })
+    }
+
+    fn finish_run_execution(
+        &self,
+        run_id: &Uuid,
+        final_status: &str,
+        outcome: &serde_json::Value,
+    ) -> Result<(), String> {
+        thalamus_postgres_adapter::PostgresAudit::finish_run_execution(
+            self,
+            run_id,
+            final_status,
+            outcome,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn record_usage(&self, session_id: &Uuid, tokens: i64) -> Result<(), String> {
+        thalamus_postgres_adapter::PostgresAudit::record_usage(self, session_id, tokens)
+            .map_err(|e| e.to_string())
     }
 }

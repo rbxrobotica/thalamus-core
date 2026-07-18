@@ -16,6 +16,16 @@ pub enum SessionStatus {
     Closed,
 }
 
+/// Governance modes a session can be created under (ADR-0403 / master plan
+/// §7): external agents get governed LLM access, never governed workspace
+/// claims. Recorded immutably at session creation and audited.
+pub const GOVERNANCE_MODE_LLM_ACCESS: &str = "governed_llm_access";
+pub const GOVERNANCE_MODE_WORKSPACE: &str = "governed_workspace";
+
+pub fn default_governance_mode() -> String {
+    GOVERNANCE_MODE_LLM_ACCESS.to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_id: Uuid,
@@ -25,6 +35,9 @@ pub struct SessionRecord {
     pub principal: Option<String>,
     pub delegation_token_id: Option<String>,
     pub status: SessionStatus,
+    /// Immutable after creation; `governed_llm_access` for Bridge sessions.
+    #[serde(default = "default_governance_mode")]
+    pub governance_mode: String,
     pub retention_class: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -41,11 +54,24 @@ pub enum RunStatus {
     Cancelled,
 }
 
+/// Execution claim states for the 1:1 run <-> call invariant: a run starts
+/// `pending`, is atomically claimed to `executing` by the governed call
+/// surface, and ends `executed`. A second call on the same run is refused.
+pub const RUN_EXECUTION_PENDING: &str = "pending";
+pub const RUN_EXECUTION_EXECUTING: &str = "executing";
+pub const RUN_EXECUTION_EXECUTED: &str = "executed";
+
+pub fn default_run_execution_state() -> String {
+    RUN_EXECUTION_PENDING.to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: Uuid,
     pub session_id: Uuid,
     pub status: RunStatus,
+    #[serde(default = "default_run_execution_state")]
+    pub execution_state: String,
     pub model_alias: Option<String>,
     pub backend_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]

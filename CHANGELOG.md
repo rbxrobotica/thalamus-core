@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (SLICE-T1 — run-bound governed calls, master plan §7 / Gate D)
+
+- `POST /rbx/v1/runs/{run_id}/calls` and `/calls/stream`: the governed way to
+  execute a model call. Tenant/product/workflow/user derive from the session
+  record, the model from the run record; the body carries only intent + a
+  structured `chat.completions.v1` payload (client-supplied `payload.model` is
+  rejected). Invariant chain: verified credential -> run exists -> caller owns
+  the session (404 anti-enumeration + `ownership_violation` audit) -> session
+  open + run active -> atomic 1:1 execution claim (`run_already_executed` on
+  replay) -> budget re-check under lock -> policy (deny never reaches the
+  backend) -> correlated route envelope (session_id + run_id columns) ->
+  execution -> post-call -> run finalized + usage consumed from budgets.
+- Chat payload passthrough in the LiteLLM adapter: messages/tools/tool_choice
+  cross the wire (allowlisted fields, max_tokens clamped by policy budget) and
+  SSE chunks are forwarded verbatim (`chat.completion.chunk` with tool_call
+  argument deltas, finish_reason, usage) via new `execute_streaming_chat`;
+  pure tool-call responses audit their serialized tool calls as content.
+- `sessions.governance_mode` (required on `POST /rbx/v1/sessions`, ADR-0403:
+  `governed_llm_access` | `governed_workspace`, immutable, audited) and
+  `runs.execution_state` (pending/executing/executed) via migration
+  `0003_governed_calls`.
+- Policy knob `require_run_correlation`: tenants flagged with it get legacy
+  uncorrelated `/v1/call` denied (`uncorrelated_call`) before backend contact
+  while the run-bound surface stays allowed.
+- Session lifecycle hash chain now records `call_started` / `call_completed` /
+  `call_failed` / `call_cancelled` / `call_denied` / `ownership_violation`
+  events, so the whole identity -> session -> run -> call story is one chain.
+
 ### Added (Phase 3 slice 4 — governance endpoints + §3 security)
 
 - `POST /rbx/v1/tool-decisions`, `POST /rbx/v1/approvals`,

@@ -35,6 +35,8 @@ struct PolicyFile {
     redaction_rules: Vec<thalamus_core::RedactionRule>,
     audit_required: bool,
     risk_threshold: RiskLevel,
+    #[serde(default)]
+    require_run_correlation: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -75,6 +77,7 @@ impl From<PolicyFile> for Policy {
             redaction_rules: f.redaction_rules,
             audit_required: f.audit_required,
             risk_threshold: f.risk_threshold,
+            require_run_correlation: f.require_run_correlation,
         }
     }
 }

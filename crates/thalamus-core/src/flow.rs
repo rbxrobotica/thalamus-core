@@ -116,6 +116,7 @@ pub fn pre_call(
                 redaction_applied: !policy.redaction_rules.is_empty(),
                 policy_ref: policy.id.clone(),
                 budget: policy.budget.clone(),
+                chat_payload: None,
             };
 
             if policy.audit_required {
@@ -439,6 +440,7 @@ mod tests {
             redaction_rules: vec![],
             audit_required: true,
             risk_threshold: RiskLevel::Medium,
+            require_run_correlation: false,
         }
     }
 
@@ -455,6 +457,7 @@ mod tests {
                 backend_type: BackendType::Model,
             }),
             budget_hint: None,
+            run_correlated: false,
         }
     }
 
