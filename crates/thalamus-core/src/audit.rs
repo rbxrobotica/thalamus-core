@@ -14,6 +14,12 @@ pub enum AuditEvent {
         tenant: String,
         product: String,
         workflow: String,
+        /// Caller identity. On the legacy /v1 surface this is the
+        /// caller-declared `user`; on the governed /rbx/v1 surface it is the
+        /// verified principal. `default` keeps pre-existing durable events
+        /// (written before this field) deserializable.
+        #[serde(default)]
+        user: Option<String>,
         policy_ref: String,
         decision: String,
         backend: Option<BackendHandle>,
