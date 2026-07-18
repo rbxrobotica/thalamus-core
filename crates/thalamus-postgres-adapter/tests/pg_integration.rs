@@ -32,6 +32,7 @@ fn pre_call_event(audit_id: AuditId) -> AuditEvent {
         tenant: "rbx".to_owned(),
         product: "kulinaryos".to_owned(),
         workflow: "test".to_owned(),
+        user: Some("ldamasio@gmail.com".to_owned()),
         policy_ref: "policy-test".to_owned(),
         decision: "Allow".to_owned(),
         backend: None,
