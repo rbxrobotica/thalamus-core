@@ -37,6 +37,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_governed_calls",
         include_str!("../migrations/0003_governed_calls.sql"),
     ),
+    (
+        "0004_maintenance_grants",
+        include_str!("../migrations/0004_maintenance_grants.sql"),
+    ),
 ];
 
 /// The sync `postgres` client drives its own internal tokio runtime; calling
