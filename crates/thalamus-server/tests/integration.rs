@@ -1113,7 +1113,7 @@ fn rbx_caller(subject: &str, scopes: &[&str]) -> VerifiedCaller {
 }
 
 fn rbx_app(verifier: Arc<dyn CredentialVerifier + Send + Sync>) -> axum::Router {
-    app::build_with_rbx_api(make_config(vec![test_policy()]), verifier)
+    app::build_with_rbx_api(make_config(vec![test_policy()]), verifier, None)
 }
 
 async fn send_with_auth(
@@ -1868,4 +1868,39 @@ async fn readyz_reports_identity_verifier_state() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["identity_verifier"], true);
     assert_eq!(body["identity_reachable"], true);
+}
+
+// Regression (prod 2026-07-18): enabling the governed surface must not
+// drop the backend from the legacy /v1/call path.
+#[tokio::test]
+async fn rbx_api_mode_keeps_legacy_call_backend_wired() {
+    let backend = Arc::new(CountingBackendPort::new(BackendResponse {
+        content: "ok".to_owned(),
+        tokens_used: Some(3),
+        latency_ms: Some(2),
+    }));
+    let verifier = StaticCredentialVerifier::with_valid(
+        "rbxsess_leandro",
+        rbx_caller("ldamasio@gmail.com", &["kulinaryos:access"]),
+    );
+    let app = app::build_with_rbx_api(
+        make_config(vec![test_policy()]),
+        Arc::new(verifier),
+        Some(backend.clone()),
+    );
+
+    let (status, body) = send_request(
+        app.clone(),
+        "POST",
+        "/v1/call",
+        Some(test_request_body("RBX", "test-product", "test-workflow")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["backend_content"], "ok");
+    assert_eq!(backend.call_count(), 1);
+
+    // readyz reflects the wired backend.
+    let (_, ready) = send_request(app, "GET", "/readyz", None).await;
+    assert_eq!(ready["backend_configured"], true);
 }
