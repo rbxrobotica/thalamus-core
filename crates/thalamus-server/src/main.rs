@@ -17,6 +17,32 @@ fn default_trace_exporter_sink() -> Arc<dyn thalamus_eval::EvalSink + Send + Syn
         .unwrap_or_else(|| Arc::new(thalamus_eval::NoOpSink))
 }
 
+/// LiteLLM adapter config from the environment: `LITELLM_ENDPOINT`,
+/// `LITELLM_API_KEY` and `THALAMUS_MODEL_MAP` (JSON object mapping
+/// institutional aliases to gateway model names, e.g.
+/// `{"coding.standard": "anthropic/glm-5.2"}`). A malformed map is a startup
+/// error: running with silently-dropped alias resolution would surface as
+/// unknown-model failures at call time instead of a clear boot refusal.
+#[cfg(feature = "litellm")]
+fn litellm_adapter_config_from_env() -> thalamus_litellm_adapter::config::AdapterConfig {
+    let endpoint = std::env::var("LITELLM_ENDPOINT")
+        .unwrap_or_else(|_| thalamus_litellm_adapter::config::AdapterConfig::default_endpoint());
+    let model_map = match std::env::var("THALAMUS_MODEL_MAP") {
+        Ok(raw) => thalamus_litellm_adapter::config::AdapterConfig::parse_model_map(&raw)
+            .unwrap_or_else(|e| {
+                eprintln!("invalid THALAMUS_MODEL_MAP: {e}");
+                std::process::exit(1);
+            }),
+        Err(_) => std::collections::HashMap::new(),
+    };
+    thalamus_litellm_adapter::config::AdapterConfig {
+        endpoint,
+        model_map,
+        api_key: std::env::var("LITELLM_API_KEY").ok(),
+        ..Default::default()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().json().with_target(false).init();
@@ -35,16 +61,8 @@ async fn main() {
     // === Trace exporter + LiteLLM ===
     #[cfg(all(feature = "langfuse", feature = "litellm"))]
     let app = {
-        let endpoint = std::env::var("LITELLM_ENDPOINT").unwrap_or_else(|_| {
-            thalamus_litellm_adapter::config::AdapterConfig::default_endpoint()
-        });
-        let adapter_config = thalamus_litellm_adapter::config::AdapterConfig {
-            endpoint,
-            api_key: std::env::var("LITELLM_API_KEY").ok(),
-            ..Default::default()
-        };
         let backend: Arc<dyn BackendPort + Send + Sync> = Arc::new(
-            thalamus_litellm_adapter::LiteLLMAdapter::new(adapter_config),
+            thalamus_litellm_adapter::LiteLLMAdapter::new(litellm_adapter_config_from_env()),
         );
         let sink = default_trace_exporter_sink();
         app::build_with_eval_sink(
@@ -101,16 +119,8 @@ async fn main() {
     // === LiteLLM, no Langfuse ===
     #[cfg(all(not(feature = "langfuse"), feature = "litellm"))]
     let app = {
-        let endpoint = std::env::var("LITELLM_ENDPOINT").unwrap_or_else(|_| {
-            thalamus_litellm_adapter::config::AdapterConfig::default_endpoint()
-        });
-        let adapter_config = thalamus_litellm_adapter::config::AdapterConfig {
-            endpoint,
-            api_key: std::env::var("LITELLM_API_KEY").ok(),
-            ..Default::default()
-        };
         let backend: Arc<dyn BackendPort + Send + Sync> = Arc::new(
-            thalamus_litellm_adapter::LiteLLMAdapter::new(adapter_config),
+            thalamus_litellm_adapter::LiteLLMAdapter::new(litellm_adapter_config_from_env()),
         );
         if let Some(sink) = ports::trace_exporter::trace_exporter_sink_from_env() {
             app::build_with_eval_sink(
@@ -202,19 +212,9 @@ async fn main() {
         #[cfg(feature = "litellm")]
         let rbx_backend: Option<
             std::sync::Arc<dyn thalamus_core::BackendPort + Send + Sync>,
-        > = {
-            let endpoint = std::env::var("LITELLM_ENDPOINT").unwrap_or_else(|_| {
-                thalamus_litellm_adapter::config::AdapterConfig::default_endpoint()
-            });
-            let adapter_config = thalamus_litellm_adapter::config::AdapterConfig {
-                endpoint,
-                api_key: std::env::var("LITELLM_API_KEY").ok(),
-                ..Default::default()
-            };
-            Some(std::sync::Arc::new(
-                thalamus_litellm_adapter::LiteLLMAdapter::new(adapter_config),
-            ))
-        };
+        > = Some(std::sync::Arc::new(
+            thalamus_litellm_adapter::LiteLLMAdapter::new(litellm_adapter_config_from_env()),
+        ));
         #[cfg(not(feature = "litellm"))]
         let rbx_backend: Option<
             std::sync::Arc<dyn thalamus_core::BackendPort + Send + Sync>,

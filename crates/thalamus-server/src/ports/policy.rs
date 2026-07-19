@@ -41,6 +41,7 @@ impl PolicyPort for ConfigPolicyPort {
                 audit_required: false,
                 risk_threshold: thalamus_core::RiskLevel::Low,
                 require_run_correlation: false,
+                prompt_profile: None,
             })
     }
 

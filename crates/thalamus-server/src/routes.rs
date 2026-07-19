@@ -1143,6 +1143,83 @@ fn invalid_id(what: &str) -> Response {
     )
 }
 
+/// Route lease contract version (rbx.route_lease.v1): the negotiation block
+/// returned on run creation so clients can compile their prompt against the
+/// resolved alias/profile BEFORE submitting the call payload. The lease is
+/// negotiation metadata; enforcement stays at call time (policy + 1:1 claim).
+pub const ROUTE_LEASE_SCHEMA_VERSION: &str = "rbx.route_lease.v1";
+/// Institutional default prompt profile when the policy pins none.
+pub const DEFAULT_PROMPT_PROFILE: &str = "rbx.default.v1";
+/// Advisory lease validity window; run/session state stays authoritative.
+const ROUTE_LEASE_TTL_SECS: i64 = 1800;
+
+/// Build the route lease for a freshly created run. `status` is `granted`
+/// only when the policy resolves and permits the alias the call will use;
+/// `no_policy` / `model_not_permitted` tell the client not to compile and
+/// call (the call would be refused with the matching typed error).
+fn route_lease_for_run(
+    state: &AppState,
+    run: &thalamus_core::RunRecord,
+    session: &thalamus_core::SessionRecord,
+) -> serde_json::Value {
+    let request = CallRequest {
+        tenant: session.tenant.clone(),
+        product: session.product.clone(),
+        user: session.principal.clone().unwrap_or_default(),
+        workflow: session.workflow.clone(),
+        intent: "route_lease".to_owned(),
+        prompt: String::new(),
+        requested_backend: None,
+        budget_hint: None,
+        run_correlated: true,
+    };
+    let policy = state.policy_port.resolve(&request);
+    // Mirror call-time semantics: a run-pinned alias must be permitted or the
+    // call will refuse (model_not_permitted); an unpinned run falls back to
+    // the first permitted backend, exactly like select_backend.
+    let (status, model_alias) = if policy.id == "no-match" {
+        ("no_policy", run.model_alias.clone())
+    } else if let Some(alias) = run.model_alias.as_deref() {
+        if policy.permitted_backends.iter().any(|b| b.id == alias) {
+            ("granted", Some(alias.to_owned()))
+        } else {
+            ("model_not_permitted", Some(alias.to_owned()))
+        }
+    } else if let Some(first) = policy.permitted_backends.first() {
+        ("granted", Some(first.id.clone()))
+    } else {
+        ("no_policy", None)
+    };
+    let issued_at = time::OffsetDateTime::now_utc();
+    let expires_at = issued_at + time::Duration::seconds(ROUTE_LEASE_TTL_SECS);
+    let format = &time::format_description::well_known::Rfc3339;
+    serde_json::json!({
+        "schema_version": ROUTE_LEASE_SCHEMA_VERSION,
+        "lease_id": Uuid::new_v4(),
+        "session_id": session.session_id,
+        "run_id": run.run_id,
+        "status": status,
+        "model_alias": model_alias,
+        "prompt_profile_id": policy
+            .prompt_profile
+            .as_deref()
+            .unwrap_or(DEFAULT_PROMPT_PROFILE),
+        "capabilities": {
+            "streaming": true,
+            "payload_kinds": [PAYLOAD_KIND_CHAT_V1],
+            "tools": true,
+        },
+        "context": {
+            "max_tokens": policy.budget.max_tokens,
+            "max_context_utilization": thalamus_core::DEFAULT_CONTEXT_UTILIZATION_LIMIT,
+            "context_policy_ref": thalamus_core::DEFAULT_CONTEXT_POLICY_REF,
+        },
+        "policy_snapshot_id": policy.id,
+        "issued_at": issued_at.format(format).ok(),
+        "expires_at": expires_at.format(format).ok(),
+    })
+}
+
 /// POST /rbx/v1/sessions/{session_id}/runs — refused when the session is
 /// unknown/closed or a governing budget is exhausted (§3 acceptance:
 /// budget-exceeded blocks new runs).
@@ -1173,7 +1250,21 @@ pub async fn rbx_create_run(
             if let Some(resp) = durable_audit_guard(&state) {
                 return resp;
             }
-            (StatusCode::CREATED, Json(record)).into_response()
+            // Attach the route lease (rbx.route_lease.v1) as an additive field
+            // on the run record: pre-lease clients keep deserializing the
+            // record unchanged. Lease lookup failures degrade to the bare
+            // record rather than failing a run that was already created.
+            let mut body = serde_json::to_value(&record)
+                .unwrap_or_else(|_| serde_json::json!({ "run_id": record.run_id }));
+            if let Ok(Some((run, session))) = state.session_store.run_with_session(&record.run_id) {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "route_lease".to_owned(),
+                        route_lease_for_run(&state, &run, &session),
+                    );
+                }
+            }
+            (StatusCode::CREATED, Json(body)).into_response()
         }
         Err(crate::ports::sessions::CreateRunError::UnknownSession) => typed_error(
             StatusCode::NOT_FOUND,
@@ -2072,6 +2163,34 @@ pub async fn rbx_run_call(
     }
 }
 
+/// Wire envelope version for the governed SSE stream (Gate 0 item 7). Every
+/// SSE event carries its `event_seq` in the native SSE `id` field (dedup and
+/// ordering key is `run_id` + `event_seq`); `decision`/`result`/`error` also
+/// embed `schema_version`, `event_id` and `event_seq` in their data. `chunk`
+/// data stays a verbatim `chat.completion.chunk` object (pre-envelope
+/// consumers keep working); its sequencing lives on the `id` line only.
+pub const STREAM_WIRE_SCHEMA_VERSION: &str = "rbx.modelstream.wire.v1";
+
+/// Stamp the wire envelope onto a non-verbatim SSE event payload.
+fn envelope_event(
+    kind: &str,
+    seq: u64,
+    mut payload: serde_json::Value,
+) -> axum::response::sse::Event {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "schema_version".to_owned(),
+            serde_json::json!(STREAM_WIRE_SCHEMA_VERSION),
+        );
+        obj.insert("event_id".to_owned(), serde_json::json!(Uuid::new_v4()));
+        obj.insert("event_seq".to_owned(), serde_json::json!(seq));
+    }
+    axum::response::sse::Event::default()
+        .event(kind)
+        .id(seq.to_string())
+        .data(payload.to_string())
+}
+
 /// POST /rbx/v1/runs/{run_id}/calls/stream — SSE run-bound governed call.
 /// All refusals happen BEFORE the stream starts (plain typed JSON responses);
 /// only an allowed, claimed call opens the SSE. Event sequence:
@@ -2106,7 +2225,12 @@ pub async fn rbx_run_call_stream(
     let state_task = Arc::clone(&state);
     tokio::spawn(async move {
         let audit_id = prepared.outcome.audit_id.0.to_string();
-        let decision_event = Event::default().event("decision").data(
+        // Monotonic per-stream sequence: decision=1, then chunks, then the
+        // terminal event. Dedup/ordering key on the wire is run_id+event_seq.
+        let seq = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let decision_event = envelope_event(
+            "decision",
+            seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             serde_json::json!({
                 "decision": "Allow",
                 "audit_id": audit_id,
@@ -2114,8 +2238,7 @@ pub async fn rbx_run_call_stream(
                 "session_id": prepared.session.session_id,
                 "run_id": prepared.run_id,
                 "policy_id": prepared.outcome.policy.id,
-            })
-            .to_string(),
+            }),
         );
         if tx.send(decision_event).await.is_err() {
             // Client vanished before execution: release the claim as
@@ -2131,9 +2254,16 @@ pub async fn rbx_run_call_stream(
         let cancel = thalamus_core::CancelToken::new();
         let cancel_for_sink = cancel.clone();
         let tx_for_sink = tx.clone();
+        let seq_for_sink = Arc::clone(&seq);
         let execution = tokio::task::spawn_blocking(move || {
             let mut on_chunk = |chunk: &serde_json::Value| {
-                let event = Event::default().event("chunk").data(chunk.to_string());
+                // Chunk data stays verbatim; sequencing rides the SSE id line.
+                let event = Event::default()
+                    .event("chunk")
+                    .id(seq_for_sink
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        .to_string())
+                    .data(chunk.to_string());
                 if tx_for_sink.blocking_send(event).is_err() {
                     cancel_for_sink.cancel();
                 }
@@ -2147,16 +2277,15 @@ pub async fn rbx_run_call_stream(
             Err(_join_err) => {
                 fail_claimed_run(&state_task, &prepared.run_id, "backend_task_failed", None);
                 let _ = tx
-                    .send(
-                        Event::default().event("error").data(
-                            serde_json::json!({
-                                "code": "BACKEND_TASK_FAILED",
-                                "message": "backend execution task failed",
-                                "audit_id": audit_id,
-                            })
-                            .to_string(),
-                        ),
-                    )
+                    .send(envelope_event(
+                        "error",
+                        seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        serde_json::json!({
+                            "code": "BACKEND_TASK_FAILED",
+                            "message": "backend execution task failed",
+                            "audit_id": audit_id,
+                        }),
+                    ))
                     .await;
                 return;
             }
@@ -2167,22 +2296,21 @@ pub async fn rbx_run_call_stream(
             Ok(exec) => {
                 let post = post_result.expect("post_call ran on success");
                 let _ = tx
-                    .send(
-                        Event::default().event("result").data(
-                            serde_json::json!({
-                                "status": format!("{:?}", post.status),
-                                "risk_class": format!("{:?}", post.risk_class),
-                                "executable_by_agent": post.executable_by_agent,
-                                "schema_valid": post.schema_valid,
-                                "audit_id": audit_id,
-                                "run_id": prepared.run_id,
-                                "finish_reason": exec.backend_metadata.get("finish_reason"),
-                                "usage": exec.usage,
-                                "latency_ms": exec.latency_ms,
-                            })
-                            .to_string(),
-                        ),
-                    )
+                    .send(envelope_event(
+                        "result",
+                        seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        serde_json::json!({
+                            "status": format!("{:?}", post.status),
+                            "risk_class": format!("{:?}", post.risk_class),
+                            "executable_by_agent": post.executable_by_agent,
+                            "schema_valid": post.schema_valid,
+                            "audit_id": audit_id,
+                            "run_id": prepared.run_id,
+                            "finish_reason": exec.backend_metadata.get("finish_reason"),
+                            "usage": exec.usage,
+                            "latency_ms": exec.latency_ms,
+                        }),
+                    ))
                     .await;
             }
             Err(err) => {
@@ -2200,18 +2328,17 @@ pub async fn rbx_run_call_stream(
                     _ => None,
                 };
                 let _ = tx
-                    .send(
-                        Event::default().event("error").data(
-                            serde_json::json!({
-                                "code": err.code(),
-                                "message": err.to_string(),
-                                "audit_id": audit_id,
-                                "run_id": prepared.run_id,
-                                "partial_usage": partial_usage,
-                            })
-                            .to_string(),
-                        ),
-                    )
+                    .send(envelope_event(
+                        "error",
+                        seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        serde_json::json!({
+                            "code": err.code(),
+                            "message": err.to_string(),
+                            "audit_id": audit_id,
+                            "run_id": prepared.run_id,
+                            "partial_usage": partial_usage,
+                        }),
+                    ))
                     .await;
             }
         }

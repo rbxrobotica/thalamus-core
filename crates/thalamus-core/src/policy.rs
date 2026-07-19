@@ -21,6 +21,12 @@ pub struct Policy {
     /// `/v1/call` surface is denied before any backend contact.
     #[serde(default)]
     pub require_run_correlation: bool,
+    /// Prompt profile this policy's backends are compatible with, negotiated
+    /// to clients in the run route lease (rbx.route_lease.v1). Clients compile
+    /// their prompts against this profile before the model call; absent means
+    /// the institutional default profile.
+    #[serde(default)]
+    pub prompt_profile: Option<String>,
 }
 
 // === Budget ===

@@ -37,6 +37,8 @@ struct PolicyFile {
     risk_threshold: RiskLevel,
     #[serde(default)]
     require_run_correlation: bool,
+    #[serde(default)]
+    prompt_profile: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -78,6 +80,7 @@ impl From<PolicyFile> for Policy {
             audit_required: f.audit_required,
             risk_threshold: f.risk_threshold,
             require_run_correlation: f.require_run_correlation,
+            prompt_profile: f.prompt_profile,
         }
     }
 }
