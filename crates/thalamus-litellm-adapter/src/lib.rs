@@ -360,7 +360,12 @@ impl BackendPort for LiteLLMAdapter {
         let mut request = agent
             .post(&plan.url)
             .header("x-trace-id", &plan.trace_id)
-            .header("x-audit-id", &plan.audit_id);
+            .header("x-audit-id", &plan.audit_id)
+            // Streaming must not negotiate compression: the proxy's gzip
+            // path buffers the whole SSE stream and delivers it as one
+            // terminal burst (observed live 2026-07-19), destroying
+            // incremental delivery. Identity keeps deltas flowing.
+            .header("accept-encoding", "identity");
         if let Some(key) = &self.config.api_key {
             request = request.header("authorization", format!("Bearer {key}"));
         }
@@ -492,7 +497,10 @@ impl BackendPort for LiteLLMAdapter {
         let mut request = agent
             .post(&plan.url)
             .header("x-trace-id", &plan.trace_id)
-            .header("x-audit-id", &plan.audit_id);
+            .header("x-audit-id", &plan.audit_id)
+            // Identity encoding on streaming: gzip through the proxy
+            // buffers the entire SSE stream into one terminal burst.
+            .header("accept-encoding", "identity");
         if let Some(key) = &self.config.api_key {
             request = request.header("authorization", format!("Bearer {key}"));
         }
@@ -1006,6 +1014,28 @@ mod streaming_tests {
         assert_eq!(exec.usage.total_tokens, Some(8));
         assert_eq!(exec.backend_metadata["streamed"], true);
         assert_eq!(exec.backend_metadata["chunks"], 3);
+    }
+
+    /// Streaming requests must pin identity encoding: a gzip-negotiated SSE
+    /// response is buffered whole by the proxy and arrives as one terminal
+    /// burst (observed live 2026-07-19), which breaks incremental delivery.
+    /// The mock only matches when the header is present.
+    #[test]
+    fn streaming_requests_pin_identity_encoding() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_header("accept-encoding", "identity")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse_body())
+            .expect(1)
+            .create();
+        let adapter = adapter_for(&server.url());
+        adapter
+            .execute_streaming(&route(), &CancelToken::new(), &mut |_| {})
+            .expect("stream succeeds only when identity encoding is pinned");
+        mock.assert();
     }
 
     #[test]
