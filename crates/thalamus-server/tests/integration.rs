@@ -75,6 +75,7 @@ impl PolicyPort for FakeReviewPolicyPort {
                 audit_required: false,
                 risk_threshold: RiskLevel::Low,
                 require_run_correlation: false,
+                prompt_profile: None,
             }
         }
     }
@@ -116,6 +117,7 @@ fn test_policy() -> Policy {
         audit_required: true,
         risk_threshold: RiskLevel::Medium,
         require_run_correlation: false,
+        prompt_profile: None,
     }
 }
 
@@ -135,6 +137,7 @@ fn empty_backend_policy() -> Policy {
         audit_required: false,
         risk_threshold: RiskLevel::Low,
         require_run_correlation: false,
+        prompt_profile: None,
     }
 }
 
@@ -452,6 +455,7 @@ fn litellm_policy() -> Policy {
         audit_required: true,
         risk_threshold: RiskLevel::Medium,
         require_run_correlation: false,
+        prompt_profile: None,
     }
 }
 
@@ -759,6 +763,7 @@ fn agentgateway_policy() -> Policy {
         audit_required: true,
         risk_threshold: RiskLevel::Medium,
         require_run_correlation: false,
+        prompt_profile: None,
     }
 }
 
@@ -933,6 +938,7 @@ async fn backend_swap_agentgateway_produces_same_flow_as_litellm() {
         audit_required: true,
         risk_threshold: RiskLevel::Low,
         require_run_correlation: false,
+        prompt_profile: None,
     };
 
     let success_body = serde_json::json!({
@@ -1941,6 +1947,7 @@ fn kulinaryos_policy(require_run_correlation: bool) -> Policy {
         audit_required: true,
         risk_threshold: RiskLevel::Medium,
         require_run_correlation,
+        prompt_profile: None,
     }
 }
 
@@ -2375,6 +2382,58 @@ async fn run_call_stream_passes_chunks_verbatim_and_finalizes_run() {
     assert_eq!(run.execution_state, "executed");
 }
 
+/// Wire envelope (rbx.modelstream.wire.v1): every SSE event carries its
+/// `event_seq` on the native `id` line; decision/result/error also embed
+/// schema_version/event_id/event_seq in data; chunk data stays verbatim.
+#[tokio::test]
+async fn run_call_stream_carries_wire_envelope_sequence() {
+    let chunks = vec![
+        json!({ "choices": [{ "index": 0, "delta": { "content": "hel" }, "finish_reason": null }] }),
+        json!({ "choices": [{ "index": 0, "delta": { "content": "lo" }, "finish_reason": "stop" }] }),
+    ];
+    let backend = Arc::new(ScriptedChatBackend {
+        chunks: chunks.clone(),
+    });
+    let (app, _store) = run_call_app(kulinaryos_policy(true), backend);
+    let (_, run_id) = create_session_and_run(&app).await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/rbx/v1/runs/{run_id}/calls/stream"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer rbxsess_leandro")
+        .body::<Body>(Body::from(
+            serde_json::to_string(&chat_call_body()).unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
+
+    // The SSE id lines carry a strictly increasing sequence: 1..=4 here
+    // (decision, chunk, chunk, result).
+    let ids: Vec<u64> = raw
+        .lines()
+        .filter_map(|l| l.strip_prefix("id: "))
+        .map(|v| v.trim().parse().unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4], "raw SSE:\n{raw}");
+
+    let events = sse_events(&raw);
+    let decision = &events[0].1;
+    assert_eq!(decision["schema_version"], "rbx.modelstream.wire.v1");
+    assert_eq!(decision["event_seq"], 1);
+    assert!(decision["event_id"].is_string());
+    // Chunk data is untouched by the envelope: no schema_version injected.
+    assert_eq!(&events[1].1, &chunks[0]);
+    assert!(events[1].1.get("schema_version").is_none());
+    let result = &events.last().unwrap().1;
+    assert_eq!(result["schema_version"], "rbx.modelstream.wire.v1");
+    assert_eq!(result["event_seq"], 4);
+    assert!(result["event_id"].is_string());
+}
+
 #[tokio::test]
 async fn run_call_rejects_model_not_permitted_by_policy() {
     let backend = counting_backend();
@@ -2408,4 +2467,89 @@ async fn run_call_rejects_model_not_permitted_by_policy() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
     assert_eq!(body["error"]["code"], "model_not_permitted");
     assert_eq!(backend.call_count(), 0);
+}
+
+// === Route lease negotiation on run creation (rbx.route_lease.v1) ===
+//
+// Prompt-profile/capability negotiation happens BEFORE the client compiles
+// and submits the call payload: the lease travels on the create-run response.
+// Enforcement stays at call time; the lease mirrors what the call will do.
+
+async fn create_run_with_alias(app: &axum::Router, alias: Option<&str>) -> Value {
+    let (status, session) = post_json_with_auth(
+        app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session_id = session["session_id"].as_str().unwrap();
+    let body = match alias {
+        Some(alias) => json!({ "model_alias": alias }),
+        None => json!({}),
+    };
+    let (status, run) = post_json_with_auth(
+        app,
+        &format!("/rbx/v1/sessions/{session_id}/runs"),
+        Some("rbxsess_leandro"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {run}");
+    run
+}
+
+#[tokio::test]
+async fn run_creation_returns_granted_route_lease() {
+    let (app, _store) = run_call_app(kulinaryos_policy(false), counting_backend());
+    let run = create_run_with_alias(&app, Some("test-backend")).await;
+
+    let lease = &run["route_lease"];
+    assert_eq!(lease["schema_version"], "rbx.route_lease.v1");
+    assert_eq!(lease["status"], "granted");
+    assert_eq!(lease["model_alias"], "test-backend");
+    assert_eq!(lease["prompt_profile_id"], "rbx.default.v1");
+    assert_eq!(lease["policy_snapshot_id"], "kulinaryos-policy");
+    assert_eq!(lease["capabilities"]["streaming"], true);
+    assert_eq!(
+        lease["capabilities"]["payload_kinds"],
+        json!(["chat.completions.v1"])
+    );
+    assert_eq!(lease["context"]["max_tokens"], 1000);
+    assert_eq!(lease["context"]["max_context_utilization"], 0.7);
+    assert_eq!(lease["run_id"], run["run_id"]);
+    assert!(lease["lease_id"].is_string());
+    assert!(lease["issued_at"].is_string());
+    assert!(lease["expires_at"].is_string());
+}
+
+#[tokio::test]
+async fn route_lease_resolves_unpinned_run_to_first_permitted_backend() {
+    let (app, _store) = run_call_app(kulinaryos_policy(false), counting_backend());
+    let run = create_run_with_alias(&app, None).await;
+
+    let lease = &run["route_lease"];
+    assert_eq!(lease["status"], "granted");
+    assert_eq!(lease["model_alias"], "test-backend");
+}
+
+#[tokio::test]
+async fn route_lease_flags_model_not_permitted_before_any_call() {
+    let (app, _store) = run_call_app(kulinaryos_policy(false), counting_backend());
+    let run = create_run_with_alias(&app, Some("forbidden-model")).await;
+
+    let lease = &run["route_lease"];
+    assert_eq!(lease["status"], "model_not_permitted");
+    assert_eq!(lease["model_alias"], "forbidden-model");
+}
+
+#[tokio::test]
+async fn route_lease_reports_policy_prompt_profile() {
+    let mut policy = kulinaryos_policy(false);
+    policy.prompt_profile = Some("rbx.coding.v1".to_owned());
+    let (app, _store) = run_call_app(policy, counting_backend());
+    let run = create_run_with_alias(&app, Some("test-backend")).await;
+
+    assert_eq!(run["route_lease"]["prompt_profile_id"], "rbx.coding.v1");
 }

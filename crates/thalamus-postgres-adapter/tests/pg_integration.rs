@@ -168,6 +168,7 @@ fn route_envelope_roundtrip_survives_reconnect() {
         audit_required: true,
         risk_threshold: RiskLevel::High,
         require_run_correlation: false,
+        prompt_profile: None,
     };
 
     {

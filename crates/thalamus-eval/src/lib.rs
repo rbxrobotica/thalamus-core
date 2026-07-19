@@ -348,6 +348,7 @@ mod tests {
             audit_required: true,
             risk_threshold: thalamus_core::RiskLevel::Medium,
             require_run_correlation: false,
+            prompt_profile: None,
         }
     }
 
