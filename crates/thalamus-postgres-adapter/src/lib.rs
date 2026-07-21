@@ -7,7 +7,10 @@
 //! persisted in `route_envelopes` so post-call validation survives restarts.
 
 mod sessions;
-pub use sessions::{ApprovalRecordInput, ClaimRunError, CreateRunError, NewSessionInput};
+pub use sessions::{
+    ApprovalRecordInput, ClaimRunError, CreateRunError, NewSessionInput, RecordApprovalError,
+    RecordToolDecisionError,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -40,6 +43,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0004_maintenance_grants",
         include_str!("../migrations/0004_maintenance_grants.sql"),
+    ),
+    (
+        "0005_governance_idempotency",
+        include_str!("../migrations/0005_governance_idempotency.sql"),
     ),
 ];
 

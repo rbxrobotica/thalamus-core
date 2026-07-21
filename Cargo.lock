@@ -1519,8 +1519,10 @@ dependencies = [
 name = "thalamus-core"
 version = "0.2.0"
 dependencies = [
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "time",
  "uuid",
 ]

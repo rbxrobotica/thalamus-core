@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod domain;
 pub mod flow;
+pub mod governance_idempotency;
 pub mod lifecycle;
 pub mod policy;
 pub mod ports;
@@ -11,6 +12,10 @@ pub use domain::{
     AuditId, BackendHandle, BackendResponse, BackendType, BudgetHint, CallRequest, CitationCheck,
     ContextEntry, Envelope, PolicyDecision, PostCallResult, PostCallStatus, RiskLevel,
     StrategosEvent, TraceId,
+};
+pub use governance_idempotency::{
+    ApprovalFingerprint, RecordOutcome, ToolDecisionFingerprint, APPROVAL_FINGERPRINT_SCHEMA,
+    TOOL_DECISION_FINGERPRINT_SCHEMA,
 };
 pub use flow::{post_call, pre_call, PreCallError, PreCallOutcome};
 pub use lifecycle::{
