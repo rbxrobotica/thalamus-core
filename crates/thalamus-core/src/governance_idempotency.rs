@@ -132,33 +132,27 @@ mod tests {
     #[test]
     fn tool_decision_fingerprint_is_deterministic() {
         let session_id = Uuid::new_v4();
-        let a = ToolDecisionFingerprint::new(
-            "rbx",
-            "robson-code",
-            session_id,
-            None,
-            "shell",
-            "denied",
-        )
-        .hash_hex();
-        let b = ToolDecisionFingerprint::new(
-            "rbx",
-            "robson-code",
-            session_id,
-            None,
-            "shell",
-            "denied",
-        )
-        .hash_hex();
+        let a =
+            ToolDecisionFingerprint::new("rbx", "robson-code", session_id, None, "shell", "denied")
+                .hash_hex();
+        let b =
+            ToolDecisionFingerprint::new("rbx", "robson-code", session_id, None, "shell", "denied")
+                .hash_hex();
         assert_eq!(a, b);
     }
 
     #[test]
     fn tool_decision_fingerprint_changes_with_decision() {
         let session_id = Uuid::new_v4();
-        let allowed =
-            ToolDecisionFingerprint::new("rbx", "robson-code", session_id, None, "shell", "allowed")
-                .hash_hex();
+        let allowed = ToolDecisionFingerprint::new(
+            "rbx",
+            "robson-code",
+            session_id,
+            None,
+            "shell",
+            "allowed",
+        )
+        .hash_hex();
         let denied =
             ToolDecisionFingerprint::new("rbx", "robson-code", session_id, None, "shell", "denied")
                 .hash_hex();

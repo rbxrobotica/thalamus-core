@@ -419,7 +419,9 @@ impl SessionStore for InMemorySessionStore {
             }
             let id = Uuid::new_v4();
             state.approvals.push((id, input.subject.clone()));
-            state.approval_idempotency.insert(map_key, (id, fingerprint));
+            state
+                .approval_idempotency
+                .insert(map_key, (id, fingerprint));
             return Ok(RecordOutcome::Created(id));
         }
         let id = Uuid::new_v4();

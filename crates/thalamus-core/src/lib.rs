@@ -13,11 +13,11 @@ pub use domain::{
     ContextEntry, Envelope, PolicyDecision, PostCallResult, PostCallStatus, RiskLevel,
     StrategosEvent, TraceId,
 };
+pub use flow::{post_call, pre_call, PreCallError, PreCallOutcome};
 pub use governance_idempotency::{
     ApprovalFingerprint, RecordOutcome, ToolDecisionFingerprint, APPROVAL_FINGERPRINT_SCHEMA,
     TOOL_DECISION_FINGERPRINT_SCHEMA,
 };
-pub use flow::{post_call, pre_call, PreCallError, PreCallOutcome};
 pub use lifecycle::{
     default_governance_mode, default_run_execution_state, BudgetLine, RunRecord, RunStatus,
     SessionLimits, SessionRecord, SessionStatus, DEFAULT_CONTEXT_POLICY_REF,

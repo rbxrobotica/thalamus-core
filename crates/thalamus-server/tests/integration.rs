@@ -1854,9 +1854,13 @@ fn rbx_lifecycle_app_with_verifier(
 #[tokio::test]
 async fn rbx_tool_decision_idempotency_replay_returns_same_invocation() {
     let (app, _store) = rbx_lifecycle_app();
-    let (_, session) =
-        post_json_with_auth(&app, "/rbx/v1/sessions", Some("rbxsess_leandro"), session_request())
-            .await;
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
     let session_id = session["session_id"].as_str().unwrap().to_owned();
     let key = uuid::Uuid::new_v4().to_string();
 
@@ -1894,9 +1898,13 @@ async fn rbx_tool_decision_idempotency_replay_returns_same_invocation() {
 #[tokio::test]
 async fn rbx_tool_decision_idempotency_conflict_returns_409() {
     let (app, _store) = rbx_lifecycle_app();
-    let (_, session) =
-        post_json_with_auth(&app, "/rbx/v1/sessions", Some("rbxsess_leandro"), session_request())
-            .await;
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
     let session_id = session["session_id"].as_str().unwrap().to_owned();
     let key = uuid::Uuid::new_v4().to_string();
 
@@ -2008,9 +2016,13 @@ async fn rbx_tool_decision_idempotency_scoped_by_tenant_and_source_system() {
 #[tokio::test]
 async fn rbx_tool_decision_idempotency_ignores_tenant_and_source_system_in_body() {
     let (app, _store) = rbx_lifecycle_app();
-    let (_, session) =
-        post_json_with_auth(&app, "/rbx/v1/sessions", Some("rbxsess_leandro"), session_request())
-            .await;
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
     let session_id = session["session_id"].as_str().unwrap().to_owned();
     let key = uuid::Uuid::new_v4().to_string();
 
@@ -2050,9 +2062,13 @@ async fn rbx_tool_decision_idempotency_ignores_tenant_and_source_system_in_body(
 #[tokio::test]
 async fn rbx_tool_decision_idempotency_emits_lifecycle_once() {
     let (app, _store) = rbx_lifecycle_app();
-    let (_, session) =
-        post_json_with_auth(&app, "/rbx/v1/sessions", Some("rbxsess_leandro"), session_request())
-            .await;
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
     let session_id = session["session_id"].as_str().unwrap().to_owned();
     let key = uuid::Uuid::new_v4().to_string();
 
@@ -2070,20 +2086,13 @@ async fn rbx_tool_decision_idempotency_emits_lifecycle_once() {
         assert_eq!(status, StatusCode::CREATED);
     }
 
-    let (status, body) = send_with_auth(
-        app.clone(),
-        "GET",
-        &format!("/v1/audit/{session_id}"),
-        None,
-    )
-    .await;
+    let (status, body) =
+        send_with_auth(app.clone(), "GET", &format!("/v1/audit/{session_id}"), None).await;
     assert_eq!(status, StatusCode::OK);
     let events = body["events"].as_array().cloned().unwrap_or_default();
     let lifecycle_count = events
         .iter()
-        .filter(|e| {
-            e["kind"] == "Lifecycle" && e["details"]["entity_type"] == "tool_invocation"
-        })
+        .filter(|e| e["kind"] == "Lifecycle" && e["details"]["entity_type"] == "tool_invocation")
         .count();
     assert_eq!(
         lifecycle_count, 1,
@@ -2131,9 +2140,13 @@ async fn rbx_approval_idempotency_unknown_session_is_404() {
 #[tokio::test]
 async fn rbx_approval_idempotency_replay_and_conflict() {
     let (app, _store) = rbx_lifecycle_app();
-    let (_, session) =
-        post_json_with_auth(&app, "/rbx/v1/sessions", Some("rbxsess_leandro"), session_request())
-            .await;
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
     let session_id = session["session_id"].as_str().unwrap().to_owned();
     let key = uuid::Uuid::new_v4().to_string();
 
@@ -2189,9 +2202,13 @@ async fn rbx_approval_idempotency_requires_client_app_id() {
         },
     );
     let (app, _store) = rbx_lifecycle_app_with_verifier(verifier);
-    let (_, session) =
-        post_json_with_auth(&app, "/rbx/v1/sessions", Some("rbxsess_no_app"), session_request())
-            .await;
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_no_app"),
+        session_request(),
+    )
+    .await;
     let session_id = session["session_id"].as_str().unwrap().to_owned();
     let key = uuid::Uuid::new_v4().to_string();
 

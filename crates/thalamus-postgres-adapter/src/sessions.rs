@@ -320,6 +320,7 @@ impl PostgresAudit {
     /// (`RecordOutcome::Replayed`); a replay with a different fingerprint is
     /// refused as `IdempotencyConflict`. Without `idempotency_key`, behavior
     /// is unchanged from the original contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_tool_decision(
         &self,
         session_id: &Uuid,

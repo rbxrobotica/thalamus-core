@@ -681,7 +681,10 @@ fn tool_decision_idempotency_concurrent_requests_do_not_duplicate() {
     // Created (the winner) or Replayed (everyone else), never a store error.
     let ids: Vec<Uuid> = results
         .into_iter()
-        .map(|r| r.expect("no unique-violation leaks past the ON CONFLICT handling").id())
+        .map(|r| {
+            r.expect("no unique-violation leaks past the ON CONFLICT handling")
+                .id()
+        })
         .collect();
     assert!(
         ids.iter().all(|id| *id == ids[0]),
