@@ -348,20 +348,28 @@ fn governance_records_persist_on_postgres() {
             "shell",
             "denied",
             &serde_json::json!({ "cmd": "redacted" }),
+            "robson-code",
+            None,
         )
         .expect("tool decision")
-        .expect("session exists");
+        .id();
 
-    let missing = store
-        .record_tool_decision(
-            &Uuid::new_v4(),
-            None,
-            "shell",
-            "allowed",
-            &serde_json::json!({}),
-        )
-        .expect("no store error");
-    assert!(missing.is_none(), "unknown session must be refused");
+    let missing = store.record_tool_decision(
+        &Uuid::new_v4(),
+        None,
+        "shell",
+        "allowed",
+        &serde_json::json!({}),
+        "robson-code",
+        None,
+    );
+    assert!(
+        matches!(
+            missing,
+            Err(thalamus_postgres_adapter::RecordToolDecisionError::UnknownSession)
+        ),
+        "unknown session must be refused"
+    );
 
     let approval = store
         .record_approval(&thalamus_postgres_adapter::ApprovalRecordInput {
@@ -372,8 +380,11 @@ fn governance_records_persist_on_postgres() {
             decision: "approved",
             reason: Some("looks good"),
             metadata: &serde_json::json!({}),
+            source_system: "robson-code",
+            idempotency_key: None,
         })
-        .expect("approval");
+        .expect("approval")
+        .id();
 
     let evidence = store
         .record_evidence(
