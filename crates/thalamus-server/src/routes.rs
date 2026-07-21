@@ -1412,6 +1412,11 @@ pub struct ToolDecisionRequest {
     pub decision: String,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Retry-safe replay support (master plan §3 slice 5). Scoped by tenant
+    /// (from the session, never the body) and `source_system` (the caller's
+    /// verified `client_app_id`, never the body).
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1427,6 +1432,52 @@ pub struct ApprovalRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Retry-safe replay support (master plan §3 slice 5). Requires
+    /// `session_id` — idempotency needs a session to derive tenant.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Idempotency requires a way to derive `tenant` (from the session) and
+/// `source_system` (from the verified credential); refuse before touching
+/// the store when either is unavailable. Both checks are typed 400s, not
+/// retryable — the caller must fix the request, not retry it.
+fn idempotency_precondition(
+    idempotency_key: &Option<String>,
+    session_id: Option<&Uuid>,
+    source_system: Option<&str>,
+) -> Option<Response> {
+    if idempotency_key.is_none() {
+        return None;
+    }
+    if session_id.is_none() {
+        return Some(typed_error(
+            StatusCode::BAD_REQUEST,
+            "idempotency_requires_session",
+            "idempotency_key requires session_id",
+            false,
+        ));
+    }
+    if source_system.is_none() {
+        return Some(typed_error(
+            StatusCode::BAD_REQUEST,
+            "idempotency_requires_client_app_id",
+            "idempotency_key requires a credential with a client_app_id",
+            false,
+        ));
+    }
+    None
+}
+
+/// 409 for an idempotency replay whose fingerprint does not match the
+/// original request — a different payload reused the same key.
+fn idempotency_conflict() -> Response {
+    typed_error(
+        StatusCode::CONFLICT,
+        "idempotency_key_conflict",
+        "idempotency_key was reused with a different request",
+        false,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1471,42 +1522,56 @@ pub async fn rbx_tool_decision(
             false,
         );
     }
+    if let Some(resp) = idempotency_precondition(
+        &req.idempotency_key,
+        Some(&session_id),
+        caller.client_app_id.as_deref(),
+    ) {
+        return resp;
+    }
     let input = crate::ports::sessions::ToolDecision {
         session_id,
         run_id,
         tool: req.tool.clone(),
         decision: req.decision.clone(),
         metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
+        source_system: caller.client_app_id.clone().unwrap_or_default(),
+        idempotency_key: req.idempotency_key.clone(),
     };
     match state.session_store.record_tool_decision(&input) {
-        Ok(invocation_id) => {
-            emit_lifecycle(
-                &state,
-                &session_id,
-                "tool_invocation",
-                &invocation_id,
-                &format!("tool_{}:{}", req.decision, req.tool),
-                caller.subject.as_deref(),
-            );
+        Ok(outcome) => {
+            if outcome.is_new() {
+                emit_lifecycle(
+                    &state,
+                    &session_id,
+                    "tool_invocation",
+                    &outcome.id(),
+                    &format!("tool_{}:{}", req.decision, req.tool),
+                    caller.subject.as_deref(),
+                );
+            }
             if let Some(resp) = durable_audit_guard(&state) {
                 return resp;
             }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
-                    "invocation_id": invocation_id,
+                    "invocation_id": outcome.id(),
                     "decision": req.decision,
                 })),
             )
                 .into_response()
         }
-        Err(err) if err == "unknown_session" => typed_error(
+        Err(crate::ports::sessions::RecordToolDecisionError::UnknownSession) => typed_error(
             StatusCode::NOT_FOUND,
             "unknown_session",
             "no session with this id",
             false,
         ),
-        Err(err) => store_error(&err),
+        Err(crate::ports::sessions::RecordToolDecisionError::IdempotencyConflict) => {
+            idempotency_conflict()
+        }
+        Err(crate::ports::sessions::RecordToolDecisionError::Store(err)) => store_error(&err),
     }
 }
 
@@ -1541,6 +1606,13 @@ pub async fn rbx_approval(
             false,
         );
     };
+    if let Some(resp) = idempotency_precondition(
+        &req.idempotency_key,
+        session_id.as_ref(),
+        caller.client_app_id.as_deref(),
+    ) {
+        return resp;
+    }
     let input = crate::ports::sessions::ApprovalInput {
         session_id,
         run_id,
@@ -1549,32 +1621,45 @@ pub async fn rbx_approval(
         decision: req.decision.clone(),
         reason: req.reason.clone(),
         metadata: req.metadata.unwrap_or_else(|| serde_json::json!({})),
+        source_system: caller.client_app_id.clone().unwrap_or_default(),
+        idempotency_key: req.idempotency_key.clone(),
     };
     match state.session_store.record_approval(&input) {
-        Ok(approval_id) => {
-            let stream = session_id.unwrap_or(approval_id);
-            emit_lifecycle(
-                &state,
-                &stream,
-                "approval",
-                &approval_id,
-                &format!("approval_{}", req.decision),
-                Some(&approver),
-            );
+        Ok(outcome) => {
+            if outcome.is_new() {
+                let stream = session_id.unwrap_or(outcome.id());
+                emit_lifecycle(
+                    &state,
+                    &stream,
+                    "approval",
+                    &outcome.id(),
+                    &format!("approval_{}", req.decision),
+                    Some(&approver),
+                );
+            }
             if let Some(resp) = durable_audit_guard(&state) {
                 return resp;
             }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
-                    "approval_id": approval_id,
+                    "approval_id": outcome.id(),
                     "approver": approver,
                     "decision": req.decision,
                 })),
             )
                 .into_response()
         }
-        Err(err) => store_error(&err),
+        Err(crate::ports::sessions::RecordApprovalError::UnknownSession) => typed_error(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "no session with this id",
+            false,
+        ),
+        Err(crate::ports::sessions::RecordApprovalError::IdempotencyConflict) => {
+            idempotency_conflict()
+        }
+        Err(crate::ports::sessions::RecordApprovalError::Store(err)) => store_error(&err),
     }
 }
 

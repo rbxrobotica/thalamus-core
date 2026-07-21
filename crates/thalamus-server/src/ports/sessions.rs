@@ -9,7 +9,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use thalamus_core::{
-    BudgetLine, RunRecord, RunStatus, SessionLimits, SessionRecord, SessionStatus,
+    ApprovalFingerprint, BudgetLine, RecordOutcome, RunRecord, RunStatus, SessionLimits,
+    SessionRecord, SessionStatus, ToolDecisionFingerprint,
 };
 
 /// Input for session creation (principal/token come from the verified caller,
@@ -63,6 +64,11 @@ pub struct ToolDecision {
     /// `allowed` | `denied` (recorded verbatim as the invocation status).
     pub decision: String,
     pub metadata: serde_json::Value,
+    /// The caller's verified `client_app_id`. Only meaningful when
+    /// `idempotency_key` is set — it scopes the idempotency key alongside
+    /// `tenant` (derived from the session, never the body).
+    pub source_system: String,
+    pub idempotency_key: Option<String>,
 }
 
 /// Approval record (§3 `POST /rbx/v1/approvals`). The approver always comes
@@ -75,6 +81,33 @@ pub struct ApprovalInput {
     pub decision: String,
     pub reason: Option<String>,
     pub metadata: serde_json::Value,
+    /// The caller's verified `client_app_id`. Only meaningful when
+    /// `idempotency_key` is set.
+    pub source_system: String,
+    /// When set, `session_id` must also be set (the caller refuses the
+    /// request otherwise) — idempotency needs a session to derive `tenant`.
+    pub idempotency_key: Option<String>,
+}
+
+/// Why recording a tool decision was refused.
+#[derive(Debug)]
+pub enum RecordToolDecisionError {
+    UnknownSession,
+    /// A replay of `idempotency_key` whose fingerprint does not match the
+    /// original request.
+    IdempotencyConflict,
+    Store(String),
+}
+
+/// Why recording an approval was refused.
+#[derive(Debug)]
+pub enum RecordApprovalError {
+    /// `idempotency_key` was set but `session_id` is missing or unknown.
+    UnknownSession,
+    /// A replay of `idempotency_key` whose fingerprint does not match the
+    /// original request.
+    IdempotencyConflict,
+    Store(String),
 }
 
 /// Evidence reference (§3 `POST /rbx/v1/evidence`): a pointer + content hash,
@@ -97,11 +130,18 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<RunRecord, CreateRunError>;
     fn cancel_run(&self, run_id: &Uuid) -> Result<Option<RunRecord>, String>;
     fn session_limits(&self, id: &Uuid) -> Result<Option<SessionLimits>, String>;
-    /// Record a tool decision. Errors with "unknown_session" when the session
-    /// does not exist. Returns the invocation id.
-    fn record_tool_decision(&self, input: &ToolDecision) -> Result<Uuid, String>;
-    /// Record an approval. Returns the approval id.
-    fn record_approval(&self, input: &ApprovalInput) -> Result<Uuid, String>;
+    /// Record a tool decision. Refused with `UnknownSession` when the
+    /// session does not exist. When `input.idempotency_key` is set, a
+    /// replay with an identical fingerprint returns `RecordOutcome::Replayed`
+    /// (no new row, no new lifecycle event); a replay with a different
+    /// fingerprint is refused as `IdempotencyConflict`.
+    fn record_tool_decision(
+        &self,
+        input: &ToolDecision,
+    ) -> Result<RecordOutcome, RecordToolDecisionError>;
+    /// Record an approval. Same idempotent-replay semantics as
+    /// `record_tool_decision` when `input.idempotency_key` is set.
+    fn record_approval(&self, input: &ApprovalInput) -> Result<RecordOutcome, RecordApprovalError>;
     /// Record an evidence reference. Returns the evidence id.
     fn record_evidence(&self, input: &EvidenceInput) -> Result<Uuid, String>;
     /// Load a run together with its owning session (ownership checks I2/I4).
@@ -138,7 +178,11 @@ struct MemState {
     run_idempotency: HashMap<String, Uuid>,
     budgets: Vec<MemBudget>,
     tool_decisions: Vec<(Uuid, String)>,
+    /// (tenant, source_system, idempotency_key) -> (invocation_id, fingerprint)
+    tool_decision_idempotency: HashMap<(String, String, String), (Uuid, String)>,
     approvals: Vec<(Uuid, String)>,
+    /// (tenant, source_system, idempotency_key) -> (approval_id, fingerprint)
+    approval_idempotency: HashMap<(String, String, String), (Uuid, String)>,
     evidence: Vec<(Uuid, String)>,
 }
 
@@ -303,21 +347,84 @@ impl SessionStore for InMemorySessionStore {
         }))
     }
 
-    fn record_tool_decision(&self, input: &ToolDecision) -> Result<Uuid, String> {
+    fn record_tool_decision(
+        &self,
+        input: &ToolDecision,
+    ) -> Result<RecordOutcome, RecordToolDecisionError> {
         let mut state = self.state.lock().unwrap();
-        if !state.sessions.contains_key(&input.session_id) {
-            return Err("unknown_session".to_owned());
+        let Some(session) = state.sessions.get(&input.session_id) else {
+            return Err(RecordToolDecisionError::UnknownSession);
+        };
+        if let Some(key) = &input.idempotency_key {
+            let tenant = session.tenant.clone();
+            let fingerprint = ToolDecisionFingerprint::new(
+                &tenant,
+                &input.source_system,
+                input.session_id,
+                input.run_id,
+                &input.tool,
+                &input.decision,
+            )
+            .hash_hex();
+            let map_key = (tenant, input.source_system.clone(), key.clone());
+            if let Some((existing_id, existing_fingerprint)) =
+                state.tool_decision_idempotency.get(&map_key).cloned()
+            {
+                return if existing_fingerprint == fingerprint {
+                    Ok(RecordOutcome::Replayed(existing_id))
+                } else {
+                    Err(RecordToolDecisionError::IdempotencyConflict)
+                };
+            }
+            let id = Uuid::new_v4();
+            state.tool_decisions.push((id, input.tool.clone()));
+            state
+                .tool_decision_idempotency
+                .insert(map_key, (id, fingerprint));
+            return Ok(RecordOutcome::Created(id));
         }
         let id = Uuid::new_v4();
         state.tool_decisions.push((id, input.tool.clone()));
-        Ok(id)
+        Ok(RecordOutcome::Created(id))
     }
 
-    fn record_approval(&self, input: &ApprovalInput) -> Result<Uuid, String> {
+    fn record_approval(&self, input: &ApprovalInput) -> Result<RecordOutcome, RecordApprovalError> {
         let mut state = self.state.lock().unwrap();
+        if let Some(key) = &input.idempotency_key {
+            let Some(session_id) = input.session_id else {
+                return Err(RecordApprovalError::UnknownSession);
+            };
+            let Some(session) = state.sessions.get(&session_id) else {
+                return Err(RecordApprovalError::UnknownSession);
+            };
+            let tenant = session.tenant.clone();
+            let fingerprint = ApprovalFingerprint::new(
+                &tenant,
+                &input.source_system,
+                session_id,
+                input.run_id,
+                &input.subject,
+                &input.decision,
+            )
+            .hash_hex();
+            let map_key = (tenant, input.source_system.clone(), key.clone());
+            if let Some((existing_id, existing_fingerprint)) =
+                state.approval_idempotency.get(&map_key).cloned()
+            {
+                return if existing_fingerprint == fingerprint {
+                    Ok(RecordOutcome::Replayed(existing_id))
+                } else {
+                    Err(RecordApprovalError::IdempotencyConflict)
+                };
+            }
+            let id = Uuid::new_v4();
+            state.approvals.push((id, input.subject.clone()));
+            state.approval_idempotency.insert(map_key, (id, fingerprint));
+            return Ok(RecordOutcome::Created(id));
+        }
         let id = Uuid::new_v4();
         state.approvals.push((id, input.subject.clone()));
-        Ok(id)
+        Ok(RecordOutcome::Created(id))
     }
 
     fn record_evidence(&self, input: &EvidenceInput) -> Result<Uuid, String> {
@@ -511,22 +618,34 @@ impl SessionStore for thalamus_postgres_adapter::PostgresAudit {
             .map_err(|e| e.to_string())
     }
 
-    fn record_tool_decision(&self, input: &ToolDecision) -> Result<Uuid, String> {
-        match thalamus_postgres_adapter::PostgresAudit::record_tool_decision(
+    fn record_tool_decision(
+        &self,
+        input: &ToolDecision,
+    ) -> Result<RecordOutcome, RecordToolDecisionError> {
+        thalamus_postgres_adapter::PostgresAudit::record_tool_decision(
             self,
             &input.session_id,
             input.run_id.as_ref(),
             &input.tool,
             &input.decision,
             &input.metadata,
-        ) {
-            Ok(Some(id)) => Ok(id),
-            Ok(None) => Err("unknown_session".to_owned()),
-            Err(e) => Err(e.to_string()),
-        }
+            &input.source_system,
+            input.idempotency_key.as_deref(),
+        )
+        .map_err(|e| match e {
+            thalamus_postgres_adapter::RecordToolDecisionError::UnknownSession => {
+                RecordToolDecisionError::UnknownSession
+            }
+            thalamus_postgres_adapter::RecordToolDecisionError::IdempotencyConflict => {
+                RecordToolDecisionError::IdempotencyConflict
+            }
+            thalamus_postgres_adapter::RecordToolDecisionError::Store(err) => {
+                RecordToolDecisionError::Store(err.to_string())
+            }
+        })
     }
 
-    fn record_approval(&self, input: &ApprovalInput) -> Result<Uuid, String> {
+    fn record_approval(&self, input: &ApprovalInput) -> Result<RecordOutcome, RecordApprovalError> {
         thalamus_postgres_adapter::PostgresAudit::record_approval(
             self,
             &thalamus_postgres_adapter::ApprovalRecordInput {
@@ -537,9 +656,21 @@ impl SessionStore for thalamus_postgres_adapter::PostgresAudit {
                 decision: &input.decision,
                 reason: input.reason.as_deref(),
                 metadata: &input.metadata,
+                source_system: &input.source_system,
+                idempotency_key: input.idempotency_key.as_deref(),
             },
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| match e {
+            thalamus_postgres_adapter::RecordApprovalError::UnknownSession => {
+                RecordApprovalError::UnknownSession
+            }
+            thalamus_postgres_adapter::RecordApprovalError::IdempotencyConflict => {
+                RecordApprovalError::IdempotencyConflict
+            }
+            thalamus_postgres_adapter::RecordApprovalError::Store(err) => {
+                RecordApprovalError::Store(err.to_string())
+            }
+        })
     }
 
     fn record_evidence(&self, input: &EvidenceInput) -> Result<Uuid, String> {
