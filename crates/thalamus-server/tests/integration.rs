@@ -1828,6 +1828,404 @@ async fn rbx_governance_records_tool_decision_approval_evidence() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+// === Governance idempotency (master plan §3 slice 5) ===
+
+fn session_request_for_tenant(tenant: &str) -> Value {
+    json!({
+        "tenant": tenant,
+        "product": "kulinaryos",
+        "workflow": "coding",
+        "governance_mode": "governed_llm_access",
+    })
+}
+
+fn rbx_lifecycle_app_with_verifier(
+    verifier: StaticCredentialVerifier,
+) -> (axum::Router, Arc<InMemorySessionStore>) {
+    let store = Arc::new(InMemorySessionStore::new());
+    let app = app::build_with_rbx_api_and_sessions(
+        make_config(vec![test_policy()]),
+        Arc::new(verifier),
+        store.clone() as SharedSessionStore,
+    );
+    (app, store)
+}
+
+#[tokio::test]
+async fn rbx_tool_decision_idempotency_replay_returns_same_invocation() {
+    let (app, _store) = rbx_lifecycle_app();
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+    let key = uuid::Uuid::new_v4().to_string();
+
+    let (status1, body1) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id, "tool": "shell", "decision": "denied",
+            "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::CREATED);
+
+    // Replay: same key, same identity fields, different metadata (excluded
+    // from the fingerprint) -> same invocation, still 201.
+    let (status2, body2) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id, "tool": "shell", "decision": "denied",
+            "idempotency_key": key, "metadata": { "retry": true },
+        }),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CREATED);
+    assert_eq!(
+        body1["invocation_id"], body2["invocation_id"],
+        "replay must return the original invocation, not a new one"
+    );
+}
+
+#[tokio::test]
+async fn rbx_tool_decision_idempotency_conflict_returns_409() {
+    let (app, _store) = rbx_lifecycle_app();
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+    let key = uuid::Uuid::new_v4().to_string();
+
+    let (status1, _) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id, "tool": "shell", "decision": "denied",
+            "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::CREATED);
+
+    // Same key, different decision -> different fingerprint -> refused.
+    let (status2, body2) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id, "tool": "shell", "decision": "allowed",
+            "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CONFLICT);
+    assert_eq!(body2["error"]["code"], "idempotency_key_conflict");
+    assert_eq!(body2["error"]["retryable"], false);
+}
+
+#[tokio::test]
+async fn rbx_tool_decision_idempotency_scoped_by_tenant_and_source_system() {
+    let verifier = StaticCredentialVerifier::with_valid(
+        "rbxsess_leandro",
+        rbx_caller("ldamasio@gmail.com", &["kulinaryos:access"]),
+    )
+    .and_valid(
+        "rbxsess_other_app",
+        VerifiedCaller {
+            client_app_id: Some("other-app".to_owned()),
+            ..rbx_caller("other@example.com", &["kulinaryos:access"])
+        },
+    );
+    let (app, _store) = rbx_lifecycle_app_with_verifier(verifier);
+
+    // Two sessions under distinct tenants.
+    let (_, session_a) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request_for_tenant("tenant-a"),
+    )
+    .await;
+    let session_a_id = session_a["session_id"].as_str().unwrap().to_owned();
+    let (_, session_b) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request_for_tenant("tenant-b"),
+    )
+    .await;
+    let session_b_id = session_b["session_id"].as_str().unwrap().to_owned();
+
+    let key = uuid::Uuid::new_v4().to_string();
+    let (status_a, body_a) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_a_id, "tool": "shell", "decision": "denied",
+            "idempotency_key": key,
+        }),
+    )
+    .await;
+    let (status_b, body_b) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_b_id, "tool": "shell", "decision": "denied",
+            "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status_a, StatusCode::CREATED);
+    assert_eq!(status_b, StatusCode::CREATED);
+    assert_ne!(
+        body_a["invocation_id"], body_b["invocation_id"],
+        "same key under different tenants must not collide"
+    );
+
+    // Same tenant (tenant-a), same key, different caller (different
+    // source_system) must also not collide.
+    let (status_c, body_c) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_other_app"),
+        json!({
+            "session_id": session_a_id, "tool": "shell", "decision": "denied",
+            "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status_c, StatusCode::CREATED);
+    assert_ne!(body_a["invocation_id"], body_c["invocation_id"]);
+}
+
+#[tokio::test]
+async fn rbx_tool_decision_idempotency_ignores_tenant_and_source_system_in_body() {
+    let (app, _store) = rbx_lifecycle_app();
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+    let key = uuid::Uuid::new_v4().to_string();
+
+    let (status1, body1) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id, "tool": "shell", "decision": "denied",
+            "idempotency_key": key,
+            "tenant": "attacker-tenant", "source_system": "attacker-app",
+        }),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::CREATED);
+
+    // Same key, same real session/caller, but a *different* forged
+    // tenant/source_system in the body. If those body fields were honored,
+    // this would land in a different scope and succeed as a fresh insert. It
+    // must instead resolve to the same invocation: proof the body values are
+    // structurally ignored (ToolDecisionRequest has no such fields).
+    let (status2, body2) = post_json_with_auth(
+        &app,
+        "/rbx/v1/tool-decisions",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id, "tool": "shell", "decision": "denied",
+            "idempotency_key": key,
+            "tenant": "another-attacker-tenant", "source_system": "another-attacker-app",
+        }),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CREATED);
+    assert_eq!(body1["invocation_id"], body2["invocation_id"]);
+}
+
+#[tokio::test]
+async fn rbx_tool_decision_idempotency_emits_lifecycle_once() {
+    let (app, _store) = rbx_lifecycle_app();
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+    let key = uuid::Uuid::new_v4().to_string();
+
+    for _ in 0..3 {
+        let (status, _) = post_json_with_auth(
+            &app,
+            "/rbx/v1/tool-decisions",
+            Some("rbxsess_leandro"),
+            json!({
+                "session_id": session_id, "tool": "shell", "decision": "denied",
+                "idempotency_key": key,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, body) =
+        send_with_auth(app.clone(), "GET", &format!("/v1/audit/{session_id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = body["events"].as_array().cloned().unwrap_or_default();
+    let lifecycle_count = events
+        .iter()
+        .filter(|e| e["kind"] == "Lifecycle" && e["details"]["entity_type"] == "tool_invocation")
+        .count();
+    assert_eq!(
+        lifecycle_count, 1,
+        "3 identical replays must emit exactly one lifecycle event, got: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn rbx_approval_idempotency_requires_session_id() {
+    let (app, _store) = rbx_lifecycle_app();
+    let key = uuid::Uuid::new_v4().to_string();
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        "/rbx/v1/approvals",
+        Some("rbxsess_leandro"),
+        json!({
+            "subject": "patch:abc123", "decision": "approved", "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "idempotency_requires_session");
+}
+
+#[tokio::test]
+async fn rbx_approval_idempotency_unknown_session_is_404() {
+    let (app, _store) = rbx_lifecycle_app();
+    let key = uuid::Uuid::new_v4().to_string();
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        "/rbx/v1/approvals",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": uuid::Uuid::new_v4().to_string(),
+            "subject": "patch:abc123", "decision": "approved", "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_session");
+}
+
+#[tokio::test]
+async fn rbx_approval_idempotency_replay_and_conflict() {
+    let (app, _store) = rbx_lifecycle_app();
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_leandro"),
+        session_request(),
+    )
+    .await;
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+    let key = uuid::Uuid::new_v4().to_string();
+
+    let (status1, body1) = post_json_with_auth(
+        &app,
+        "/rbx/v1/approvals",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id, "subject": "patch:abc123", "decision": "approved",
+            "reason": "looks good", "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::CREATED);
+
+    // Replay: same identity fields, different reason (excluded from the
+    // fingerprint) -> same approval.
+    let (status2, body2) = post_json_with_auth(
+        &app,
+        "/rbx/v1/approvals",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id, "subject": "patch:abc123", "decision": "approved",
+            "reason": "a completely different reason", "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CREATED);
+    assert_eq!(body1["approval_id"], body2["approval_id"]);
+
+    // Same key, different decision -> conflict.
+    let (status3, body3) = post_json_with_auth(
+        &app,
+        "/rbx/v1/approvals",
+        Some("rbxsess_leandro"),
+        json!({
+            "session_id": session_id, "subject": "patch:abc123", "decision": "rejected",
+            "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status3, StatusCode::CONFLICT);
+    assert_eq!(body3["error"]["code"], "idempotency_key_conflict");
+}
+
+#[tokio::test]
+async fn rbx_approval_idempotency_requires_client_app_id() {
+    let verifier = StaticCredentialVerifier::with_valid(
+        "rbxsess_no_app",
+        VerifiedCaller {
+            client_app_id: None,
+            ..rbx_caller("ldamasio@gmail.com", &["kulinaryos:access"])
+        },
+    );
+    let (app, _store) = rbx_lifecycle_app_with_verifier(verifier);
+    let (_, session) = post_json_with_auth(
+        &app,
+        "/rbx/v1/sessions",
+        Some("rbxsess_no_app"),
+        session_request(),
+    )
+    .await;
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+    let key = uuid::Uuid::new_v4().to_string();
+
+    let (status, body) = post_json_with_auth(
+        &app,
+        "/rbx/v1/approvals",
+        Some("rbxsess_no_app"),
+        json!({
+            "session_id": session_id, "subject": "patch:abc123", "decision": "approved",
+            "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "idempotency_requires_client_app_id");
+}
+
 #[tokio::test]
 async fn rbx_rate_limit_returns_typed_429_with_retry_after() {
     use thalamus_server::rate_limit::RateLimiter;

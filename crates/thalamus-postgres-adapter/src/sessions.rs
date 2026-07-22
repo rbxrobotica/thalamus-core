@@ -11,12 +11,16 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use thalamus_core::{
-    BudgetLine, RunRecord, RunStatus, SessionLimits, SessionRecord, SessionStatus,
+    ApprovalFingerprint, BudgetLine, RecordOutcome, RunRecord, RunStatus, SessionLimits,
+    SessionRecord, SessionStatus, ToolDecisionFingerprint,
 };
 
 use crate::{off_runtime, AuditStoreError, PostgresAudit};
 
-/// Approval record input (§3).
+/// Approval record input (§3). `source_system` and `idempotency_key` are the
+/// governance-idempotency extension (master plan §3 slice 5): when
+/// `idempotency_key` is set, `session_id` must also be set — the caller
+/// (`rbx_approval`) refuses the request before it ever reaches the store.
 pub struct ApprovalRecordInput<'a> {
     pub session_id: Option<&'a Uuid>,
     pub run_id: Option<&'a Uuid>,
@@ -25,6 +29,30 @@ pub struct ApprovalRecordInput<'a> {
     pub decision: &'a str,
     pub reason: Option<&'a str>,
     pub metadata: &'a serde_json::Value,
+    pub source_system: &'a str,
+    pub idempotency_key: Option<&'a str>,
+}
+
+/// Why recording a tool decision was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordToolDecisionError {
+    #[error("unknown session")]
+    UnknownSession,
+    #[error("idempotency key conflict: request does not match the original")]
+    IdempotencyConflict,
+    #[error(transparent)]
+    Store(#[from] AuditStoreError),
+}
+
+/// Why recording an approval was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordApprovalError {
+    #[error("unknown session")]
+    UnknownSession,
+    #[error("idempotency key conflict: request does not match the original")]
+    IdempotencyConflict,
+    #[error(transparent)]
+    Store(#[from] AuditStoreError),
 }
 
 /// Input for session creation.
@@ -284,6 +312,15 @@ impl PostgresAudit {
 
     /// Record a governed tool-invocation decision (§3). Returns `None` when
     /// the session does not exist.
+    ///
+    /// When `idempotency_key` is set, the insert is scoped-unique on
+    /// `(tenant, source_system, idempotency_key)` (tenant from the owning
+    /// session, source_system from the caller's verified credential): a
+    /// replay with an identical fingerprint returns the original row
+    /// (`RecordOutcome::Replayed`); a replay with a different fingerprint is
+    /// refused as `IdempotencyConflict`. Without `idempotency_key`, behavior
+    /// is unchanged from the original contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_tool_decision(
         &self,
         session_id: &Uuid,
@@ -291,34 +328,173 @@ impl PostgresAudit {
         tool: &str,
         decision: &str,
         metadata: &serde_json::Value,
-    ) -> Result<Option<Uuid>, AuditStoreError> {
+        source_system: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<RecordOutcome, RecordToolDecisionError> {
         off_runtime(|| {
-            let mut conn = self.pool.get()?;
-            let mut tx = conn.transaction()?;
-            if session_by_id(&mut tx, session_id)?.is_none() {
-                tx.commit()?;
-                return Ok(None);
+            let mut conn = self.pool.get().map_err(AuditStoreError::from)?;
+            let mut tx = conn.transaction().map_err(AuditStoreError::from)?;
+            let Some(session) =
+                session_by_id(&mut tx, session_id).map_err(AuditStoreError::from)?
+            else {
+                return Err(RecordToolDecisionError::UnknownSession);
+            };
+
+            if let Some(key) = idempotency_key {
+                let tenant = session.tenant.as_str();
+                let hash = ToolDecisionFingerprint::new(
+                    tenant,
+                    source_system,
+                    *session_id,
+                    run_id.copied(),
+                    tool,
+                    decision,
+                )
+                .hash_hex();
+                let id = Uuid::new_v4();
+                let inserted = tx
+                    .query_opt(
+                        "INSERT INTO tool_invocations
+                            (invocation_id, run_id, tool, status, completed_at, metadata,
+                             tenant, source_system, idempotency_key, request_fingerprint)
+                         VALUES ($1, $2, $3, $4, now(), $5, $6, $7, $8, $9)
+                         ON CONFLICT (tenant, source_system, idempotency_key)
+                             WHERE idempotency_key IS NOT NULL
+                             DO NOTHING
+                         RETURNING invocation_id",
+                        &[
+                            &id,
+                            &run_id,
+                            &tool,
+                            &decision,
+                            metadata,
+                            &tenant,
+                            &source_system,
+                            &key,
+                            &hash,
+                        ],
+                    )
+                    .map_err(AuditStoreError::from)?;
+                if let Some(row) = inserted {
+                    tx.commit().map_err(AuditStoreError::from)?;
+                    return Ok(RecordOutcome::Created(row.get(0)));
+                }
+                let existing = tx
+                    .query_one(
+                        "SELECT invocation_id, request_fingerprint FROM tool_invocations
+                         WHERE tenant = $1 AND source_system = $2 AND idempotency_key = $3",
+                        &[&tenant, &source_system, &key],
+                    )
+                    .map_err(AuditStoreError::from)?;
+                tx.commit().map_err(AuditStoreError::from)?;
+                let existing_id: Uuid = existing.get(0);
+                let existing_fingerprint: Option<String> = existing.get(1);
+                return if existing_fingerprint.as_deref() == Some(hash.as_str()) {
+                    Ok(RecordOutcome::Replayed(existing_id))
+                } else {
+                    Err(RecordToolDecisionError::IdempotencyConflict)
+                };
             }
+
             let id = Uuid::new_v4();
             tx.execute(
                 "INSERT INTO tool_invocations
                     (invocation_id, run_id, tool, status, completed_at, metadata)
                  VALUES ($1, $2, $3, $4, now(), $5)",
                 &[&id, &run_id, &tool, &decision, metadata],
-            )?;
-            tx.commit()?;
-            Ok(Some(id))
+            )
+            .map_err(AuditStoreError::from)?;
+            tx.commit().map_err(AuditStoreError::from)?;
+            Ok(RecordOutcome::Created(id))
         })
     }
 
     /// Record an approval (§3). The approver comes from the verified
     /// credential upstream.
+    ///
+    /// When `input.idempotency_key` is set, `input.session_id` must also be
+    /// set (enforced by the caller before this is reached): the session is
+    /// looked up inside a transaction — unlike the no-key path below, which
+    /// never validates `session_id` — and the insert is scoped-unique on
+    /// `(tenant, source_system, idempotency_key)`, same replay/conflict
+    /// semantics as [`PostgresAudit::record_tool_decision`]. Without
+    /// `idempotency_key`, behavior is unchanged from the original contract.
     pub fn record_approval(
         &self,
         input: &ApprovalRecordInput<'_>,
-    ) -> Result<Uuid, AuditStoreError> {
+    ) -> Result<RecordOutcome, RecordApprovalError> {
         off_runtime(|| {
-            let mut conn = self.pool.get()?;
+            if let Some(key) = input.idempotency_key {
+                let Some(session_id) = input.session_id else {
+                    return Err(RecordApprovalError::UnknownSession);
+                };
+                let mut conn = self.pool.get().map_err(AuditStoreError::from)?;
+                let mut tx = conn.transaction().map_err(AuditStoreError::from)?;
+                let Some(session) =
+                    session_by_id(&mut tx, session_id).map_err(AuditStoreError::from)?
+                else {
+                    return Err(RecordApprovalError::UnknownSession);
+                };
+                let tenant = session.tenant.as_str();
+                let hash = ApprovalFingerprint::new(
+                    tenant,
+                    input.source_system,
+                    *session_id,
+                    input.run_id.copied(),
+                    input.subject,
+                    input.decision,
+                )
+                .hash_hex();
+                let id = Uuid::new_v4();
+                let inserted = tx
+                    .query_opt(
+                        "INSERT INTO approvals
+                            (approval_id, session_id, run_id, subject, approver, decision,
+                             reason, metadata, tenant, source_system, idempotency_key,
+                             request_fingerprint)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                         ON CONFLICT (tenant, source_system, idempotency_key)
+                             WHERE idempotency_key IS NOT NULL
+                             DO NOTHING
+                         RETURNING approval_id",
+                        &[
+                            &id,
+                            &input.session_id,
+                            &input.run_id,
+                            &input.subject,
+                            &input.approver,
+                            &input.decision,
+                            &input.reason,
+                            input.metadata,
+                            &tenant,
+                            &input.source_system,
+                            &key,
+                            &hash,
+                        ],
+                    )
+                    .map_err(AuditStoreError::from)?;
+                if let Some(row) = inserted {
+                    tx.commit().map_err(AuditStoreError::from)?;
+                    return Ok(RecordOutcome::Created(row.get(0)));
+                }
+                let existing = tx
+                    .query_one(
+                        "SELECT approval_id, request_fingerprint FROM approvals
+                         WHERE tenant = $1 AND source_system = $2 AND idempotency_key = $3",
+                        &[&tenant, &input.source_system, &key],
+                    )
+                    .map_err(AuditStoreError::from)?;
+                tx.commit().map_err(AuditStoreError::from)?;
+                let existing_id: Uuid = existing.get(0);
+                let existing_fingerprint: Option<String> = existing.get(1);
+                return if existing_fingerprint.as_deref() == Some(hash.as_str()) {
+                    Ok(RecordOutcome::Replayed(existing_id))
+                } else {
+                    Err(RecordApprovalError::IdempotencyConflict)
+                };
+            }
+
+            let mut conn = self.pool.get().map_err(AuditStoreError::from)?;
             let id = Uuid::new_v4();
             conn.execute(
                 "INSERT INTO approvals
@@ -334,8 +510,9 @@ impl PostgresAudit {
                     &input.reason,
                     input.metadata,
                 ],
-            )?;
-            Ok(id)
+            )
+            .map_err(AuditStoreError::from)?;
+            Ok(RecordOutcome::Created(id))
         })
     }
 
