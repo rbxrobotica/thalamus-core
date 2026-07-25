@@ -2060,6 +2060,17 @@ fn prepare_run_call(
     })
 }
 
+/// Cost of a run at the alias policy bound it to. The alias comes from the
+/// run record, never from the caller: the price is applied to what was
+/// actually executed.
+fn run_cost(
+    state: &Arc<AppState>,
+    prepared: &PreparedRunCall,
+    usage: &thalamus_core::BackendUsage,
+) -> thalamus_core::RunCost {
+    state.pricing.cost_of(&prepared.route.model_alias, usage)
+}
+
 /// Finalize an executed run-bound call: post-call validation, run state,
 /// budget usage and the lifecycle audit trail.
 fn finalize_run_call(
@@ -2083,10 +2094,14 @@ fn finalize_run_call(
                 state.eval_port.as_ref(),
                 state.obs_port.as_ref(),
             );
+            let cost = run_cost(state, prepared, &exec.usage);
             let outcome_meta = serde_json::json!({
                 "audit_id": audit_id,
                 "usage": exec.usage,
                 "latency_ms": exec.latency_ms,
+                "cost_micros": cost.cost_micros,
+                "cost_basis": cost.cost_basis,
+                "cost_currency": cost.currency,
                 "post_call_status": format!("{:?}", post_result.status),
             });
             if let Err(err) = state.session_store.finish_run_execution(
@@ -2128,10 +2143,19 @@ fn finalize_run_call(
                 }
                 _ => None,
             };
+            // A run that timed out or was cancelled still consumed tokens, so
+            // it still has a cost. Pricing the partial usage keeps the ledger
+            // complete instead of leaving failures free.
+            let cost = partial_usage
+                .as_ref()
+                .map(|usage| run_cost(state, prepared, usage));
             let outcome_meta = serde_json::json!({
                 "audit_id": audit_id,
                 "backend_error": err.code(),
                 "partial_usage": partial_usage,
+                "cost_micros": cost.as_ref().and_then(|c| c.cost_micros),
+                "cost_basis": cost.as_ref().map(|c| c.cost_basis.clone()),
+                "cost_currency": cost.as_ref().and_then(|c| c.currency.clone()),
             });
             if let Err(store_err) = state.session_store.finish_run_execution(
                 &prepared.run_id,

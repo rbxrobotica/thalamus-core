@@ -48,6 +48,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0005_governance_idempotency",
         include_str!("../migrations/0005_governance_idempotency.sql"),
     ),
+    (
+        "0006_run_ledger",
+        include_str!("../migrations/0006_run_ledger.sql"),
+    ),
 ];
 
 /// The sync `postgres` client drives its own internal tokio runtime; calling

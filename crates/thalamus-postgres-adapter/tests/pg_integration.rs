@@ -208,6 +208,107 @@ fn new_session_input(idempotency_key: Option<&str>) -> NewSessionInput {
     }
 }
 
+/// The ledger is what answers the audit question, so it must project every
+/// column the governed path promises: who, which session, which model, tokens,
+/// latency and cost.
+#[test]
+fn run_ledger_projects_the_audited_columns() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let session = store
+        .create_session(&new_session_input(None))
+        .expect("create session");
+    let run = store
+        .create_run(&session.session_id, Some("coding.standard"), None)
+        .expect("create run");
+    store
+        .finish_run_execution(
+            &run.run_id,
+            "completed",
+            &serde_json::json!({
+                "audit_id": "audit-ledger",
+                "usage": {"prompt_tokens": 12000, "completion_tokens": 3000, "total_tokens": 15000},
+                "latency_ms": 4200,
+                "cost_micros": 13800,
+                "cost_basis": "metered",
+                "cost_currency": "USD",
+                "post_call_status": "Valid",
+            }),
+        )
+        .expect("finalize");
+
+    let mut client =
+        postgres::Client::connect(&url, postgres::NoTls).expect("direct client for the view");
+    let row = client
+        .query_one(
+            "SELECT principal, model_alias, prompt_tokens, completion_tokens, total_tokens,
+                    latency_ms, cost_micros, cost_basis, cost_currency, status, audit_id
+             FROM run_ledger WHERE run_id = $1",
+            &[&run.run_id],
+        )
+        .expect("ledger row");
+
+    assert_eq!(
+        row.get::<_, Option<String>>(0).as_deref(),
+        Some("ldamasio@gmail.com")
+    );
+    assert_eq!(
+        row.get::<_, Option<String>>(1).as_deref(),
+        Some("coding.standard")
+    );
+    assert_eq!(row.get::<_, Option<i64>>(2), Some(12_000));
+    assert_eq!(row.get::<_, Option<i64>>(3), Some(3_000));
+    assert_eq!(row.get::<_, Option<i64>>(4), Some(15_000));
+    assert_eq!(row.get::<_, Option<i64>>(5), Some(4_200));
+    assert_eq!(row.get::<_, Option<i64>>(6), Some(13_800));
+    assert_eq!(row.get::<_, Option<String>>(7).as_deref(), Some("metered"));
+    assert_eq!(row.get::<_, Option<String>>(8).as_deref(), Some("USD"));
+    assert_eq!(row.get::<_, String>(9), "completed");
+    assert_eq!(
+        row.get::<_, Option<String>>(10).as_deref(),
+        Some("audit-ledger")
+    );
+
+    // A cancelled run still reaches the ledger, priced from its partial usage.
+    let partial = store
+        .create_run(&session.session_id, Some("coding.standard"), None)
+        .expect("create run");
+    store
+        .finish_run_execution(
+            &partial.run_id,
+            "cancelled",
+            &serde_json::json!({
+                "audit_id": "audit-partial",
+                "backend_error": "cancelled",
+                "partial_usage": {"prompt_tokens": 500, "completion_tokens": 10, "total_tokens": 510},
+                "cost_micros": 322,
+                "cost_basis": "metered",
+                "cost_currency": "USD",
+            }),
+        )
+        .expect("finalize cancelled");
+
+    let row = client
+        .query_one(
+            "SELECT total_tokens, cost_micros, backend_error, status
+             FROM run_ledger WHERE run_id = $1",
+            &[&partial.run_id],
+        )
+        .expect("ledger row for the cancelled run");
+    assert_eq!(row.get::<_, Option<i64>>(0), Some(510));
+    assert_eq!(row.get::<_, Option<i64>>(1), Some(322));
+    assert_eq!(
+        row.get::<_, Option<String>>(2).as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(row.get::<_, String>(3), "cancelled");
+}
+
 #[test]
 fn session_run_lifecycle_and_closed_session_refusal() {
     let Some(url) = test_url() else {

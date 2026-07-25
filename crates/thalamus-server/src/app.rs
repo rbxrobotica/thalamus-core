@@ -39,6 +39,9 @@ pub struct AppState {
     /// Inbound credential verifier for the gated `/rbx/v1/*` surface. `None`
     /// means `THALAMUS_RBX_API` is off and no `/rbx/v1/*` routes are mounted.
     pub credential_verifier: Option<Arc<dyn auth::CredentialVerifier + Send + Sync>>,
+    /// Model alias to price, so every finalized run carries a cost alongside
+    /// its tokens and latency. Empty book = every run recorded `unpriced`.
+    pub pricing: Arc<thalamus_core::PriceBook>,
 }
 
 #[allow(
@@ -67,6 +70,7 @@ pub fn build(config: ServerConfig) -> Router {
         eval_store,
         credential_verifier: None,
         rate_limiter: default_rate_limiter(),
+        pricing: default_price_book(),
     });
 
     build_router(state)
@@ -98,6 +102,7 @@ pub fn build_with_backend(
         eval_store,
         credential_verifier: None,
         rate_limiter: default_rate_limiter(),
+        pricing: default_price_book(),
     });
 
     build_router(state)
@@ -128,6 +133,7 @@ pub fn build_with_ports(
         eval_store,
         credential_verifier: None,
         rate_limiter: default_rate_limiter(),
+        pricing: default_price_book(),
     });
 
     build_router(state)
@@ -135,6 +141,19 @@ pub fn build_with_ports(
 
 /// Body limit for the governed /rbx/v1/* surface (master plan §3 security).
 const RBX_BODY_LIMIT_BYTES: usize = 256 * 1024;
+
+/// Price book from `THALAMUS_MODEL_PRICES`. A malformed book aborts the boot:
+/// running with prices silently dropped would write an audit trail whose cost
+/// column is wrong rather than absent.
+fn default_price_book() -> Arc<thalamus_core::PriceBook> {
+    match thalamus_core::PriceBook::from_env() {
+        Ok(book) => Arc::new(book),
+        Err(err) => {
+            eprintln!("invalid THALAMUS_MODEL_PRICES: {err}");
+            std::process::exit(1);
+        }
+    }
+}
 
 fn default_rate_limiter() -> Option<Arc<crate::rate_limit::RateLimiter>> {
     crate::rate_limit::RateLimiter::from_env().map(Arc::new)
@@ -239,6 +258,7 @@ pub fn build_with_rbx_api(
         eval_store,
         credential_verifier: Some(credential_verifier),
         rate_limiter: default_rate_limiter(),
+        pricing: default_price_book(),
     });
 
     build_router(state)
@@ -272,6 +292,7 @@ pub fn build_with_rbx_api_and_sessions(
         eval_store,
         credential_verifier: Some(credential_verifier),
         rate_limiter: default_rate_limiter(),
+        pricing: default_price_book(),
     });
 
     build_router(state)
@@ -306,6 +327,7 @@ pub fn build_with_rbx_api_sessions_backend(
         eval_store,
         credential_verifier: Some(credential_verifier),
         rate_limiter: default_rate_limiter(),
+        pricing: default_price_book(),
     });
 
     build_router(state)
@@ -340,6 +362,7 @@ pub fn build_with_rbx_api_sessions_limiter(
         eval_store,
         credential_verifier: Some(credential_verifier),
         rate_limiter,
+        pricing: default_price_book(),
     });
 
     build_router(state)
@@ -376,6 +399,7 @@ pub fn build_with_eval_sink(
         eval_store,
         credential_verifier: None,
         rate_limiter: default_rate_limiter(),
+        pricing: default_price_book(),
     });
 
     build_router(state)
@@ -408,6 +432,7 @@ pub fn build_with_eval_inspection(
         eval_store: eval_store.clone(),
         credential_verifier: None,
         rate_limiter: default_rate_limiter(),
+        pricing: default_price_book(),
     });
 
     (build_router(state), eval_store)
