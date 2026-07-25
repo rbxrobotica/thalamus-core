@@ -1,4 +1,4 @@
--- 0005_run_ledger.sql
+-- 0006_run_ledger.sql
 -- One question, one query: what did this run cost, how long did it take, how
 -- many tokens did it burn, who asked for it, in which session, on which
 -- model. Those facts already exist, split between sessions, runs and the

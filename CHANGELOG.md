@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cost zero) and `unpriced` (no rate configured, amount deliberately absent
   rather than a fabricated zero). Timed-out and cancelled runs are priced from
   their partial usage, so failures are not free in the ledger.
-- Migration `0005_run_ledger`: view `run_ledger` joining `sessions` and `runs`
+- Migration `0006_run_ledger`: view `run_ledger` joining `sessions` and `runs`
   so one query answers who, which session, which model, how many tokens, how
   long and at what cost, without knowing the shape of `runs.metadata`.
   `SELECT` granted to `thalamus_app`; nothing about `audit_events` changes.

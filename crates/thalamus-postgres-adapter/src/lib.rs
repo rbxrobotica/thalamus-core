@@ -42,8 +42,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0004_maintenance_grants.sql"),
     ),
     (
-        "0005_run_ledger",
-        include_str!("../migrations/0005_run_ledger.sql"),
+        "0006_run_ledger",
+        include_str!("../migrations/0006_run_ledger.sql"),
     ),
 ];
 
