@@ -4,6 +4,7 @@ pub mod flow;
 pub mod lifecycle;
 pub mod policy;
 pub mod ports;
+pub mod pricing;
 pub mod routing;
 
 pub use audit::AuditEvent;
@@ -21,4 +22,8 @@ pub use lifecycle::{
 };
 pub use policy::{Budget, ContextGrant, Policy, PolicyEngine, RedactionAction, RedactionRule};
 pub use ports::{AuditPort, BackendPort, ContextPort, EvalPort, ObservabilityPort, PolicyPort};
+pub use pricing::{
+    ModelPrice, PriceBook, RunCost, COST_BASIS_METERED, COST_BASIS_SUBSCRIPTION,
+    COST_BASIS_UNPRICED,
+};
 pub use routing::{BackendCallError, BackendExecution, BackendUsage, CancelToken, RouteEnvelope};

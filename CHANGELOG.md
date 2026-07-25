@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (T2 · per-run cost and the run ledger)
+
+- `THALAMUS_MODEL_PRICES`: JSON price book mapping a policy alias to a rate,
+  e.g. `{"coding.standard":{"basis":"metered","prompt_micros_per_1m":600000,
+  "completion_micros_per_1m":2200000,"currency":"USD"},
+  "glm-test":{"basis":"subscription","currency":"USD"}}`. Rates are integer
+  micros per 1M tokens, so the arithmetic is exact and the stored amount is an
+  integer. A malformed book aborts the boot, like `THALAMUS_MODEL_MAP`.
+- Every finalized run-bound call records `cost_micros`, `cost_basis` and
+  `cost_currency` next to its usage and latency. `cost_basis` distinguishes
+  `metered` (billed per token), `subscription` (seat already paid, marginal
+  cost zero) and `unpriced` (no rate configured, amount deliberately absent
+  rather than a fabricated zero). Timed-out and cancelled runs are priced from
+  their partial usage, so failures are not free in the ledger.
+- Migration `0005_run_ledger`: view `run_ledger` joining `sessions` and `runs`
+  so one query answers who, which session, which model, how many tokens, how
+  long and at what cost, without knowing the shape of `runs.metadata`.
+  `SELECT` granted to `thalamus_app`; nothing about `audit_events` changes.
+
 ### Added (SLICE-T1 — run-bound governed calls, master plan §7 / Gate D)
 
 - `POST /rbx/v1/runs/{run_id}/calls` and `/calls/stream`: the governed way to
