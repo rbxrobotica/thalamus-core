@@ -449,20 +449,28 @@ fn governance_records_persist_on_postgres() {
             "shell",
             "denied",
             &serde_json::json!({ "cmd": "redacted" }),
+            "robson-code",
+            None,
         )
         .expect("tool decision")
-        .expect("session exists");
+        .id();
 
-    let missing = store
-        .record_tool_decision(
-            &Uuid::new_v4(),
-            None,
-            "shell",
-            "allowed",
-            &serde_json::json!({}),
-        )
-        .expect("no store error");
-    assert!(missing.is_none(), "unknown session must be refused");
+    let missing = store.record_tool_decision(
+        &Uuid::new_v4(),
+        None,
+        "shell",
+        "allowed",
+        &serde_json::json!({}),
+        "robson-code",
+        None,
+    );
+    assert!(
+        matches!(
+            missing,
+            Err(thalamus_postgres_adapter::RecordToolDecisionError::UnknownSession)
+        ),
+        "unknown session must be refused"
+    );
 
     let approval = store
         .record_approval(&thalamus_postgres_adapter::ApprovalRecordInput {
@@ -473,8 +481,11 @@ fn governance_records_persist_on_postgres() {
             decision: "approved",
             reason: Some("looks good"),
             metadata: &serde_json::json!({}),
+            source_system: "robson-code",
+            idempotency_key: None,
         })
-        .expect("approval");
+        .expect("approval")
+        .id();
 
     let evidence = store
         .record_evidence(
@@ -570,4 +581,361 @@ fn run_execution_claim_is_one_to_one_and_records_governance_mode() {
     store.cancel_run(&run2.run_id).expect("cancel");
     let refused = store.claim_run_execution(&run2.run_id);
     assert!(matches!(refused, Err(ClaimRunError::RunNotActive)));
+}
+
+// === Governance idempotency (master plan §3 slice 5) ===
+
+use thalamus_postgres_adapter::{
+    ApprovalRecordInput, RecordApprovalError, RecordToolDecisionError,
+};
+
+#[test]
+fn tool_decision_idempotency_replay_returns_original_row() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let session = store
+        .create_session(&new_session_input(None))
+        .expect("session");
+    let key = format!("k-{}", Uuid::new_v4());
+
+    let first = store
+        .record_tool_decision(
+            &session.session_id,
+            None,
+            "shell",
+            "denied",
+            &serde_json::json!({ "cmd": "redacted" }),
+            "robson-code",
+            Some(&key),
+        )
+        .expect("first insert");
+    assert!(matches!(first, thalamus_core::RecordOutcome::Created(_)));
+
+    // Identical replay: same fingerprint, no new row.
+    let second = store
+        .record_tool_decision(
+            &session.session_id,
+            None,
+            "shell",
+            "denied",
+            &serde_json::json!({ "cmd": "redacted, but metadata is excluded from the fingerprint anyway" }),
+            "robson-code",
+            Some(&key),
+        )
+        .expect("replay");
+    assert!(matches!(second, thalamus_core::RecordOutcome::Replayed(_)));
+    assert_eq!(first.id(), second.id());
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("psql");
+    let count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM tool_invocations WHERE invocation_id = $1",
+            &[&first.id()],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1, "replay must not create a second row");
+}
+
+#[test]
+fn tool_decision_idempotency_conflict_on_mismatched_payload() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let session = store
+        .create_session(&new_session_input(None))
+        .expect("session");
+    let key = format!("k-{}", Uuid::new_v4());
+
+    store
+        .record_tool_decision(
+            &session.session_id,
+            None,
+            "shell",
+            "denied",
+            &serde_json::json!({}),
+            "robson-code",
+            Some(&key),
+        )
+        .expect("first insert");
+
+    // Same key, different decision -> different fingerprint -> conflict.
+    let conflict = store.record_tool_decision(
+        &session.session_id,
+        None,
+        "shell",
+        "allowed",
+        &serde_json::json!({}),
+        "robson-code",
+        Some(&key),
+    );
+    assert!(matches!(
+        conflict,
+        Err(RecordToolDecisionError::IdempotencyConflict)
+    ));
+}
+
+#[test]
+fn tool_decision_idempotency_scoped_by_tenant_and_source_system() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    // Two sessions get distinct random tenants (new_session_input), so the
+    // same key under each session must not collide.
+    let session_a = store
+        .create_session(&new_session_input(None))
+        .expect("session a");
+    let session_b = store
+        .create_session(&new_session_input(None))
+        .expect("session b");
+    let key = format!("k-{}", Uuid::new_v4());
+
+    let a = store
+        .record_tool_decision(
+            &session_a.session_id,
+            None,
+            "shell",
+            "denied",
+            &serde_json::json!({}),
+            "robson-code",
+            Some(&key),
+        )
+        .expect("tenant a insert");
+    let b = store
+        .record_tool_decision(
+            &session_b.session_id,
+            None,
+            "shell",
+            "denied",
+            &serde_json::json!({}),
+            "robson-code",
+            Some(&key),
+        )
+        .expect("tenant b insert");
+    assert_ne!(a.id(), b.id(), "different tenants must not collide");
+    assert!(matches!(a, thalamus_core::RecordOutcome::Created(_)));
+    assert!(matches!(b, thalamus_core::RecordOutcome::Created(_)));
+
+    // Same tenant, same key, different source_system must also not collide.
+    let c = store
+        .record_tool_decision(
+            &session_a.session_id,
+            None,
+            "shell",
+            "denied",
+            &serde_json::json!({}),
+            "other-app",
+            Some(&key),
+        )
+        .expect("different source_system insert");
+    assert!(matches!(c, thalamus_core::RecordOutcome::Created(_)));
+    assert_ne!(a.id(), c.id());
+}
+
+#[test]
+fn tool_decision_idempotency_concurrent_requests_do_not_duplicate() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = std::sync::Arc::new(PostgresAudit::connect(&url).expect("connect"));
+
+    let session = store
+        .create_session(&new_session_input(None))
+        .expect("session");
+    let key = format!("k-{}", Uuid::new_v4());
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        let session_id = session.session_id;
+        let key = key.clone();
+        handles.push(std::thread::spawn(move || {
+            store.record_tool_decision(
+                &session_id,
+                None,
+                "shell",
+                "denied",
+                &serde_json::json!({}),
+                "robson-code",
+                Some(&key),
+            )
+        }));
+    }
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    // No result may surface a raw unique_violation: every outcome is either
+    // Created (the winner) or Replayed (everyone else), never a store error.
+    let ids: Vec<Uuid> = results
+        .into_iter()
+        .map(|r| {
+            r.expect("no unique-violation leaks past the ON CONFLICT handling")
+                .id()
+        })
+        .collect();
+    assert!(
+        ids.iter().all(|id| *id == ids[0]),
+        "all concurrent replays must resolve to the same row: {ids:?}"
+    );
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("psql");
+    let count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM tool_invocations WHERE invocation_id = $1",
+            &[&ids[0]],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1, "concurrent replays must produce exactly one row");
+}
+
+#[test]
+fn approval_idempotency_requires_and_validates_session() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    // idempotency_key present, session unknown -> UnknownSession (this is
+    // the store-level existence check; the HTTP layer additionally refuses
+    // idempotency_key without any session_id at all, before reaching here).
+    let unknown = Uuid::new_v4();
+    let key = format!("k-{}", Uuid::new_v4());
+    let refused = store.record_approval(&ApprovalRecordInput {
+        session_id: Some(&unknown),
+        run_id: None,
+        subject: "patch:abc",
+        approver: "ldamasio@gmail.com",
+        decision: "approved",
+        reason: None,
+        metadata: &serde_json::json!({}),
+        source_system: "robson-code",
+        idempotency_key: Some(&key),
+    });
+    assert!(matches!(refused, Err(RecordApprovalError::UnknownSession)));
+
+    // Valid session: replay returns the same row; a differing reason alone
+    // (excluded from the fingerprint) does not trigger a conflict.
+    let session = store
+        .create_session(&new_session_input(None))
+        .expect("session");
+    let first = store
+        .record_approval(&ApprovalRecordInput {
+            session_id: Some(&session.session_id),
+            run_id: None,
+            subject: "patch:abc",
+            approver: "ldamasio@gmail.com",
+            decision: "approved",
+            reason: Some("looks good"),
+            metadata: &serde_json::json!({}),
+            source_system: "robson-code",
+            idempotency_key: Some(&key),
+        })
+        .expect("first insert");
+    let replay = store
+        .record_approval(&ApprovalRecordInput {
+            session_id: Some(&session.session_id),
+            run_id: None,
+            subject: "patch:abc",
+            approver: "ldamasio@gmail.com",
+            decision: "approved",
+            reason: Some("a completely different reason string"),
+            metadata: &serde_json::json!({ "unrelated": true }),
+            source_system: "robson-code",
+            idempotency_key: Some(&key),
+        })
+        .expect("replay");
+    assert!(matches!(replay, thalamus_core::RecordOutcome::Replayed(_)));
+    assert_eq!(first.id(), replay.id());
+
+    // Same key, different decision -> conflict.
+    let conflict = store.record_approval(&ApprovalRecordInput {
+        session_id: Some(&session.session_id),
+        run_id: None,
+        subject: "patch:abc",
+        approver: "ldamasio@gmail.com",
+        decision: "rejected",
+        reason: None,
+        metadata: &serde_json::json!({}),
+        source_system: "robson-code",
+        idempotency_key: Some(&key),
+    });
+    assert!(matches!(
+        conflict,
+        Err(RecordApprovalError::IdempotencyConflict)
+    ));
+}
+
+#[test]
+fn governance_no_idempotency_key_is_unaffected() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let session = store
+        .create_session(&new_session_input(None))
+        .expect("session");
+
+    // Two calls with identical payload and no idempotency_key must create
+    // two independent rows — the old unscoped contract is untouched.
+    let a = store
+        .record_tool_decision(
+            &session.session_id,
+            None,
+            "shell",
+            "denied",
+            &serde_json::json!({}),
+            "robson-code",
+            None,
+        )
+        .expect("first");
+    let b = store
+        .record_tool_decision(
+            &session.session_id,
+            None,
+            "shell",
+            "denied",
+            &serde_json::json!({}),
+            "robson-code",
+            None,
+        )
+        .expect("second");
+    assert_ne!(a.id(), b.id());
+
+    // Approval without idempotency_key never validates session_id, even for
+    // an unknown one (unchanged legacy behavior).
+    let unknown = Uuid::new_v4();
+    let approval = store
+        .record_approval(&ApprovalRecordInput {
+            session_id: Some(&unknown),
+            run_id: None,
+            subject: "patch:xyz",
+            approver: "ldamasio@gmail.com",
+            decision: "approved",
+            reason: None,
+            metadata: &serde_json::json!({}),
+            source_system: "robson-code",
+            idempotency_key: None,
+        })
+        .expect("approval without idempotency_key skips session validation");
+    assert!(matches!(approval, thalamus_core::RecordOutcome::Created(_)));
 }
