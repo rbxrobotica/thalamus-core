@@ -1,5 +1,5 @@
 use crate::audit::AuditEvent;
-use crate::domain::{BackendResponse, CallRequest, ContextEntry, Envelope, PolicyDecision};
+use crate::domain::{BackendResponse, CallRequest, ContextEntry, EmbeddingError, EmbeddingRequest, EmbeddingResponse, Envelope, PolicyDecision};
 use crate::policy::{ContextGrant, Policy};
 use crate::routing::{
     BackendCallError, BackendExecution, BackendUsage, CancelToken, RouteEnvelope,
@@ -7,6 +7,12 @@ use crate::routing::{
 
 /// Stable port: backend execution. Implemented by data-plane adapters.
 /// Never a domain dependency.
+/// Stable port for governed embedding generation. Implementations belong to
+/// data-plane adapters; product code and rbx-memory never own provider transport.
+pub trait EmbeddingPort {
+    fn embed(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse, EmbeddingError>;
+}
+
 pub trait BackendPort {
     fn call(&self, envelope: &Envelope) -> BackendResponse;
 

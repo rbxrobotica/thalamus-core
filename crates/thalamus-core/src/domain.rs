@@ -154,3 +154,39 @@ pub struct BackendResponse {
     pub tokens_used: Option<u32>,
     pub latency_ms: Option<u64>,
 }
+
+/// A governed embedding request. The model alias is resolved only by the
+/// data-plane adapter; callers never see provider model names or credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    pub model_alias: String,
+    pub input: Vec<String>,
+    pub trace_id: TraceId,
+    pub audit_id: AuditId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub model_alias: String,
+    pub vectors: Vec<Vec<f32>>,
+    pub provider_metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmbeddingError {
+    InvalidRequest { detail: String },
+    Unavailable { detail: String },
+    MalformedResponse { detail: String },
+}
+
+impl std::fmt::Display for EmbeddingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest { detail } => write!(f, "invalid embedding request: {detail}"),
+            Self::Unavailable { detail } => write!(f, "embedding backend unavailable: {detail}"),
+            Self::MalformedResponse { detail } => write!(f, "malformed embedding response: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for EmbeddingError {}
