@@ -322,21 +322,48 @@ impl EmbeddingPort for LiteLLMAdapter {
         }
         let response = wire
             .send_json(serde_json::json!({ "model": wire_model, "input": request.input }))
-            .map_err(|error| EmbeddingError::Unavailable { detail: error.to_string() })?;
+            .map_err(|error| EmbeddingError::Unavailable {
+                detail: error.to_string(),
+            })?;
         let payload: serde_json::Value = response.into_body().read_json().map_err(|error| {
-            EmbeddingError::MalformedResponse { detail: error.to_string() }
+            EmbeddingError::MalformedResponse {
+                detail: error.to_string(),
+            }
         })?;
-        let mut rows = payload.get("data").and_then(|value| value.as_array()).cloned().ok_or_else(|| {
-            EmbeddingError::MalformedResponse { detail: "missing data array".to_owned() }
-        })?;
-        rows.sort_by_key(|row| row.get("index").and_then(|value| value.as_u64()).unwrap_or(u64::MAX));
-        let vectors: Result<Vec<Vec<f32>>, EmbeddingError> = rows.into_iter().map(|row| {
-            row.get("embedding").and_then(|value| value.as_array()).ok_or_else(|| {
-                EmbeddingError::MalformedResponse { detail: "embedding row missing vector".to_owned() }
-            }).and_then(|vector| vector.iter().map(|value| value.as_f64().map(|number| number as f32).ok_or_else(|| {
-                EmbeddingError::MalformedResponse { detail: "embedding vector contains non-number".to_owned() }
-            })).collect())
-        }).collect();
+        let mut rows = payload
+            .get("data")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .ok_or_else(|| EmbeddingError::MalformedResponse {
+                detail: "missing data array".to_owned(),
+            })?;
+        rows.sort_by_key(|row| {
+            row.get("index")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(u64::MAX)
+        });
+        let vectors: Result<Vec<Vec<f32>>, EmbeddingError> = rows
+            .into_iter()
+            .map(|row| {
+                row.get("embedding")
+                    .and_then(|value| value.as_array())
+                    .ok_or_else(|| EmbeddingError::MalformedResponse {
+                        detail: "embedding row missing vector".to_owned(),
+                    })
+                    .and_then(|vector| {
+                        vector
+                            .iter()
+                            .map(|value| {
+                                value.as_f64().map(|number| number as f32).ok_or_else(|| {
+                                    EmbeddingError::MalformedResponse {
+                                        detail: "embedding vector contains non-number".to_owned(),
+                                    }
+                                })
+                            })
+                            .collect()
+                    })
+            })
+            .collect();
         let vectors = vectors?;
         if vectors.len() != request.input.len() || vectors.iter().any(Vec::is_empty) {
             return Err(EmbeddingError::MalformedResponse {
@@ -345,7 +372,9 @@ impl EmbeddingPort for LiteLLMAdapter {
         }
         let dimensions = vectors[0].len();
         if vectors.iter().any(|vector| vector.len() != dimensions) {
-            return Err(EmbeddingError::MalformedResponse { detail: "embedding dimensions differ".to_owned() });
+            return Err(EmbeddingError::MalformedResponse {
+                detail: "embedding dimensions differ".to_owned(),
+            });
         }
         Ok(EmbeddingResponse {
             model_alias: request.model_alias.clone(),
