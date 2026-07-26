@@ -184,7 +184,9 @@ impl std::fmt::Display for EmbeddingError {
         match self {
             Self::InvalidRequest { detail } => write!(f, "invalid embedding request: {detail}"),
             Self::Unavailable { detail } => write!(f, "embedding backend unavailable: {detail}"),
-            Self::MalformedResponse { detail } => write!(f, "malformed embedding response: {detail}"),
+            Self::MalformedResponse { detail } => {
+                write!(f, "malformed embedding response: {detail}")
+            }
         }
     }
 }

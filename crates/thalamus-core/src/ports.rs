@@ -1,5 +1,8 @@
 use crate::audit::AuditEvent;
-use crate::domain::{BackendResponse, CallRequest, ContextEntry, EmbeddingError, EmbeddingRequest, EmbeddingResponse, Envelope, PolicyDecision};
+use crate::domain::{
+    BackendResponse, CallRequest, ContextEntry, EmbeddingError, EmbeddingRequest,
+    EmbeddingResponse, Envelope, PolicyDecision,
+};
 use crate::policy::{ContextGrant, Policy};
 use crate::routing::{
     BackendCallError, BackendExecution, BackendUsage, CancelToken, RouteEnvelope,
