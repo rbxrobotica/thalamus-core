@@ -11,8 +11,8 @@ pub mod routing;
 pub use audit::AuditEvent;
 pub use domain::{
     AuditId, BackendHandle, BackendResponse, BackendType, BudgetHint, CallRequest, CitationCheck,
-    ContextEntry, Envelope, PolicyDecision, PostCallResult, PostCallStatus, RiskLevel,
-    StrategosEvent, TraceId,
+    ContextEntry, EmbeddingError, EmbeddingRequest, EmbeddingResponse, Envelope, PolicyDecision,
+    PostCallResult, PostCallStatus, RiskLevel, StrategosEvent, TraceId,
 };
 pub use flow::{post_call, pre_call, PreCallError, PreCallOutcome};
 pub use governance_idempotency::{
@@ -26,7 +26,9 @@ pub use lifecycle::{
     RUN_EXECUTION_EXECUTED, RUN_EXECUTION_EXECUTING, RUN_EXECUTION_PENDING,
 };
 pub use policy::{Budget, ContextGrant, Policy, PolicyEngine, RedactionAction, RedactionRule};
-pub use ports::{AuditPort, BackendPort, ContextPort, EvalPort, ObservabilityPort, PolicyPort};
+pub use ports::{
+    AuditPort, BackendPort, ContextPort, EmbeddingPort, EvalPort, ObservabilityPort, PolicyPort,
+};
 pub use pricing::{
     ModelPrice, PriceBook, RunCost, COST_BASIS_METERED, COST_BASIS_SUBSCRIPTION,
     COST_BASIS_UNPRICED,

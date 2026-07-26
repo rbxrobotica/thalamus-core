@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use thalamus_core::{
     BackendCallError, BackendExecution, BackendPort, BackendResponse, BackendUsage, CancelToken,
-    Envelope, RouteEnvelope,
+    EmbeddingError, EmbeddingPort, EmbeddingRequest, EmbeddingResponse, Envelope, RouteEnvelope,
 };
 
 use config::AdapterConfig;
@@ -298,6 +298,91 @@ impl LiteLLMAdapter {
                 "endpoint": self.config.endpoint,
                 "finish_reason": finish_reason,
                 "message": if plan.chat_payload.is_some() { message } else { serde_json::Value::Null },
+            }),
+        })
+    }
+}
+
+impl EmbeddingPort for LiteLLMAdapter {
+    fn embed(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse, EmbeddingError> {
+        if request.input.is_empty() || request.input.iter().any(|value| value.trim().is_empty()) {
+            return Err(EmbeddingError::InvalidRequest {
+                detail: "input must contain one or more non-empty strings".to_owned(),
+            });
+        }
+        let url = format!("{}/v1/embeddings", self.config.endpoint);
+        let wire_model = self.config.resolve_model(&request.model_alias);
+        let mut wire = self
+            .agent
+            .post(&url)
+            .header("x-trace-id", request.trace_id.0.to_string())
+            .header("x-audit-id", request.audit_id.0.to_string());
+        if let Some(key) = &self.config.api_key {
+            wire = wire.header("authorization", format!("Bearer {key}"));
+        }
+        let response = wire
+            .send_json(serde_json::json!({ "model": wire_model, "input": request.input }))
+            .map_err(|error| EmbeddingError::Unavailable {
+                detail: error.to_string(),
+            })?;
+        let payload: serde_json::Value = response.into_body().read_json().map_err(|error| {
+            EmbeddingError::MalformedResponse {
+                detail: error.to_string(),
+            }
+        })?;
+        let mut rows = payload
+            .get("data")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .ok_or_else(|| EmbeddingError::MalformedResponse {
+                detail: "missing data array".to_owned(),
+            })?;
+        rows.sort_by_key(|row| {
+            row.get("index")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(u64::MAX)
+        });
+        let vectors: Result<Vec<Vec<f32>>, EmbeddingError> = rows
+            .into_iter()
+            .map(|row| {
+                row.get("embedding")
+                    .and_then(|value| value.as_array())
+                    .ok_or_else(|| EmbeddingError::MalformedResponse {
+                        detail: "embedding row missing vector".to_owned(),
+                    })
+                    .and_then(|vector| {
+                        vector
+                            .iter()
+                            .map(|value| {
+                                value.as_f64().map(|number| number as f32).ok_or_else(|| {
+                                    EmbeddingError::MalformedResponse {
+                                        detail: "embedding vector contains non-number".to_owned(),
+                                    }
+                                })
+                            })
+                            .collect()
+                    })
+            })
+            .collect();
+        let vectors = vectors?;
+        if vectors.len() != request.input.len() || vectors.iter().any(Vec::is_empty) {
+            return Err(EmbeddingError::MalformedResponse {
+                detail: "embedding response count or dimensions do not match request".to_owned(),
+            });
+        }
+        let dimensions = vectors[0].len();
+        if vectors.iter().any(|vector| vector.len() != dimensions) {
+            return Err(EmbeddingError::MalformedResponse {
+                detail: "embedding dimensions differ".to_owned(),
+            });
+        }
+        Ok(EmbeddingResponse {
+            model_alias: request.model_alias.clone(),
+            vectors,
+            provider_metadata: serde_json::json!({
+                "provider_pool": PROVIDER_POOL,
+                "wire_model": wire_model,
+                "dimensions": dimensions,
             }),
         })
     }
