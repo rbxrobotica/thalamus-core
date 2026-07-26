@@ -204,6 +204,8 @@ fn new_session_input(idempotency_key: Option<&str>) -> NewSessionInput {
         principal: Some("ldamasio@gmail.com".to_owned()),
         delegation_token_id: Some("jti-1".to_owned()),
         governance_mode: "governed_llm_access".to_owned(),
+        repository: Some("github.com/rbxrobotica/kulinaryos".to_owned()),
+        branch: Some("feat/kds-button".to_owned()),
         idempotency_key: idempotency_key.map(str::to_owned),
     }
 }
@@ -247,7 +249,8 @@ fn run_ledger_projects_the_audited_columns() {
     let row = client
         .query_one(
             "SELECT principal, model_alias, prompt_tokens, completion_tokens, total_tokens,
-                    latency_ms, cost_micros, cost_basis, cost_currency, status, audit_id
+                    latency_ms, cost_micros, cost_basis, cost_currency, status, audit_id,
+                    repository, branch
              FROM run_ledger WHERE run_id = $1",
             &[&run.run_id],
         )
@@ -272,6 +275,15 @@ fn run_ledger_projects_the_audited_columns() {
     assert_eq!(
         row.get::<_, Option<String>>(10).as_deref(),
         Some("audit-ledger")
+    );
+    // "On what": the repo and branch the agent worked in.
+    assert_eq!(
+        row.get::<_, Option<String>>(11).as_deref(),
+        Some("github.com/rbxrobotica/kulinaryos")
+    );
+    assert_eq!(
+        row.get::<_, Option<String>>(12).as_deref(),
+        Some("feat/kds-button")
     );
 
     // A cancelled run still reaches the ledger, priced from its partial usage.
@@ -307,6 +319,42 @@ fn run_ledger_projects_the_audited_columns() {
         Some("cancelled")
     );
     assert_eq!(row.get::<_, String>(3), "cancelled");
+}
+
+/// Attribution is optional: a caller that is not repository-bound records no
+/// repo, and the ledger says so with NULL rather than inventing one.
+#[test]
+fn sessions_without_attribution_still_reach_the_ledger() {
+    let Some(url) = test_url() else {
+        eprintln!("skipped: THALAMUS_TEST_DATABASE_URL not set");
+        return;
+    };
+    migrate_once(&url);
+    let store = PostgresAudit::connect(&url).expect("connect");
+
+    let mut input = new_session_input(None);
+    input.repository = None;
+    input.branch = None;
+    let session = store.create_session(&input).expect("create session");
+    assert_eq!(session.repository, None);
+    let run = store
+        .create_run(&session.session_id, Some("glm-test"), None)
+        .expect("create run");
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("direct client");
+    let row = client
+        .query_one(
+            "SELECT repository, branch, principal FROM run_ledger WHERE run_id = $1",
+            &[&run.run_id],
+        )
+        .expect("ledger row");
+    assert_eq!(row.get::<_, Option<String>>(0), None);
+    assert_eq!(row.get::<_, Option<String>>(1), None);
+    // The attested field is present regardless.
+    assert_eq!(
+        row.get::<_, Option<String>>(2).as_deref(),
+        Some("ldamasio@gmail.com")
+    );
 }
 
 #[test]

@@ -34,6 +34,14 @@ pub struct SessionRecord {
     pub workflow: String,
     pub principal: Option<String>,
     pub delegation_token_id: Option<String>,
+    /// Repository the session works in, as `host/org/repo`. DECLARED by the
+    /// client, unlike `principal`, which is derived from the verified
+    /// credential. Attribution, never evidence.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// Branch the session works on. Client-declared, same caveat.
+    #[serde(default)]
+    pub branch: Option<String>,
     pub status: SessionStatus,
     /// Immutable after creation; `governed_llm_access` for Bridge sessions.
     #[serde(default = "default_governance_mode")]

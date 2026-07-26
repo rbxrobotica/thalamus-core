@@ -63,6 +63,9 @@ pub struct NewSessionInput {
     pub principal: Option<String>,
     pub delegation_token_id: Option<String>,
     pub governance_mode: String,
+    /// Client-declared attribution (see migration 0007).
+    pub repository: Option<String>,
+    pub branch: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -126,8 +129,9 @@ impl PostgresAudit {
             tx.execute(
                 "INSERT INTO sessions
                     (session_id, tenant, product, workflow, principal,
-                     delegation_token_id, governance_mode, idempotency_key)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                     delegation_token_id, governance_mode, repository, branch,
+                     idempotency_key)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[
                     &session_id,
                     &input.tenant,
@@ -136,6 +140,8 @@ impl PostgresAudit {
                     &input.principal,
                     &input.delegation_token_id,
                     &input.governance_mode,
+                    &input.repository,
+                    &input.branch,
                     &input.idempotency_key,
                 ],
             )?;
@@ -675,7 +681,7 @@ fn session_by_id(
     let row = tx.query_opt(
         "SELECT session_id, tenant, product, workflow, principal,
                 delegation_token_id, status, governance_mode, retention_class,
-                created_at, updated_at
+                created_at, updated_at, repository, branch
          FROM sessions WHERE session_id = $1",
         &[id],
     )?;
@@ -691,6 +697,8 @@ fn session_by_id(
         retention_class: row.get(8),
         created_at: row.get::<_, OffsetDateTime>(9),
         updated_at: row.get::<_, OffsetDateTime>(10),
+        repository: row.get(11),
+        branch: row.get(12),
     }))
 }
 

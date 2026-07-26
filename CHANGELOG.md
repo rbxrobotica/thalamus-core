@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (T3 · session attribution)
+
+- `POST /rbx/v1/sessions` accepts optional `repository` (`host/org/repo`) and
+  `branch`, recorded on the session and projected into `run_ledger`. The
+  audit trail answers what tokens were spent on, not only who spent them.
+- Attestation boundary, documented in migration `0007` and the API: `principal`
+  and `delegation_token_id` are derived server-side from the verified
+  credential and a caller cannot influence them; `repository` and `branch` are
+  DECLARED by the client. Attribution, never authorization, and never evidence.
+- Both fields are bounded (512 / 255 chars) and rejected rather than truncated:
+  a value too long to store must not become a silently different value in the
+  record. Blank is treated as absent; control characters are refused.
+
 ### Added (T2 · per-run cost and the run ledger)
 
 - `THALAMUS_MODEL_PRICES`: JSON price book mapping a policy alias to a rate,

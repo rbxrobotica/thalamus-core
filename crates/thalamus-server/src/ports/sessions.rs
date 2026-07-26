@@ -23,6 +23,11 @@ pub struct NewSession {
     pub delegation_token_id: Option<String>,
     /// Validated governance mode (ADR-0403); immutable after creation.
     pub governance_mode: String,
+    /// Client-declared attribution: the repo/branch the agent works in.
+    /// Unlike `principal`, these are asserted by the caller, not attested
+    /// by the credential (migration 0007).
+    pub repository: Option<String>,
+    pub branch: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -265,6 +270,8 @@ impl SessionStore for InMemorySessionStore {
             workflow: input.workflow.clone(),
             principal: input.principal.clone(),
             delegation_token_id: input.delegation_token_id.clone(),
+            repository: input.repository.clone(),
+            branch: input.branch.clone(),
             status: SessionStatus::Open,
             governance_mode: input.governance_mode.clone(),
             retention_class: "standard".to_owned(),
@@ -568,6 +575,8 @@ impl SessionStore for thalamus_postgres_adapter::PostgresAudit {
                 principal: input.principal.clone(),
                 delegation_token_id: input.delegation_token_id.clone(),
                 governance_mode: input.governance_mode.clone(),
+                repository: input.repository.clone(),
+                branch: input.branch.clone(),
                 idempotency_key: input.idempotency_key.clone(),
             },
         )
