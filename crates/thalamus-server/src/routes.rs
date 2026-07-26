@@ -1104,25 +1104,15 @@ fn attribution_field(
     raw: Option<&str>,
     name: &str,
     max_len: usize,
-) -> Result<Option<String>, Response> {
+) -> Result<Option<String>, String> {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
     if trimmed.chars().count() > max_len {
-        return Err(typed_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            &format!("{name} must be at most {max_len} characters"),
-            false,
-        ));
+        return Err(format!("{name} must be at most {max_len} characters"));
     }
     if trimmed.chars().any(|c| c.is_control()) {
-        return Err(typed_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            &format!("{name} must not contain control characters"),
-            false,
-        ));
+        return Err(format!("{name} must not contain control characters"));
     }
     Ok(Some(trimmed.to_owned()))
 }
@@ -1142,13 +1132,14 @@ pub async fn rbx_create_session(
             false,
         );
     }
-    let repository = match attribution_field(req.repository.as_deref(), "repository", 512) {
-        Ok(value) => value,
-        Err(resp) => return resp,
-    };
-    let branch = match attribution_field(req.branch.as_deref(), "branch", 255) {
-        Ok(value) => value,
-        Err(resp) => return resp,
+    let (repository, branch) = match (
+        attribution_field(req.repository.as_deref(), "repository", 512),
+        attribution_field(req.branch.as_deref(), "branch", 255),
+    ) {
+        (Ok(repository), Ok(branch)) => (repository, branch),
+        (Err(detail), _) | (_, Err(detail)) => {
+            return typed_error(StatusCode::BAD_REQUEST, "invalid_request", &detail, false)
+        }
     };
     let input = crate::ports::sessions::NewSession {
         tenant: req.tenant,
