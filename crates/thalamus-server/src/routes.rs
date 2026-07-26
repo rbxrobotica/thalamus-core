@@ -1036,6 +1036,15 @@ pub struct CreateSessionRequest {
     /// Required (Gate D acceptance): every governed session records the mode
     /// it was created under. `governed_llm_access` for external agents.
     pub governance_mode: String,
+    /// Repository the session works in, as `host/org/repo`. Optional, and
+    /// DECLARED by the caller: unlike `tenant`/`product`/`workflow` it is
+    /// attribution for auditing, not an authorization input, and unlike
+    /// `principal` it is not attested by the credential.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// Branch the session works on. Same caveat as `repository`.
+    #[serde(default)]
+    pub branch: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -1087,6 +1096,37 @@ fn emit_lifecycle(
 }
 
 /// POST /rbx/v1/sessions — create a governed session for the verified caller.
+/// Normalize one client-declared attribution field: trimmed, blank treated as
+/// absent, bounded. Bounded because it is written straight into the audit
+/// trail from an untrusted caller; refused rather than truncated, so a value
+/// too long to store never becomes a silently different value in the record.
+fn attribution_field(
+    raw: Option<&str>,
+    name: &str,
+    max_len: usize,
+) -> Result<Option<String>, Response> {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if trimmed.chars().count() > max_len {
+        return Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("{name} must be at most {max_len} characters"),
+            false,
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("{name} must not contain control characters"),
+            false,
+        ));
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
 pub async fn rbx_create_session(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<VerifiedCaller>,
@@ -1102,6 +1142,14 @@ pub async fn rbx_create_session(
             false,
         );
     }
+    let repository = match attribution_field(req.repository.as_deref(), "repository", 512) {
+        Ok(value) => value,
+        Err(resp) => return resp,
+    };
+    let branch = match attribution_field(req.branch.as_deref(), "branch", 255) {
+        Ok(value) => value,
+        Err(resp) => return resp,
+    };
     let input = crate::ports::sessions::NewSession {
         tenant: req.tenant,
         product: req.product,
@@ -1109,6 +1157,8 @@ pub async fn rbx_create_session(
         principal: caller.subject.clone(),
         delegation_token_id: caller.jti.clone(),
         governance_mode: req.governance_mode,
+        repository,
+        branch,
         idempotency_key: req.idempotency_key,
     };
     match state.session_store.create_session(&input) {
