@@ -521,7 +521,7 @@ pub async fn embeddings(
             return response;
         }
         return embedding_refusal(
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::FORBIDDEN,
             "model_not_permitted",
             "embedding model alias is not permitted by policy",
             false,

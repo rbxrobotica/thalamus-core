@@ -1371,7 +1371,7 @@ async fn governed_embeddings_fail_closed_before_port_for_auth_policy_and_alias()
         Some(wrong_alias),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"]["code"], "model_not_permitted");
     assert!(body["trace_id"].is_string());
     assert_eq!(embedding.call_count(), 0);
