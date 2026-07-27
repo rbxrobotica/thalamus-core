@@ -131,7 +131,8 @@ inline mediated mode is proposed in
 **Current implementation**: this repository already contains Rust crates for
 `thalamus-core`, `thalamus-server`, LiteLLM and Agentgateway adapters, and eval
 support. The server currently exposes `/v1/decide`, `/v1/pre-call`,
-`/v1/post-call`, `/v1/call`, and `/v1/audit/{id}`.
+`/v1/post-call`, `/v1/call`, the authenticated `/v1/embeddings` route, and
+`/v1/audit/{id}`.
 
 **Not production-ready for the institutional LLM pilot yet**: authentication,
 session records, route envelopes, durable audit, payload redaction, streaming,

@@ -67,6 +67,7 @@ Exposes the control-plane API over HTTP and gRPC.
 | `POST /v1/decide` | pre-call | Resolve policy, return `PolicyDecision` without executing |
 | `POST /v1/pre-call` | pre-call | Decide and produce an approved `Envelope` |
 | `POST /v1/call` | both | Pre-call, delegate to `BackendPort`, post-call, return `PostCallResult` |
+| `POST /v1/embeddings` | both | Authenticated policy/redaction/audit, delegate to `EmbeddingPort`, validate vectors |
 | `POST /v1/post-call` | post-call | Validate an externally executed response |
 | `POST /v1/evaluate` | post-call | Submit a response/dataset to evaluation |
 | `GET  /v1/audit/{audit_id}` | n/a | Retrieve audit events for a call |
@@ -75,6 +76,25 @@ Exposes the control-plane API over HTTP and gRPC.
 `/v1/decide` + `/v1/post-call` is the split path: callers that execute the
 backend themselves (for example through an existing data plane) but still want
 governance.
+
+`/v1/embeddings` is mounted only when `THALAMUS_RBX_API` enables the credential
+middleware. The verified credential must target audience `thalamus` and carry
+the least-privilege `thalamus:embeddings` scope. Its additive v1 contract is:
+
+```json
+{
+  "tenant": "RBX",
+  "product": "rbx-rag-public-assistant",
+  "workflow": "index",
+  "model_alias": "embedding.default",
+  "input": ["one or up to 128 strings"]
+}
+```
+
+A successful response contains `model_alias`, `vectors`, `trace_id`, and
+`audit_id`. Provider model names and metadata never cross this HTTP boundary.
+Policy/auth/refusal errors use the governed typed error envelope and include
+trace/audit IDs once the authenticated handler has accepted the request.
 
 ### thalamus-sdk-python and thalamus-sdk-ts
 
@@ -131,6 +151,7 @@ edits go through governed change control.
 | `PolicyPort` | `CallRequest` | `Policy` + resolution context | `PolicyEngine` (Rust, in-process) |
 | `ContextPort` | `ContextGrant` | authorized context only | RBX context sources per policy |
 | `BackendPort` | approved `Envelope` | raw backend response | `thalamus-agentgateway-adapter` / LiteLLM adapter |
+| `EmbeddingPort` | governed alias + redacted inputs + trace/audit IDs | embedding vectors | LiteLLM adapter |
 | `AuditPort` | `AuditEvent` | durable ack | Postgres (external VPS) |
 | `EvalPort` | response + policy | eval submission ref | `thalamus-eval` + Langfuse |
 | `ObservabilityPort` | spans/metrics | exporter ack | OpenTelemetry OTLP |

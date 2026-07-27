@@ -1,6 +1,6 @@
-//! Inbound credential validation for the gated `/rbx/v1/*` surface
-//! (ADR-0101). Mounted only when `THALAMUS_RBX_API=on`; the legacy `/v1/*`
-//! routes never pass through it.
+//! Inbound credential validation for the gated `/rbx/v1/*` surface and the
+//! governed `/v1/embeddings` route (ADR-0101, ADR-0023). Mounted only when
+//! `THALAMUS_RBX_API=on`; other legacy `/v1/*` routes never pass through it.
 //!
 //! # First slice
 //!

@@ -5,7 +5,7 @@ use axum::middleware::{self, Next};
 use axum::routing::{get, post};
 use axum::Router;
 
-use thalamus_core::BackendPort;
+use thalamus_core::{BackendPort, EmbeddingPort};
 
 use crate::auth;
 use crate::config::ServerConfig;
@@ -30,6 +30,7 @@ pub struct AppState {
     pub eval_port: Arc<dyn thalamus_core::EvalPort + Send + Sync>,
     pub obs_port: Arc<dyn thalamus_core::ObservabilityPort + Send + Sync>,
     pub backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
+    pub embedding_port: Option<Arc<dyn EmbeddingPort + Send + Sync>>,
     pub audit_store: AuditStore,
     #[allow(
         dead_code,
@@ -66,6 +67,7 @@ pub fn build(config: ServerConfig) -> Router {
         eval_port,
         obs_port,
         backend_port,
+        embedding_port: None,
         audit_store,
         eval_store,
         credential_verifier: None,
@@ -98,6 +100,7 @@ pub fn build_with_backend(
         eval_port,
         obs_port,
         backend_port: Some(backend),
+        embedding_port: None,
         audit_store,
         eval_store,
         credential_verifier: None,
@@ -129,6 +132,7 @@ pub fn build_with_ports(
         eval_port,
         obs_port,
         backend_port: Some(backend),
+        embedding_port: None,
         audit_store,
         eval_store,
         credential_verifier: None,
@@ -139,7 +143,7 @@ pub fn build_with_ports(
     build_router(state)
 }
 
-/// Body limit for the governed /rbx/v1/* surface (master plan §3 security).
+/// Body limit for the governed authenticated surface (master plan §3 security).
 const RBX_BODY_LIMIT_BYTES: usize = 256 * 1024;
 
 /// Price book from `THALAMUS_MODEL_PRICES`. A malformed book aborts the boot:
@@ -173,9 +177,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/audit/{id}", get(routes::get_audit))
         .with_state(state.clone());
 
-    // Gated /rbx/v1/* surface (THALAMUS_RBX_API). Mounted only when a
-    // credential verifier is present. The auth middleware is scoped to this
-    // sub-router, so the legacy /v1/* and /healthz routes are never affected.
+    // Gated authenticated surface (THALAMUS_RBX_API): `/rbx/v1/*` plus the
+    // governed `/v1/embeddings` contract. Mounted only when a credential
+    // verifier is present. The auth middleware is scoped to this sub-router,
+    // so other legacy `/v1/*` and health routes are never affected.
     // Credential validation runs before every handler: a session/run is never
     // created for an unverified caller.
     if let Some(verifier) = credential_verifier {
@@ -203,6 +208,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             .route("/rbx/v1/tool-decisions", post(routes::rbx_tool_decision))
             .route("/rbx/v1/approvals", post(routes::rbx_approval))
             .route("/rbx/v1/evidence", post(routes::rbx_evidence))
+            .route("/v1/embeddings", post(routes::embeddings))
             // Innermost: rate limiting sees the VerifiedCaller inserted by
             // the (outer) credential middleware.
             .layer(middleware::from_fn({
@@ -224,8 +230,8 @@ fn build_router(state: Arc<AppState>) -> Router {
     }
 }
 
-/// Build an app that also serves the gated `/rbx/v1/*` surface with the given
-/// credential verifier (`THALAMUS_RBX_API=on`). Used by `main` (real
+/// Build an app that also serves the gated `/rbx/v1/*` and `/v1/embeddings`
+/// surfaces with the given credential verifier (`THALAMUS_RBX_API=on`). Used by `main` (real
 /// introspection verifier) and by integration tests (static verifier). The
 /// backend adapter is wired by the caller so the legacy /v1/call surface
 /// keeps working when the governed surface is enabled.
@@ -237,6 +243,18 @@ pub fn build_with_rbx_api(
     config: ServerConfig,
     credential_verifier: Arc<dyn auth::CredentialVerifier + Send + Sync>,
     backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
+) -> Router {
+    build_with_rbx_api_and_embedding(config, credential_verifier, backend_port, None)
+}
+
+/// Build the governed API with independently injected chat and embedding
+/// execution seams. A caller may wire either port without exposing a provider
+/// type to the server.
+pub fn build_with_rbx_api_and_embedding(
+    config: ServerConfig,
+    credential_verifier: Arc<dyn auth::CredentialVerifier + Send + Sync>,
+    backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
+    embedding_port: Option<Arc<dyn EmbeddingPort + Send + Sync>>,
 ) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
@@ -254,6 +272,7 @@ pub fn build_with_rbx_api(
         eval_port,
         obs_port,
         backend_port,
+        embedding_port,
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
@@ -288,6 +307,7 @@ pub fn build_with_rbx_api_and_sessions(
         eval_port,
         obs_port,
         backend_port: None,
+        embedding_port: None,
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
@@ -323,6 +343,7 @@ pub fn build_with_rbx_api_sessions_backend(
         eval_port,
         obs_port,
         backend_port: Some(backend),
+        embedding_port: None,
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
@@ -358,6 +379,7 @@ pub fn build_with_rbx_api_sessions_limiter(
         eval_port,
         obs_port,
         backend_port: None,
+        embedding_port: None,
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
@@ -395,6 +417,7 @@ pub fn build_with_eval_sink(
         eval_port,
         obs_port,
         backend_port: backend,
+        embedding_port: None,
         audit_store,
         eval_store,
         credential_verifier: None,
@@ -428,6 +451,7 @@ pub fn build_with_eval_inspection(
         eval_port,
         obs_port,
         backend_port: Some(backend),
+        embedding_port: None,
         audit_store,
         eval_store: eval_store.clone(),
         credential_verifier: None,
