@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (governed embeddings route)
+
+- Authenticated `POST /v1/embeddings` resolves policy by tenant, product, and
+  workflow; refuses missing policies and unpermitted aliases without fallback;
+  applies block/redact rules before transport; emits correlated pre-route-post
+  audit events; and delegates a bounded batch only through `EmbeddingPort`.
+- The HTTP response exposes the institutional alias, validated vectors,
+  `trace_id`, and `audit_id`; provider metadata remains inside the adapter.
+
 ### Added (T3 · session attribution)
 
 - `POST /rbx/v1/sessions` accepts optional `repository` (`host/org/repo`) and

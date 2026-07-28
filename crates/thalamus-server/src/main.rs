@@ -207,19 +207,30 @@ async fn main() {
         });
         let verifier: std::sync::Arc<dyn auth::CredentialVerifier + Send + Sync> =
             std::sync::Arc::new(auth::OpaqueIntrospectionVerifier::new(introspection_url));
-        // Keep the data plane wired in governed mode: the legacy /v1/call
-        // surface must not lose its backend when /rbx/v1/* is enabled.
+        // Keep the data plane wired in governed mode. The same concrete
+        // LiteLLM adapter implements two independent domain seams; server code
+        // sees only BackendPort and EmbeddingPort trait objects.
+        #[cfg(feature = "litellm")]
+        let adapter = std::sync::Arc::new(thalamus_litellm_adapter::LiteLLMAdapter::new(
+            litellm_adapter_config_from_env(),
+        ));
         #[cfg(feature = "litellm")]
         let rbx_backend: Option<
             std::sync::Arc<dyn thalamus_core::BackendPort + Send + Sync>,
-        > = Some(std::sync::Arc::new(
-            thalamus_litellm_adapter::LiteLLMAdapter::new(litellm_adapter_config_from_env()),
-        ));
+        > = Some(adapter.clone());
+        #[cfg(feature = "litellm")]
+        let rbx_embedding: Option<
+            std::sync::Arc<dyn thalamus_core::EmbeddingPort + Send + Sync>,
+        > = Some(adapter);
         #[cfg(not(feature = "litellm"))]
         let rbx_backend: Option<
             std::sync::Arc<dyn thalamus_core::BackendPort + Send + Sync>,
         > = None;
-        app::build_with_rbx_api(cfg, verifier, rbx_backend)
+        #[cfg(not(feature = "litellm"))]
+        let rbx_embedding: Option<
+            std::sync::Arc<dyn thalamus_core::EmbeddingPort + Send + Sync>,
+        > = None;
+        app::build_with_rbx_api_and_embedding(cfg, verifier, rbx_backend, rbx_embedding)
     } else {
         app
     };

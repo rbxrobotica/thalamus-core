@@ -6,7 +6,11 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use thalamus_core::{AuditId, BackendResponse, CallRequest, PolicyDecision, PreCallError};
+use thalamus_core::{
+    AuditEvent, AuditId, BackendHandle, BackendResponse, BackendType, CallRequest, EmbeddingError,
+    EmbeddingRequest, EmbeddingResponse, PolicyDecision, PreCallError, RedactionAction, RiskLevel,
+    TraceId,
+};
 
 use crate::app::AppState;
 use crate::auth::VerifiedCaller;
@@ -196,6 +200,500 @@ fn durable_audit_guard(state: &AppState) -> Option<Response> {
 /// land in Phase 3 behind the same `THALAMUS_RBX_API` flag.
 pub async fn rbx_identity(Extension(caller): Extension<VerifiedCaller>) -> impl IntoResponse {
     (StatusCode::OK, Json(caller))
+}
+
+const MAX_EMBEDDING_BATCH_SIZE: usize = 128;
+const EMBEDDING_AUDIENCE: &str = "thalamus";
+const EMBEDDING_SCOPE: &str = "thalamus:embeddings";
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInputJson {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingsRequest {
+    pub tenant: String,
+    pub product: String,
+    pub workflow: String,
+    pub model_alias: String,
+    pub input: EmbeddingInputJson,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingsResponse {
+    pub model_alias: String,
+    pub vectors: Vec<Vec<f32>>,
+    pub trace_id: String,
+    pub audit_id: String,
+}
+
+fn embedding_refusal(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    retryable: bool,
+    trace_id: &TraceId,
+    audit_id: &AuditId,
+) -> Response {
+    let body = serde_json::json!({
+        "error": { "code": code, "message": message, "retryable": retryable },
+        "trace_id": trace_id.0,
+        "audit_id": audit_id.0,
+    });
+    (status, Json(body)).into_response()
+}
+
+fn emit_embedding_decision(
+    state: &AppState,
+    request: &CallRequest,
+    trace_id: &TraceId,
+    audit_id: &AuditId,
+    policy_ref: &str,
+    decision: &str,
+    backend: Option<BackendHandle>,
+) {
+    state.audit_port.emit(AuditEvent::PreCallDecision {
+        trace_id: trace_id.clone(),
+        audit_id: audit_id.clone(),
+        tenant: request.tenant.clone(),
+        product: request.product.clone(),
+        workflow: request.workflow.clone(),
+        user: Some(request.user.clone()),
+        policy_ref: policy_ref.to_owned(),
+        decision: decision.to_owned(),
+        backend,
+        timestamp: time::OffsetDateTime::now_utc(),
+    });
+}
+
+fn emit_embedding_outcome(state: &AppState, trace_id: &TraceId, audit_id: &AuditId, valid: bool) {
+    state.audit_port.emit(AuditEvent::PostCallOutcome {
+        trace_id: trace_id.clone(),
+        audit_id: audit_id.clone(),
+        status: if valid { "Valid" } else { "Invalid" }.to_owned(),
+        risk_class: if valid {
+            RiskLevel::Low
+        } else {
+            RiskLevel::Prohibited
+        },
+        executable_by_agent: false,
+        schema_valid: valid,
+        timestamp: time::OffsetDateTime::now_utc(),
+    });
+}
+
+fn embedding_inputs(input: EmbeddingInputJson) -> Result<Vec<String>, &'static str> {
+    let input = match input {
+        EmbeddingInputJson::Single(value) => vec![value],
+        EmbeddingInputJson::Batch(values) => values,
+    };
+    if input.is_empty() {
+        return Err("input must contain at least one string");
+    }
+    if input.len() > MAX_EMBEDDING_BATCH_SIZE {
+        return Err("embedding batch exceeds 128 inputs");
+    }
+    if input.iter().any(|value| value.trim().is_empty()) {
+        return Err("embedding inputs must be non-empty strings");
+    }
+    Ok(input)
+}
+
+fn redact_embedding_inputs(
+    input: Vec<String>,
+    rules: &[thalamus_core::RedactionRule],
+) -> Result<Vec<String>, &'static str> {
+    let blocked = rules.iter().any(|rule| {
+        !rule.pattern.is_empty()
+            && matches!(rule.action, RedactionAction::Block)
+            && input.iter().any(|value| value.contains(&rule.pattern))
+    });
+    if blocked {
+        return Err("embedding input blocked by policy");
+    }
+
+    Ok(input
+        .into_iter()
+        .map(|mut value| {
+            for rule in rules.iter().filter(|rule| {
+                !rule.pattern.is_empty() && matches!(rule.action, RedactionAction::Redact)
+            }) {
+                value = value.replace(&rule.pattern, "[REDACTED]");
+            }
+            value
+        })
+        .collect())
+}
+
+fn valid_embedding_response(
+    response: &EmbeddingResponse,
+    expected_alias: &str,
+    expected_count: usize,
+) -> bool {
+    if response.model_alias != expected_alias || response.vectors.len() != expected_count {
+        return false;
+    }
+    let Some(dimension) = response
+        .vectors
+        .first()
+        .map(Vec::len)
+        .filter(|size| *size > 0)
+    else {
+        return false;
+    };
+    response.vectors.iter().all(|vector| {
+        vector.len() == dimension && vector.iter().all(|component| component.is_finite())
+    })
+}
+
+/// POST /v1/embeddings — authenticated, policy-governed embedding generation.
+/// The route is mounted only with `THALAMUS_RBX_API`; provider transport remains
+/// behind `EmbeddingPort`, and a requested alias is never silently substituted.
+pub async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Json(req): Json<EmbeddingsRequest>,
+) -> Response {
+    let trace_id = TraceId(Uuid::new_v4());
+    let audit_id = AuditId(Uuid::new_v4());
+    let principal = caller
+        .subject
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            caller
+                .client_app_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+        });
+    let Some(principal) = principal else {
+        return embedding_refusal(
+            StatusCode::FORBIDDEN,
+            "policy_denied",
+            "verified caller has no attributable principal",
+            false,
+            &trace_id,
+            &audit_id,
+        );
+    };
+
+    if req.tenant.trim().is_empty()
+        || req.product.trim().is_empty()
+        || req.workflow.trim().is_empty()
+        || req.model_alias.trim().is_empty()
+    {
+        return embedding_refusal(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "tenant, product, workflow, and model_alias are required",
+            false,
+            &trace_id,
+            &audit_id,
+        );
+    }
+    let input = match embedding_inputs(req.input) {
+        Ok(input) => input,
+        Err(detail) => {
+            return embedding_refusal(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                detail,
+                false,
+                &trace_id,
+                &audit_id,
+            )
+        }
+    };
+
+    let requested_backend = BackendHandle {
+        id: req.model_alias.clone(),
+        backend_type: BackendType::Model,
+    };
+    let call_request = CallRequest {
+        tenant: req.tenant,
+        product: req.product,
+        user: principal.to_owned(),
+        workflow: req.workflow,
+        intent: "embedding".to_owned(),
+        prompt: serde_json::to_string(&input).unwrap_or_default(),
+        requested_backend: Some(requested_backend.clone()),
+        budget_hint: None,
+        run_correlated: false,
+    };
+    let audience_allowed = caller
+        .audience
+        .iter()
+        .any(|audience| audience == EMBEDDING_AUDIENCE);
+    let scope_allowed = caller.scopes.iter().any(|scope| scope == EMBEDDING_SCOPE);
+    if !audience_allowed || !scope_allowed {
+        emit_embedding_decision(
+            &state,
+            &call_request,
+            &trace_id,
+            &audit_id,
+            "credential-scope",
+            "Deny",
+            None,
+        );
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return embedding_refusal(
+            StatusCode::FORBIDDEN,
+            "policy_denied",
+            "credential is not authorized for governed embeddings",
+            false,
+            &trace_id,
+            &audit_id,
+        );
+    }
+    let policy = state.policy_port.resolve(&call_request);
+    match state.policy_port.evaluate(&call_request, &policy) {
+        PolicyDecision::Deny { reason, policy_ref } => {
+            emit_embedding_decision(
+                &state,
+                &call_request,
+                &trace_id,
+                &audit_id,
+                &policy_ref,
+                "Deny",
+                None,
+            );
+            if let Some(response) = durable_audit_guard(&state) {
+                return response;
+            }
+            return embedding_refusal(
+                StatusCode::FORBIDDEN,
+                "policy_denied",
+                &reason,
+                false,
+                &trace_id,
+                &audit_id,
+            );
+        }
+        PolicyDecision::AllowWithReview {
+            review_reason,
+            policy_ref,
+        } => {
+            emit_embedding_decision(
+                &state,
+                &call_request,
+                &trace_id,
+                &audit_id,
+                &policy_ref,
+                "AllowWithReview",
+                None,
+            );
+            if let Some(response) = durable_audit_guard(&state) {
+                return response;
+            }
+            return embedding_refusal(
+                StatusCode::FORBIDDEN,
+                "needs_human_review",
+                &review_reason,
+                false,
+                &trace_id,
+                &audit_id,
+            );
+        }
+        PolicyDecision::Allow => {}
+    }
+
+    let permitted_backend = policy
+        .permitted_backends
+        .iter()
+        .find(|backend| backend.id == req.model_alias && backend.backend_type == BackendType::Model)
+        .cloned();
+    let Some(permitted_backend) = permitted_backend else {
+        emit_embedding_decision(
+            &state,
+            &call_request,
+            &trace_id,
+            &audit_id,
+            &policy.id,
+            "Deny",
+            None,
+        );
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return embedding_refusal(
+            StatusCode::FORBIDDEN,
+            "model_not_permitted",
+            "embedding model alias is not permitted by policy",
+            false,
+            &trace_id,
+            &audit_id,
+        );
+    };
+
+    let input = match redact_embedding_inputs(input, &policy.redaction_rules) {
+        Ok(input) => input,
+        Err(detail) => {
+            emit_embedding_decision(
+                &state,
+                &call_request,
+                &trace_id,
+                &audit_id,
+                &policy.id,
+                "Deny",
+                None,
+            );
+            if let Some(response) = durable_audit_guard(&state) {
+                return response;
+            }
+            return embedding_refusal(
+                StatusCode::FORBIDDEN,
+                "content_blocked",
+                detail,
+                false,
+                &trace_id,
+                &audit_id,
+            );
+        }
+    };
+
+    emit_embedding_decision(
+        &state,
+        &call_request,
+        &trace_id,
+        &audit_id,
+        &policy.id,
+        "Allow",
+        Some(permitted_backend),
+    );
+    state.audit_port.emit(AuditEvent::RouteEnvelope {
+        trace_id: trace_id.clone(),
+        audit_id: audit_id.clone(),
+        model_alias: req.model_alias.clone(),
+        provider_pool: Vec::new(),
+        region: None,
+        data_class: None,
+        capability_class: Some("embeddings".to_owned()),
+        cost_class: None,
+        timeout_ms: policy.budget.max_latency_ms,
+        timestamp: time::OffsetDateTime::now_utc(),
+    });
+    if let Some(response) = durable_audit_guard(&state) {
+        return response;
+    }
+
+    let Some(embedding_port) = state.embedding_port.as_ref().map(Arc::clone) else {
+        emit_embedding_outcome(&state, &trace_id, &audit_id, false);
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return embedding_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "embedding_backend_unavailable",
+            "no embedding backend is configured",
+            true,
+            &trace_id,
+            &audit_id,
+        );
+    };
+    let expected_count = input.len();
+    let embedding_request = EmbeddingRequest {
+        model_alias: req.model_alias.clone(),
+        input,
+        trace_id: trace_id.clone(),
+        audit_id: audit_id.clone(),
+    };
+    let result =
+        tokio::task::spawn_blocking(move || embedding_port.embed(&embedding_request)).await;
+    let result = match result {
+        Ok(result) => result,
+        Err(join_error) => {
+            tracing::error!(
+                trace_id = %trace_id.0,
+                audit_id = %audit_id.0,
+                error = %crate::redact::redact(&join_error.to_string()),
+                "embedding backend task failed"
+            );
+            emit_embedding_outcome(&state, &trace_id, &audit_id, false);
+            if let Some(response) = durable_audit_guard(&state) {
+                return response;
+            }
+            return embedding_refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "embedding_task_failed",
+                "embedding backend task failed",
+                true,
+                &trace_id,
+                &audit_id,
+            );
+        }
+    };
+
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            let (status, code, message, retryable) = match &error {
+                EmbeddingError::InvalidRequest { .. } => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "embedding request rejected by backend",
+                    false,
+                ),
+                EmbeddingError::Unavailable { .. } => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "embedding_backend_unavailable",
+                    "embedding backend is unavailable",
+                    true,
+                ),
+                EmbeddingError::MalformedResponse { .. } => (
+                    StatusCode::BAD_GATEWAY,
+                    "malformed_embedding_response",
+                    "embedding backend returned an invalid response",
+                    true,
+                ),
+            };
+            tracing::warn!(
+                trace_id = %trace_id.0,
+                audit_id = %audit_id.0,
+                error = %crate::redact::redact(&error.to_string()),
+                "embedding request failed"
+            );
+            emit_embedding_outcome(&state, &trace_id, &audit_id, false);
+            if let Some(response) = durable_audit_guard(&state) {
+                return response;
+            }
+            return embedding_refusal(status, code, message, retryable, &trace_id, &audit_id);
+        }
+    };
+
+    if !valid_embedding_response(&response, &req.model_alias, expected_count) {
+        emit_embedding_outcome(&state, &trace_id, &audit_id, false);
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return embedding_refusal(
+            StatusCode::BAD_GATEWAY,
+            "malformed_embedding_response",
+            "embedding backend returned vectors with an invalid shape",
+            true,
+            &trace_id,
+            &audit_id,
+        );
+    }
+
+    emit_embedding_outcome(&state, &trace_id, &audit_id, true);
+    if let Some(response) = durable_audit_guard(&state) {
+        return response;
+    }
+    (
+        StatusCode::OK,
+        Json(EmbeddingsResponse {
+            model_alias: req.model_alias,
+            vectors: response.vectors,
+            trace_id: trace_id.0.to_string(),
+            audit_id: audit_id.0.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 /// POST /v1/decide — policy decision only, no backend call.

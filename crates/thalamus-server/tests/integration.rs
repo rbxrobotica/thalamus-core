@@ -9,7 +9,8 @@ use tower::ServiceExt;
 
 use thalamus_core::{
     BackendHandle, BackendPort, BackendResponse, BackendType, Budget, CallRequest, ContextGrant,
-    Envelope, Policy, PolicyDecision, PolicyPort, RiskLevel,
+    EmbeddingError, EmbeddingPort, EmbeddingRequest, EmbeddingResponse, Envelope, Policy,
+    PolicyDecision, PolicyPort, RedactionAction, RedactionRule, RiskLevel,
 };
 
 use thalamus_server::app;
@@ -42,6 +43,35 @@ impl BackendPort for CountingBackendPort {
     fn call(&self, _envelope: &Envelope) -> BackendResponse {
         *self.calls.lock().unwrap() += 1;
         self.response.clone()
+    }
+}
+
+struct RecordingEmbeddingPort {
+    requests: Mutex<Vec<EmbeddingRequest>>,
+    result: Result<EmbeddingResponse, EmbeddingError>,
+}
+
+impl RecordingEmbeddingPort {
+    fn new(result: Result<EmbeddingResponse, EmbeddingError>) -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            result,
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
+    fn requests(&self) -> Vec<EmbeddingRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl EmbeddingPort for RecordingEmbeddingPort {
+    fn embed(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse, EmbeddingError> {
+        self.requests.lock().unwrap().push(request.clone());
+        self.result.clone()
     }
 }
 
@@ -1134,11 +1164,28 @@ async fn send_with_auth(
     uri: &str,
     bearer: Option<&str>,
 ) -> (StatusCode, Value) {
+    send_with_auth_json(app, method, uri, bearer, None).await
+}
+
+async fn send_with_auth_json(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    bearer: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(b) = bearer {
         builder = builder.header("authorization", format!("Bearer {b}"));
     }
-    let request = builder.body::<Body>(Body::empty()).unwrap();
+    let request = if let Some(body) = body {
+        builder
+            .header("content-type", "application/json")
+            .body::<Body>(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    } else {
+        builder.body::<Body>(Body::empty()).unwrap()
+    };
     let response = app.oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -1168,6 +1215,238 @@ async fn rbx_identity_rejects_missing_bearer() {
     let (status, body) = send_with_auth(app, "GET", "/rbx/v1/identity", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "policy_denied");
+}
+
+#[tokio::test]
+async fn governed_embeddings_authenticate_redact_audit_and_use_only_embedding_port() {
+    let mut policy = test_policy();
+    policy.redaction_rules = vec![RedactionRule {
+        pattern: "secret".to_owned(),
+        action: RedactionAction::Redact,
+    }];
+    let verifier = Arc::new(StaticCredentialVerifier::with_valid(
+        "rbxsess-memory",
+        rbx_caller("rbx-memory", &["thalamus:embeddings"]),
+    ));
+    let chat_backend = Arc::new(CountingBackendPort::new(BackendResponse {
+        content: "must not run".to_owned(),
+        tokens_used: None,
+        latency_ms: None,
+    }));
+    let embedding = Arc::new(RecordingEmbeddingPort::new(Ok(EmbeddingResponse {
+        model_alias: "test-backend".to_owned(),
+        vectors: vec![vec![0.1, 0.2], vec![0.3, 0.4]],
+        provider_metadata: json!({ "provider": "must-not-cross-http-boundary" }),
+    })));
+    let app = app::build_with_rbx_api_and_embedding(
+        make_config(vec![policy]),
+        verifier,
+        Some(chat_backend.clone()),
+        Some(embedding.clone()),
+    );
+    let request = json!({
+        "tenant": "RBX",
+        "product": "test-product",
+        "workflow": "test-workflow",
+        "model_alias": "test-backend",
+        "input": ["public", "contains secret"]
+    });
+
+    let (status, body) = send_with_auth_json(
+        app.clone(),
+        "POST",
+        "/v1/embeddings",
+        Some("rbxsess-memory"),
+        Some(request),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["model_alias"], "test-backend");
+    assert_eq!(body["vectors"], json!([[0.1, 0.2], [0.3, 0.4]]));
+    assert!(body.get("provider_metadata").is_none());
+    let trace_id = body["trace_id"].as_str().unwrap();
+    let audit_id = body["audit_id"].as_str().unwrap();
+    uuid::Uuid::parse_str(trace_id).unwrap();
+    uuid::Uuid::parse_str(audit_id).unwrap();
+
+    assert_eq!(embedding.call_count(), 1);
+    assert_eq!(chat_backend.call_count(), 0);
+    let requests = embedding.requests();
+    assert_eq!(requests[0].input, vec!["public", "contains [REDACTED]"]);
+    assert_eq!(requests[0].trace_id.0.to_string(), trace_id);
+    assert_eq!(requests[0].audit_id.0.to_string(), audit_id);
+
+    let (audit_status, audit) =
+        send_request(app, "GET", &format!("/v1/audit/{audit_id}"), None).await;
+    assert_eq!(audit_status, StatusCode::OK);
+    let kinds: Vec<&str> = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["PreCallDecision", "RouteEnvelope", "PostCallOutcome"]
+    );
+    assert_eq!(audit["events"][0]["details"]["user"], "rbx-memory");
+    assert_eq!(
+        audit["events"][1]["details"]["capability_class"],
+        "embeddings"
+    );
+}
+
+#[tokio::test]
+async fn governed_embeddings_fail_closed_before_port_for_auth_policy_and_alias() {
+    let verifier = Arc::new(
+        StaticCredentialVerifier::with_valid(
+            "rbxsess-memory",
+            rbx_caller("rbx-memory", &["thalamus:embeddings"]),
+        )
+        .and_valid("rbxsess-no-scope", rbx_caller("rbx-memory", &[])),
+    );
+    let embedding = Arc::new(RecordingEmbeddingPort::new(Ok(EmbeddingResponse {
+        model_alias: "test-backend".to_owned(),
+        vectors: vec![vec![0.1]],
+        provider_metadata: json!({}),
+    })));
+    let app = app::build_with_rbx_api_and_embedding(
+        make_config(vec![test_policy()]),
+        verifier,
+        None,
+        Some(embedding.clone()),
+    );
+    let allowed = json!({
+        "tenant": "RBX",
+        "product": "test-product",
+        "workflow": "test-workflow",
+        "model_alias": "test-backend",
+        "input": "text"
+    });
+
+    let (status, body) = send_with_auth_json(
+        app.clone(),
+        "POST",
+        "/v1/embeddings",
+        None,
+        Some(allowed.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "policy_denied");
+
+    let (status, body) = send_with_auth_json(
+        app.clone(),
+        "POST",
+        "/v1/embeddings",
+        Some("rbxsess-no-scope"),
+        Some(allowed.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "policy_denied");
+
+    let mut no_policy = allowed.clone();
+    no_policy["product"] = json!("unknown-product");
+    let (status, body) = send_with_auth_json(
+        app.clone(),
+        "POST",
+        "/v1/embeddings",
+        Some("rbxsess-memory"),
+        Some(no_policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "policy_denied");
+    assert!(body["audit_id"].is_string());
+
+    let mut wrong_alias = allowed;
+    wrong_alias["model_alias"] = json!("unpermitted-alias");
+    let (status, body) = send_with_auth_json(
+        app,
+        "POST",
+        "/v1/embeddings",
+        Some("rbxsess-memory"),
+        Some(wrong_alias),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "model_not_permitted");
+    assert!(body["trace_id"].is_string());
+    assert_eq!(embedding.call_count(), 0);
+}
+
+#[tokio::test]
+async fn governed_embeddings_block_policy_and_malformed_vectors_fail_closed() {
+    let verifier = Arc::new(StaticCredentialVerifier::with_valid(
+        "rbxsess-memory",
+        rbx_caller("rbx-memory", &["thalamus:embeddings"]),
+    ));
+    let mut blocking_policy = test_policy();
+    blocking_policy.redaction_rules = vec![RedactionRule {
+        pattern: "private".to_owned(),
+        action: RedactionAction::Block,
+    }];
+    let blocked_port = Arc::new(RecordingEmbeddingPort::new(Ok(EmbeddingResponse {
+        model_alias: "test-backend".to_owned(),
+        vectors: vec![vec![0.1]],
+        provider_metadata: json!({}),
+    })));
+    let blocked_app = app::build_with_rbx_api_and_embedding(
+        make_config(vec![blocking_policy]),
+        verifier.clone(),
+        None,
+        Some(blocked_port.clone()),
+    );
+    let blocked_request = json!({
+        "tenant": "RBX",
+        "product": "test-product",
+        "workflow": "test-workflow",
+        "model_alias": "test-backend",
+        "input": "private material"
+    });
+    let (status, body) = send_with_auth_json(
+        blocked_app,
+        "POST",
+        "/v1/embeddings",
+        Some("rbxsess-memory"),
+        Some(blocked_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "content_blocked");
+    assert_eq!(blocked_port.call_count(), 0);
+
+    let malformed_port = Arc::new(RecordingEmbeddingPort::new(Ok(EmbeddingResponse {
+        model_alias: "test-backend".to_owned(),
+        vectors: vec![vec![0.1], vec![0.2, 0.3]],
+        provider_metadata: json!({}),
+    })));
+    let malformed_app = app::build_with_rbx_api_and_embedding(
+        make_config(vec![test_policy()]),
+        verifier,
+        None,
+        Some(malformed_port.clone()),
+    );
+    let malformed_request = json!({
+        "tenant": "RBX",
+        "product": "test-product",
+        "workflow": "test-workflow",
+        "model_alias": "test-backend",
+        "input": ["one", "two"]
+    });
+    let (status, body) = send_with_auth_json(
+        malformed_app,
+        "POST",
+        "/v1/embeddings",
+        Some("rbxsess-memory"),
+        Some(malformed_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "malformed_embedding_response");
+    assert_eq!(malformed_port.call_count(), 1);
 }
 
 // Matrix cases 3 + 5: expired / revoked map to session_expired.

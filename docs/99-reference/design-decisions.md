@@ -718,6 +718,42 @@ has six mutually-exclusive cfg blocks (3 langfuse × {litellm, agentgateway, non
 
 **Decision Level**: Autonomous. **Status**: Accepted. **Refs**: TH-S6b.
 
+### 2026-07-27: Governed embeddings use a dedicated authenticated route and port
+
+**Context**: ADR-0023 requires `rbx-memory` to obtain embeddings through
+Thalamus rather than calling LiteLLM or a provider. `EmbeddingPort` and the
+LiteLLM implementation already exist, but the server had no authenticated HTTP
+surface connecting policy to that port.
+
+**Decision**: Mount `POST /v1/embeddings` only on the credential-gated
+`THALAMUS_RBX_API` router. The credential must target audience `thalamus` and
+carry `thalamus:embeddings`; this is the capability authorization before policy
+resolution. The request carries tenant, product, workflow, an institutional
+model alias, and one or more input strings. Thalamus resolves and
+evaluates the exact policy tuple, refuses a missing policy, refuses an alias not
+listed as a model backend without substituting another alias, applies policy
+block/redact rules, creates trace/audit IDs, emits pre-call, route, and post-call
+audit events, and invokes `EmbeddingPort` once for the bounded batch. The
+response validates count, dimensions, finite values, and alias correlation; it
+returns no provider metadata.
+
+The synchronous port runs in `spawn_blocking`, matching the existing adapter
+boundary. LiteLLM model-name resolution and credentials stay in the adapter.
+The route is additive and has no existing consumers; `rbx-memory` is the first
+planned consumer.
+
+**Control-boundary analysis**: Control = yes (identity, policy, redaction,
+routing permission, audit, response validation). Provider transport ownership =
+no (`EmbeddingPort` only). Gateway coupling = no (server imports no LiteLLM or
+provider type). Sibling ownership = no (`rbx-memory` retains persistence and
+retrieval; Thalamus stores no vectors). Variation = policy data keyed by tenant,
+product, and workflow. The trade-off is a purpose-built governed contract rather
+than wire compatibility with the provider-facing OpenAI request shape; this
+keeps caller scope and audit correlation explicit.
+
+**Decision Level**: Reviewed, within accepted ADR-0023 and the existing
+`EmbeddingPort`. **Status**: Proposed in implementation PR.
+
 ### Open items
 
 - Policy language/representation and evaluation semantics: not yet decided.
