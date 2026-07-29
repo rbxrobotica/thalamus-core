@@ -230,7 +230,24 @@ async fn main() {
         let rbx_embedding: Option<
             std::sync::Arc<dyn thalamus_core::EmbeddingPort + Send + Sync>,
         > = None;
-        app::build_with_rbx_api_and_embedding(cfg, verifier, rbx_backend, rbx_embedding)
+        let rbx_retrieval: Option<
+            std::sync::Arc<dyn ports::retrieval::RetrievalPort + Send + Sync>,
+        > = ports::retrieval::HttpRetrievalPort::from_env()
+            .unwrap_or_else(|error| {
+                eprintln!("invalid governed RAG retrieval configuration: {error}");
+                std::process::exit(1);
+            })
+            .map(|port| {
+                std::sync::Arc::new(port)
+                    as std::sync::Arc<dyn ports::retrieval::RetrievalPort + Send + Sync>
+            });
+        app::build_with_rbx_api_embedding_retrieval(
+            cfg,
+            verifier,
+            rbx_backend,
+            rbx_embedding,
+            rbx_retrieval,
+        )
     } else {
         app
     };

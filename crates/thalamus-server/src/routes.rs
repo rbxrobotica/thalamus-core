@@ -14,6 +14,7 @@ use thalamus_core::{
 
 use crate::app::AppState;
 use crate::auth::VerifiedCaller;
+use crate::ports::retrieval::{RetrievalPortError, RetrievalPortRequest};
 use axum::Extension;
 
 // === Request / Response types ===
@@ -142,6 +143,7 @@ pub async fn healthz() -> impl IntoResponse {
 /// soon as it is wired.
 pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     let backend_configured = state.backend_port.is_some();
+    let retrieval_configured = state.retrieval_port.is_some();
     let audit_reachable = match &state.durable_audit {
         Some(durable) => durable.probe() && durable.healthy(),
         None => true,
@@ -167,6 +169,7 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
         "identity_verifier": state.credential_verifier.is_some(),
         "identity_reachable": identity_reachable,
         "backend_configured": backend_configured,
+        "retrieval_configured": retrieval_configured,
     });
     let code = if ok {
         StatusCode::OK
@@ -230,7 +233,7 @@ pub struct EmbeddingsResponse {
     pub audit_id: String,
 }
 
-fn embedding_refusal(
+fn governed_refusal(
     status: StatusCode,
     code: &str,
     message: &str,
@@ -246,7 +249,7 @@ fn embedding_refusal(
     (status, Json(body)).into_response()
 }
 
-fn emit_embedding_decision(
+fn emit_governed_decision(
     state: &AppState,
     request: &CallRequest,
     trace_id: &TraceId,
@@ -269,7 +272,7 @@ fn emit_embedding_decision(
     });
 }
 
-fn emit_embedding_outcome(state: &AppState, trace_id: &TraceId, audit_id: &AuditId, valid: bool) {
+fn emit_governed_outcome(state: &AppState, trace_id: &TraceId, audit_id: &AuditId, valid: bool) {
     state.audit_port.emit(AuditEvent::PostCallOutcome {
         trace_id: trace_id.clone(),
         audit_id: audit_id.clone(),
@@ -370,7 +373,7 @@ pub async fn embeddings(
                 .filter(|value| !value.is_empty())
         });
     let Some(principal) = principal else {
-        return embedding_refusal(
+        return governed_refusal(
             StatusCode::FORBIDDEN,
             "policy_denied",
             "verified caller has no attributable principal",
@@ -385,7 +388,7 @@ pub async fn embeddings(
         || req.workflow.trim().is_empty()
         || req.model_alias.trim().is_empty()
     {
-        return embedding_refusal(
+        return governed_refusal(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "tenant, product, workflow, and model_alias are required",
@@ -397,7 +400,7 @@ pub async fn embeddings(
     let input = match embedding_inputs(req.input) {
         Ok(input) => input,
         Err(detail) => {
-            return embedding_refusal(
+            return governed_refusal(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 detail,
@@ -429,7 +432,7 @@ pub async fn embeddings(
         .any(|audience| audience == EMBEDDING_AUDIENCE);
     let scope_allowed = caller.scopes.iter().any(|scope| scope == EMBEDDING_SCOPE);
     if !audience_allowed || !scope_allowed {
-        emit_embedding_decision(
+        emit_governed_decision(
             &state,
             &call_request,
             &trace_id,
@@ -441,7 +444,7 @@ pub async fn embeddings(
         if let Some(response) = durable_audit_guard(&state) {
             return response;
         }
-        return embedding_refusal(
+        return governed_refusal(
             StatusCode::FORBIDDEN,
             "policy_denied",
             "credential is not authorized for governed embeddings",
@@ -453,7 +456,7 @@ pub async fn embeddings(
     let policy = state.policy_port.resolve(&call_request);
     match state.policy_port.evaluate(&call_request, &policy) {
         PolicyDecision::Deny { reason, policy_ref } => {
-            emit_embedding_decision(
+            emit_governed_decision(
                 &state,
                 &call_request,
                 &trace_id,
@@ -465,7 +468,7 @@ pub async fn embeddings(
             if let Some(response) = durable_audit_guard(&state) {
                 return response;
             }
-            return embedding_refusal(
+            return governed_refusal(
                 StatusCode::FORBIDDEN,
                 "policy_denied",
                 &reason,
@@ -478,7 +481,7 @@ pub async fn embeddings(
             review_reason,
             policy_ref,
         } => {
-            emit_embedding_decision(
+            emit_governed_decision(
                 &state,
                 &call_request,
                 &trace_id,
@@ -490,7 +493,7 @@ pub async fn embeddings(
             if let Some(response) = durable_audit_guard(&state) {
                 return response;
             }
-            return embedding_refusal(
+            return governed_refusal(
                 StatusCode::FORBIDDEN,
                 "needs_human_review",
                 &review_reason,
@@ -508,7 +511,7 @@ pub async fn embeddings(
         .find(|backend| backend.id == req.model_alias && backend.backend_type == BackendType::Model)
         .cloned();
     let Some(permitted_backend) = permitted_backend else {
-        emit_embedding_decision(
+        emit_governed_decision(
             &state,
             &call_request,
             &trace_id,
@@ -520,7 +523,7 @@ pub async fn embeddings(
         if let Some(response) = durable_audit_guard(&state) {
             return response;
         }
-        return embedding_refusal(
+        return governed_refusal(
             StatusCode::FORBIDDEN,
             "model_not_permitted",
             "embedding model alias is not permitted by policy",
@@ -533,7 +536,7 @@ pub async fn embeddings(
     let input = match redact_embedding_inputs(input, &policy.redaction_rules) {
         Ok(input) => input,
         Err(detail) => {
-            emit_embedding_decision(
+            emit_governed_decision(
                 &state,
                 &call_request,
                 &trace_id,
@@ -545,7 +548,7 @@ pub async fn embeddings(
             if let Some(response) = durable_audit_guard(&state) {
                 return response;
             }
-            return embedding_refusal(
+            return governed_refusal(
                 StatusCode::FORBIDDEN,
                 "content_blocked",
                 detail,
@@ -556,7 +559,7 @@ pub async fn embeddings(
         }
     };
 
-    emit_embedding_decision(
+    emit_governed_decision(
         &state,
         &call_request,
         &trace_id,
@@ -582,11 +585,11 @@ pub async fn embeddings(
     }
 
     let Some(embedding_port) = state.embedding_port.as_ref().map(Arc::clone) else {
-        emit_embedding_outcome(&state, &trace_id, &audit_id, false);
+        emit_governed_outcome(&state, &trace_id, &audit_id, false);
         if let Some(response) = durable_audit_guard(&state) {
             return response;
         }
-        return embedding_refusal(
+        return governed_refusal(
             StatusCode::SERVICE_UNAVAILABLE,
             "embedding_backend_unavailable",
             "no embedding backend is configured",
@@ -613,11 +616,11 @@ pub async fn embeddings(
                 error = %crate::redact::redact(&join_error.to_string()),
                 "embedding backend task failed"
             );
-            emit_embedding_outcome(&state, &trace_id, &audit_id, false);
+            emit_governed_outcome(&state, &trace_id, &audit_id, false);
             if let Some(response) = durable_audit_guard(&state) {
                 return response;
             }
-            return embedding_refusal(
+            return governed_refusal(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "embedding_task_failed",
                 "embedding backend task failed",
@@ -657,20 +660,20 @@ pub async fn embeddings(
                 error = %crate::redact::redact(&error.to_string()),
                 "embedding request failed"
             );
-            emit_embedding_outcome(&state, &trace_id, &audit_id, false);
+            emit_governed_outcome(&state, &trace_id, &audit_id, false);
             if let Some(response) = durable_audit_guard(&state) {
                 return response;
             }
-            return embedding_refusal(status, code, message, retryable, &trace_id, &audit_id);
+            return governed_refusal(status, code, message, retryable, &trace_id, &audit_id);
         }
     };
 
     if !valid_embedding_response(&response, &req.model_alias, expected_count) {
-        emit_embedding_outcome(&state, &trace_id, &audit_id, false);
+        emit_governed_outcome(&state, &trace_id, &audit_id, false);
         if let Some(response) = durable_audit_guard(&state) {
             return response;
         }
-        return embedding_refusal(
+        return governed_refusal(
             StatusCode::BAD_GATEWAY,
             "malformed_embedding_response",
             "embedding backend returned vectors with an invalid shape",
@@ -680,7 +683,7 @@ pub async fn embeddings(
         );
     }
 
-    emit_embedding_outcome(&state, &trace_id, &audit_id, true);
+    emit_governed_outcome(&state, &trace_id, &audit_id, true);
     if let Some(response) = durable_audit_guard(&state) {
         return response;
     }
@@ -691,6 +694,454 @@ pub async fn embeddings(
             vectors: response.vectors,
             trace_id: trace_id.0.to_string(),
             audit_id: audit_id.0.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+const RAG_RETRIEVAL_AUDIENCE: &str = "thalamus";
+const RAG_RETRIEVAL_SCOPE: &str = "thalamus:rag:retrieve";
+const MAX_RAG_QUERY_BYTES: usize = 4_000;
+const MAX_RAG_RESULTS: u16 = 20;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RagShadowRetrievalRequest {
+    pub tenant: String,
+    pub product: String,
+    pub workflow: String,
+    pub package_id: String,
+    pub visibility: String,
+    pub query: String,
+    pub limit: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RagShadowRetrievalHit {
+    pub chunk_id: String,
+    pub document_id: String,
+    pub content: String,
+    pub locale: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RagShadowRetrievalResponse {
+    pub mode: &'static str,
+    pub package_id: String,
+    pub visibility: String,
+    pub model_alias: String,
+    pub trace_id: String,
+    pub audit_id: String,
+    pub embedding_trace_id: String,
+    pub embedding_audit_id: String,
+    pub hits: Vec<RagShadowRetrievalHit>,
+}
+
+fn valid_rag_scope_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn sanitized_audit_dimension(value: &str) -> String {
+    let value = value.trim();
+    if valid_rag_scope_id(value) {
+        value.to_owned()
+    } else {
+        "<invalid>".to_owned()
+    }
+}
+
+fn emit_rag_early_refusal(
+    state: &AppState,
+    request: &RagShadowRetrievalRequest,
+    trace_id: &TraceId,
+    audit_id: &AuditId,
+    policy_ref: &str,
+) {
+    state.audit_port.emit(AuditEvent::PreCallDecision {
+        trace_id: trace_id.clone(),
+        audit_id: audit_id.clone(),
+        tenant: sanitized_audit_dimension(&request.tenant),
+        product: sanitized_audit_dimension(&request.product),
+        workflow: sanitized_audit_dimension(&request.workflow),
+        user: None,
+        policy_ref: policy_ref.to_owned(),
+        decision: "Deny".to_owned(),
+        backend: None,
+        timestamp: time::OffsetDateTime::now_utc(),
+    });
+}
+
+/// POST /rbx/v1/rag/shadow/retrieve — authenticated, policy-governed context
+/// retrieval for shadow consumers. The route never generates a public answer.
+/// It delegates persistence/querying only to the configured rbx-memory adapter;
+/// rbx-memory obtains query embeddings through the separately governed
+/// `/v1/embeddings` route.
+pub async fn rag_shadow_retrieve(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<VerifiedCaller>,
+    Json(req): Json<RagShadowRetrievalRequest>,
+) -> Response {
+    let trace_id = TraceId(Uuid::new_v4());
+    let audit_id = AuditId(Uuid::new_v4());
+    let principal = caller
+        .subject
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            caller
+                .client_app_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+        });
+    let Some(principal) = principal else {
+        emit_rag_early_refusal(&state, &req, &trace_id, &audit_id, "credential-principal");
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return governed_refusal(
+            StatusCode::FORBIDDEN,
+            "policy_denied",
+            "verified caller has no attributable principal",
+            false,
+            &trace_id,
+            &audit_id,
+        );
+    };
+
+    let query = req.query.trim();
+    if !valid_rag_scope_id(req.tenant.trim())
+        || !valid_rag_scope_id(req.product.trim())
+        || !valid_rag_scope_id(req.workflow.trim())
+        || !valid_rag_scope_id(&req.package_id)
+        || !matches!(
+            req.visibility.as_str(),
+            "public" | "internal" | "restricted"
+        )
+        || query.is_empty()
+        || query.len() > MAX_RAG_QUERY_BYTES
+        || req.limit == 0
+        || req.limit > MAX_RAG_RESULTS
+    {
+        emit_rag_early_refusal(&state, &req, &trace_id, &audit_id, "invalid-request");
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return governed_refusal(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "tenant, product, workflow, package scope, query, or limit is invalid",
+            false,
+            &trace_id,
+            &audit_id,
+        );
+    }
+
+    let requested_backend = BackendHandle {
+        id: format!(
+            "rbx-memory:{}:{}",
+            req.package_id.as_str(),
+            req.visibility.as_str()
+        ),
+        backend_type: BackendType::Custom("Retrieval".to_owned()),
+    };
+    let call_request = CallRequest {
+        tenant: req.tenant,
+        product: req.product,
+        user: principal.to_owned(),
+        workflow: req.workflow,
+        intent: "rag_shadow_retrieval".to_owned(),
+        prompt: query.to_owned(),
+        requested_backend: Some(requested_backend.clone()),
+        budget_hint: None,
+        run_correlated: false,
+    };
+
+    let audience_allowed = caller
+        .audience
+        .iter()
+        .any(|audience| audience == RAG_RETRIEVAL_AUDIENCE);
+    let scope_allowed = caller
+        .scopes
+        .iter()
+        .any(|scope| scope == RAG_RETRIEVAL_SCOPE);
+    if !audience_allowed || !scope_allowed {
+        emit_governed_decision(
+            &state,
+            &call_request,
+            &trace_id,
+            &audit_id,
+            "credential-scope",
+            "Deny",
+            None,
+        );
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return governed_refusal(
+            StatusCode::FORBIDDEN,
+            "policy_denied",
+            "credential is not authorized for governed RAG retrieval",
+            false,
+            &trace_id,
+            &audit_id,
+        );
+    }
+
+    let policy = state.policy_port.resolve(&call_request);
+    match state.policy_port.evaluate(&call_request, &policy) {
+        PolicyDecision::Deny { reason, policy_ref } => {
+            emit_governed_decision(
+                &state,
+                &call_request,
+                &trace_id,
+                &audit_id,
+                &policy_ref,
+                "Deny",
+                None,
+            );
+            if let Some(response) = durable_audit_guard(&state) {
+                return response;
+            }
+            return governed_refusal(
+                StatusCode::FORBIDDEN,
+                "policy_denied",
+                &reason,
+                false,
+                &trace_id,
+                &audit_id,
+            );
+        }
+        PolicyDecision::AllowWithReview {
+            review_reason,
+            policy_ref,
+        } => {
+            emit_governed_decision(
+                &state,
+                &call_request,
+                &trace_id,
+                &audit_id,
+                &policy_ref,
+                "AllowWithReview",
+                None,
+            );
+            if let Some(response) = durable_audit_guard(&state) {
+                return response;
+            }
+            return governed_refusal(
+                StatusCode::FORBIDDEN,
+                "needs_human_review",
+                &review_reason,
+                false,
+                &trace_id,
+                &audit_id,
+            );
+        }
+        PolicyDecision::Allow => {}
+    }
+
+    let permitted_backend = policy
+        .permitted_backends
+        .iter()
+        .find(|backend| *backend == &requested_backend)
+        .cloned();
+    let Some(permitted_backend) = permitted_backend else {
+        emit_governed_decision(
+            &state,
+            &call_request,
+            &trace_id,
+            &audit_id,
+            &policy.id,
+            "Deny",
+            None,
+        );
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return governed_refusal(
+            StatusCode::FORBIDDEN,
+            "context_not_permitted",
+            "RAG package and visibility are not permitted by policy",
+            false,
+            &trace_id,
+            &audit_id,
+        );
+    };
+
+    let Some(retrieval_port) = state.retrieval_port.as_ref().map(Arc::clone) else {
+        emit_governed_decision(
+            &state,
+            &call_request,
+            &trace_id,
+            &audit_id,
+            &policy.id,
+            "Deny",
+            None,
+        );
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return governed_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "retrieval_unavailable",
+            "no RAG retrieval backend is configured",
+            true,
+            &trace_id,
+            &audit_id,
+        );
+    };
+    if retrieval_port.scope().package_id != req.package_id
+        || retrieval_port.scope().visibility != req.visibility
+        || retrieval_port.scope().backend_id() != requested_backend.id
+    {
+        emit_governed_decision(
+            &state,
+            &call_request,
+            &trace_id,
+            &audit_id,
+            &policy.id,
+            "Deny",
+            None,
+        );
+        if let Some(response) = durable_audit_guard(&state) {
+            return response;
+        }
+        return governed_refusal(
+            StatusCode::FORBIDDEN,
+            "context_not_permitted",
+            "RAG package and visibility are not configured for this runtime",
+            false,
+            &trace_id,
+            &audit_id,
+        );
+    }
+
+    let query = match redact_embedding_inputs(vec![query.to_owned()], &policy.redaction_rules) {
+        Ok(mut values) => values.remove(0),
+        Err(detail) => {
+            emit_governed_decision(
+                &state,
+                &call_request,
+                &trace_id,
+                &audit_id,
+                &policy.id,
+                "Deny",
+                None,
+            );
+            if let Some(response) = durable_audit_guard(&state) {
+                return response;
+            }
+            return governed_refusal(
+                StatusCode::FORBIDDEN,
+                "content_blocked",
+                detail,
+                false,
+                &trace_id,
+                &audit_id,
+            );
+        }
+    };
+
+    emit_governed_decision(
+        &state,
+        &call_request,
+        &trace_id,
+        &audit_id,
+        &policy.id,
+        "Allow",
+        Some(permitted_backend),
+    );
+    if let Some(response) = durable_audit_guard(&state) {
+        return response;
+    }
+
+    let retrieval = retrieval_port
+        .retrieve(RetrievalPortRequest {
+            query,
+            limit: req.limit,
+        })
+        .await;
+    let retrieval = match retrieval {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                trace_id = %trace_id.0,
+                audit_id = %audit_id.0,
+                error = %crate::redact::redact(&error.to_string()),
+                "governed RAG retrieval failed"
+            );
+            emit_governed_outcome(&state, &trace_id, &audit_id, false);
+            if let Some(response) = durable_audit_guard(&state) {
+                return response;
+            }
+            let (status, code, message, retryable) = match error {
+                RetrievalPortError::InvalidResponse(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    "malformed_retrieval_response",
+                    "RAG retrieval returned an invalid response",
+                    true,
+                ),
+                RetrievalPortError::InvalidConfiguration(_)
+                | RetrievalPortError::Transport
+                | RetrievalPortError::Refused(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "retrieval_unavailable",
+                    "RAG retrieval dependency is unavailable",
+                    true,
+                ),
+            };
+            return governed_refusal(status, code, message, retryable, &trace_id, &audit_id);
+        }
+    };
+
+    let mut hits = Vec::with_capacity(retrieval.hits.len());
+    for hit in retrieval.hits {
+        let content = match redact_embedding_inputs(vec![hit.content], &policy.redaction_rules) {
+            Ok(mut values) => values.remove(0),
+            Err(detail) => {
+                emit_governed_outcome(&state, &trace_id, &audit_id, false);
+                if let Some(response) = durable_audit_guard(&state) {
+                    return response;
+                }
+                return governed_refusal(
+                    StatusCode::FORBIDDEN,
+                    "content_blocked",
+                    detail,
+                    false,
+                    &trace_id,
+                    &audit_id,
+                );
+            }
+        };
+        hits.push(RagShadowRetrievalHit {
+            chunk_id: hit.chunk_id,
+            document_id: hit.document_id,
+            content,
+            locale: hit.locale,
+            score: hit.score,
+        });
+    }
+
+    emit_governed_outcome(&state, &trace_id, &audit_id, true);
+    if let Some(response) = durable_audit_guard(&state) {
+        return response;
+    }
+    (
+        StatusCode::OK,
+        Json(RagShadowRetrievalResponse {
+            mode: "shadow",
+            package_id: retrieval.package_id,
+            visibility: retrieval.visibility,
+            model_alias: retrieval.model_alias,
+            trace_id: trace_id.0.to_string(),
+            audit_id: audit_id.0.to_string(),
+            embedding_trace_id: retrieval.trace_id,
+            embedding_audit_id: retrieval.audit_id,
+            hits,
         }),
     )
         .into_response()

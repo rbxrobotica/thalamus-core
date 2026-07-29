@@ -31,6 +31,7 @@ pub struct AppState {
     pub obs_port: Arc<dyn thalamus_core::ObservabilityPort + Send + Sync>,
     pub backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
     pub embedding_port: Option<Arc<dyn EmbeddingPort + Send + Sync>>,
+    pub retrieval_port: Option<Arc<dyn ports::retrieval::RetrievalPort + Send + Sync>>,
     pub audit_store: AuditStore,
     #[allow(
         dead_code,
@@ -68,6 +69,7 @@ pub fn build(config: ServerConfig) -> Router {
         obs_port,
         backend_port,
         embedding_port: None,
+        retrieval_port: None,
         audit_store,
         eval_store,
         credential_verifier: None,
@@ -101,6 +103,7 @@ pub fn build_with_backend(
         obs_port,
         backend_port: Some(backend),
         embedding_port: None,
+        retrieval_port: None,
         audit_store,
         eval_store,
         credential_verifier: None,
@@ -133,6 +136,7 @@ pub fn build_with_ports(
         obs_port,
         backend_port: Some(backend),
         embedding_port: None,
+        retrieval_port: None,
         audit_store,
         eval_store,
         credential_verifier: None,
@@ -208,6 +212,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             .route("/rbx/v1/tool-decisions", post(routes::rbx_tool_decision))
             .route("/rbx/v1/approvals", post(routes::rbx_approval))
             .route("/rbx/v1/evidence", post(routes::rbx_evidence))
+            .route(
+                "/rbx/v1/rag/shadow/retrieve",
+                post(routes::rag_shadow_retrieve),
+            )
             .route("/v1/embeddings", post(routes::embeddings))
             // Innermost: rate limiting sees the VerifiedCaller inserted by
             // the (outer) credential middleware.
@@ -256,6 +264,25 @@ pub fn build_with_rbx_api_and_embedding(
     backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
     embedding_port: Option<Arc<dyn EmbeddingPort + Send + Sync>>,
 ) -> Router {
+    build_with_rbx_api_embedding_retrieval(
+        config,
+        credential_verifier,
+        backend_port,
+        embedding_port,
+        None,
+    )
+}
+
+/// Build the governed API with chat, embedding, and scoped retrieval seams.
+/// Retrieval remains a server adapter: rbx-memory owns persistence/querying,
+/// while Thalamus owns authorization, policy, redaction, and audit correlation.
+pub fn build_with_rbx_api_embedding_retrieval(
+    config: ServerConfig,
+    credential_verifier: Arc<dyn auth::CredentialVerifier + Send + Sync>,
+    backend_port: Option<Arc<dyn BackendPort + Send + Sync>>,
+    embedding_port: Option<Arc<dyn EmbeddingPort + Send + Sync>>,
+    retrieval_port: Option<Arc<dyn ports::retrieval::RetrievalPort + Send + Sync>>,
+) -> Router {
     let policy_port = Arc::new(ports::ConfigPolicyPort::from_config(&config));
     let context_port = Arc::new(ports::StaticContextPort::empty());
     let (audit_port, audit_store, durable_audit, session_store) = ports::audit::audit_wiring();
@@ -273,6 +300,7 @@ pub fn build_with_rbx_api_and_embedding(
         obs_port,
         backend_port,
         embedding_port,
+        retrieval_port,
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
@@ -308,6 +336,7 @@ pub fn build_with_rbx_api_and_sessions(
         obs_port,
         backend_port: None,
         embedding_port: None,
+        retrieval_port: None,
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
@@ -344,6 +373,7 @@ pub fn build_with_rbx_api_sessions_backend(
         obs_port,
         backend_port: Some(backend),
         embedding_port: None,
+        retrieval_port: None,
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
@@ -380,6 +410,7 @@ pub fn build_with_rbx_api_sessions_limiter(
         obs_port,
         backend_port: None,
         embedding_port: None,
+        retrieval_port: None,
         audit_store,
         eval_store,
         credential_verifier: Some(credential_verifier),
@@ -418,6 +449,7 @@ pub fn build_with_eval_sink(
         obs_port,
         backend_port: backend,
         embedding_port: None,
+        retrieval_port: None,
         audit_store,
         eval_store,
         credential_verifier: None,
@@ -452,6 +484,7 @@ pub fn build_with_eval_inspection(
         obs_port,
         backend_port: Some(backend),
         embedding_port: None,
+        retrieval_port: None,
         audit_store,
         eval_store: eval_store.clone(),
         credential_verifier: None,

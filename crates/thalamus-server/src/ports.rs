@@ -4,6 +4,7 @@ pub mod context;
 pub mod eval;
 pub mod observability;
 pub mod policy;
+pub mod retrieval;
 pub mod sessions;
 pub mod trace_exporter;
 
