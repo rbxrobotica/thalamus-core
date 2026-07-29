@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Architecture phase (post-pivot)
 
+### Added (shadow RAG retrieval)
+
+- Authenticated `POST /rbx/v1/rag/shadow/retrieve` requires the least-privilege
+  `thalamus:rag:retrieve` scope, resolves tenant/product/workflow policy, and
+  permits only the exact package/visibility backend configured for rbx-memory.
+- Queries and returned context pass policy block/redact rules; responses remain
+  explicitly shadow-only and carry both retrieval and embedding trace/audit IDs.
+- The bounded server adapter calls only rbx-memory `/v1/retrieval`; Thalamus owns
+  authorization/audit while rbx-memory retains index and retrieval ownership.
+  Response bytes and fields are capped, and ungoverned `source_uri` metadata is
+  withheld from the public shadow contract.
+
 ### Added (governed embeddings route)
 
 - Authenticated `POST /v1/embeddings` resolves policy by tenant, product, and

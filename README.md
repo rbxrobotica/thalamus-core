@@ -131,8 +131,26 @@ inline mediated mode is proposed in
 **Current implementation**: this repository already contains Rust crates for
 `thalamus-core`, `thalamus-server`, LiteLLM and Agentgateway adapters, and eval
 support. The server currently exposes `/v1/decide`, `/v1/pre-call`,
-`/v1/post-call`, `/v1/call`, the authenticated `/v1/embeddings` route, and
+`/v1/post-call`, `/v1/call`, the authenticated `/v1/embeddings` route, the
+authenticated shadow-only `/rbx/v1/rag/shadow/retrieve` route, and
 `/v1/audit/{id}`.
+
+The RAG route is mounted only with `THALAMUS_RBX_API` and requires audience
+`thalamus`, scope `thalamus:rag:retrieve`, a matching tenant/product/workflow
+policy, and an exact `Retrieval` backend ID of
+`rbx-memory:<package_id>:<visibility>`. Its rbx-memory adapter is disabled unless
+all of these variables are present:
+
+- `THALAMUS_RBX_MEMORY_URL`
+- `THALAMUS_RBX_MEMORY_TOKEN`
+- `THALAMUS_RAG_PACKAGE_ID`
+- `THALAMUS_RAG_VISIBILITY`
+
+`THALAMUS_RAG_TIMEOUT_MS` is optional and defaults to 2000 milliseconds. Partial
+or malformed configuration aborts startup. The dependency response and every
+returned field are byte-bounded. `source_uri` is deliberately withheld from the
+public shadow contract. The route never generates or returns a public answer; it
+exposes authorized context only for BFF shadow measurement.
 
 **Not production-ready for the institutional LLM pilot yet**: authentication,
 session records, route envelopes, durable audit, payload redaction, streaming,

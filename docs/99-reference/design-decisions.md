@@ -754,6 +754,44 @@ keeps caller scope and audit correlation explicit.
 **Decision Level**: Reviewed, within accepted ADR-0023 and the existing
 `EmbeddingPort`. **Status**: Proposed in implementation PR.
 
+### 2026-07-29: Scoped RAG retrieval is a server adapter and remains shadow-only
+
+**Context**: Accepted ADR-0023 requires the public BFF to call Thalamus, never
+rbx-memory or an LLM gateway directly, and requires package/visibility retrieval
+to run in shadow before any separate public rollout. rbx-memory now exposes a
+scoped retrieval API and obtains its embeddings from the governed Thalamus
+embedding route. Thalamus still needed the inbound policy boundary and the
+outbound memory adapter.
+
+**Decision**: Add authenticated `POST /rbx/v1/rag/shadow/retrieve`. The BFF
+credential must target audience `thalamus` and carry `thalamus:rag:retrieve`.
+Thalamus resolves the supplied tenant/product/workflow tuple, requires an exact
+policy backend `rbx-memory:<package_id>:<visibility>` with type `Retrieval`,
+checks that the configured adapter has the same immutable scope, applies policy
+block/redact rules to the query, calls only rbx-memory `/v1/retrieval`, validates
+that the returned package and visibility did not escape scope, redacts returned
+context, and emits correlated pre/post audit events. Dependency bodies and fields
+are byte-bounded; `source_uri` remains withheld until it has a policy-controlled
+disclosure contract. Responses are fixed to `mode: shadow`, include both retrieval
+and embedding trace/audit IDs, and never contain an assistant answer.
+
+The HTTP integration is a server-local `RetrievalPort` adapter, not a new stable
+`thalamus-core` domain port. This avoids a Level 3 domain-contract expansion and
+does not reuse `BackendPort` for data ownership. Configuration is all-or-none;
+partial configuration aborts startup. The adapter is bounded by a configurable
+1-10000 ms timeout and has no retry loop.
+
+**Control-boundary analysis**: Control = yes (identity, policy, exact context
+scope, redaction, audit, refusal). Data plane ownership = no (rbx-memory retains
+indexing and queries). Provider transport = no (rbx-memory calls the separately
+governed `EmbeddingPort` path). Gateway coupling = no. Orchestration = no (one
+bounded context call, no sequencing/retry/mission state). Evaluation = no
+(Verentir remains asynchronous). Groundtruth = no (TruthMetal owns acceptance).
+Variation = policy and runtime configuration, not product-specific branches.
+
+**Decision Level**: Reviewed, within accepted ADR-0023 and existing server
+integration responsibilities. **Status**: Proposed in implementation PR.
+
 ### Open items
 
 - Policy language/representation and evaluation semantics: not yet decided.

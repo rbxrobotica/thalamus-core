@@ -68,6 +68,7 @@ Exposes the control-plane API over HTTP and gRPC.
 | `POST /v1/pre-call` | pre-call | Decide and produce an approved `Envelope` |
 | `POST /v1/call` | both | Pre-call, delegate to `BackendPort`, post-call, return `PostCallResult` |
 | `POST /v1/embeddings` | both | Authenticated policy/redaction/audit, delegate to `EmbeddingPort`, validate vectors |
+| `POST /rbx/v1/rag/shadow/retrieve` | pre-call | Authenticated package/visibility authorization and shadow retrieval through rbx-memory |
 | `POST /v1/post-call` | post-call | Validate an externally executed response |
 | `POST /v1/evaluate` | post-call | Submit a response/dataset to evaluation |
 | `GET  /v1/audit/{audit_id}` | n/a | Retrieve audit events for a call |
@@ -95,6 +96,25 @@ A successful response contains `model_alias`, `vectors`, `trace_id`, and
 `audit_id`. Provider model names and metadata never cross this HTTP boundary.
 Policy/auth/refusal errors use the governed typed error envelope and include
 trace/audit IDs once the authenticated handler has accepted the request.
+
+`/rbx/v1/rag/shadow/retrieve` is also mounted only with `THALAMUS_RBX_API`.
+The verified BFF credential needs `thalamus:rag:retrieve`. The request supplies
+an explicit tenant/product/workflow policy tuple, package ID, visibility, query,
+and bounded result limit. Policy must permit the exact `Retrieval` backend
+`rbx-memory:<package_id>:<visibility>`, and the configured adapter must match the
+same package/visibility pair before any memory call. Thalamus redacts the query
+before delegation and the returned public context before responding. The
+rbx-memory response and its fields are byte-bounded before exposure, and
+`source_uri` is withheld until a policy-controlled disclosure contract exists.
+The response is fixed to `mode: shadow` and carries both the Thalamus retrieval
+trace/audit IDs and the embedding trace/audit IDs returned through rbx-memory.
+It does not generate an answer or invoke an LLM backend.
+
+The rbx-memory HTTP adapter is a server-local integration seam rather than a new
+`thalamus-core` port. That preserves the stable domain port set: rbx-memory owns
+persistence and retrieval, while Thalamus owns request policy, authorization,
+redaction, correlation, and refusal. The downstream embedding path remains
+rbx-memory → `/v1/embeddings` → `EmbeddingPort` → adapter.
 
 ### thalamus-sdk-python and thalamus-sdk-ts
 

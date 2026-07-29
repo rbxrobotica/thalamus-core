@@ -19,6 +19,10 @@ use thalamus_server::auth::{
     VerifiedCaller,
 };
 use thalamus_server::config::ServerConfig;
+use thalamus_server::ports::retrieval::{
+    RetrievalHit, RetrievalPort, RetrievalPortError, RetrievalPortRequest, RetrievalPortResponse,
+    RetrievalScope,
+};
 
 // === Test helpers ===
 
@@ -72,6 +76,62 @@ impl EmbeddingPort for RecordingEmbeddingPort {
     fn embed(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse, EmbeddingError> {
         self.requests.lock().unwrap().push(request.clone());
         self.result.clone()
+    }
+}
+
+struct RecordingRetrievalPort {
+    scope: RetrievalScope,
+    requests: Mutex<Vec<RetrievalPortRequest>>,
+    response: RetrievalPortResponse,
+    fail: bool,
+}
+
+impl RecordingRetrievalPort {
+    fn successful(scope: RetrievalScope, response: RetrievalPortResponse) -> Self {
+        Self {
+            scope,
+            requests: Mutex::new(Vec::new()),
+            response,
+            fail: false,
+        }
+    }
+
+    fn failing(scope: RetrievalScope, response: RetrievalPortResponse) -> Self {
+        Self {
+            scope,
+            requests: Mutex::new(Vec::new()),
+            response,
+            fail: true,
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
+    fn requests(&self) -> Vec<RetrievalPortRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl RetrievalPort for RecordingRetrievalPort {
+    fn scope(&self) -> &RetrievalScope {
+        &self.scope
+    }
+
+    async fn retrieve(
+        &self,
+        request: RetrievalPortRequest,
+    ) -> Result<RetrievalPortResponse, RetrievalPortError> {
+        self.requests.lock().unwrap().push(request);
+        if self.fail {
+            Err(RetrievalPortError::InvalidResponse(
+                "test malformed response".to_owned(),
+            ))
+        } else {
+            Ok(self.response.clone())
+        }
     }
 }
 
@@ -149,6 +209,69 @@ fn test_policy() -> Policy {
         require_run_correlation: false,
         prompt_profile: None,
     }
+}
+
+fn rag_scope() -> RetrievalScope {
+    RetrievalScope {
+        package_id: "rbx-rag-public-assistant".to_owned(),
+        visibility: "public".to_owned(),
+    }
+}
+
+fn rag_policy() -> Policy {
+    Policy {
+        id: "public-assistant-shadow".to_owned(),
+        tenant: "public".to_owned(),
+        product: "rbx-site".to_owned(),
+        workflow: "public-assistant-shadow".to_owned(),
+        permitted_backends: vec![BackendHandle {
+            id: rag_scope().backend_id(),
+            backend_type: BackendType::Custom("Retrieval".to_owned()),
+        }],
+        budget: Budget {
+            max_tokens: 0,
+            max_latency_ms: 2_000,
+        },
+        context_grants: vec![ContextGrant {
+            source: "rbx-rag-public-assistant".to_owned(),
+            authorized: true,
+        }],
+        redaction_rules: vec![],
+        audit_required: true,
+        risk_threshold: RiskLevel::Low,
+        require_run_correlation: false,
+        prompt_profile: None,
+    }
+}
+
+fn rag_response(content: &str) -> RetrievalPortResponse {
+    RetrievalPortResponse {
+        package_id: "rbx-rag-public-assistant".to_owned(),
+        visibility: "public".to_owned(),
+        model_alias: "embedding-public".to_owned(),
+        trace_id: "embedding-trace-1".to_owned(),
+        audit_id: "embedding-audit-1".to_owned(),
+        hits: vec![RetrievalHit {
+            chunk_id: "chunk-1".to_owned(),
+            document_id: "doc-1".to_owned(),
+            content: content.to_owned(),
+            locale: "pt-BR".to_owned(),
+            source_uri: Some("package://rbx-rag-public-assistant/doc-1".to_owned()),
+            score: 0.9,
+        }],
+    }
+}
+
+fn rag_request() -> Value {
+    json!({
+        "tenant": "public",
+        "product": "rbx-site",
+        "workflow": "public-assistant-shadow",
+        "package_id": "rbx-rag-public-assistant",
+        "visibility": "public",
+        "query": "O que é a RBX?",
+        "limit": 5
+    })
 }
 
 fn empty_backend_policy() -> Policy {
@@ -1447,6 +1570,242 @@ async fn governed_embeddings_block_policy_and_malformed_vectors_fail_closed() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body["error"]["code"], "malformed_embedding_response");
     assert_eq!(malformed_port.call_count(), 1);
+}
+
+#[tokio::test]
+async fn governed_rag_shadow_retrieval_authenticates_scopes_redacts_and_audits() {
+    let mut policy = rag_policy();
+    policy.redaction_rules = vec![RedactionRule {
+        pattern: "secret".to_owned(),
+        action: RedactionAction::Redact,
+    }];
+    let verifier = Arc::new(StaticCredentialVerifier::with_valid(
+        "rbxsess-site",
+        rbx_caller("rbx-site-bff", &["thalamus:rag:retrieve"]),
+    ));
+    let retrieval = Arc::new(RecordingRetrievalPort::successful(
+        rag_scope(),
+        rag_response("public secret fact"),
+    ));
+    let app = app::build_with_rbx_api_embedding_retrieval(
+        make_config(vec![policy]),
+        verifier,
+        None,
+        None,
+        Some(retrieval.clone()),
+    );
+    let mut request = rag_request();
+    request["query"] = json!("contains secret");
+
+    let (status, body) = send_with_auth_json(
+        app.clone(),
+        "POST",
+        "/rbx/v1/rag/shadow/retrieve",
+        Some("rbxsess-site"),
+        Some(request),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["mode"], "shadow");
+    assert_eq!(body["package_id"], "rbx-rag-public-assistant");
+    assert_eq!(body["visibility"], "public");
+    assert_eq!(body["embedding_trace_id"], "embedding-trace-1");
+    assert_eq!(body["embedding_audit_id"], "embedding-audit-1");
+    assert_eq!(body["hits"][0]["content"], "public [REDACTED] fact");
+    assert!(body["hits"][0].get("source_uri").is_none());
+    let trace_id = body["trace_id"].as_str().unwrap();
+    let audit_id = body["audit_id"].as_str().unwrap();
+    uuid::Uuid::parse_str(trace_id).unwrap();
+    uuid::Uuid::parse_str(audit_id).unwrap();
+    assert_eq!(retrieval.call_count(), 1);
+    assert_eq!(retrieval.requests()[0].query, "contains [REDACTED]");
+    assert_eq!(retrieval.requests()[0].limit, 5);
+
+    let (audit_status, audit) =
+        send_request(app, "GET", &format!("/v1/audit/{audit_id}"), None).await;
+    assert_eq!(audit_status, StatusCode::OK);
+    let kinds = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, vec!["PreCallDecision", "PostCallOutcome"]);
+    assert_eq!(audit["events"][0]["details"]["user"], "rbx-site-bff");
+    assert_eq!(
+        audit["events"][0]["details"]["backend"],
+        "rbx-memory:rbx-rag-public-assistant:public"
+    );
+}
+
+#[tokio::test]
+async fn governed_rag_shadow_retrieval_fails_closed_before_memory() {
+    let mut unattributed = rbx_caller("rbx-site-bff", &["thalamus:rag:retrieve"]);
+    unattributed.subject = None;
+    unattributed.client_app_id = None;
+    let verifier = Arc::new(
+        StaticCredentialVerifier::with_valid(
+            "rbxsess-site",
+            rbx_caller("rbx-site-bff", &["thalamus:rag:retrieve"]),
+        )
+        .and_valid("rbxsess-no-scope", rbx_caller("rbx-site-bff", &[]))
+        .and_valid("rbxsess-unattributed", unattributed),
+    );
+    let retrieval = Arc::new(RecordingRetrievalPort::successful(
+        rag_scope(),
+        rag_response("public fact"),
+    ));
+    let app = app::build_with_rbx_api_embedding_retrieval(
+        make_config(vec![rag_policy()]),
+        verifier,
+        None,
+        None,
+        Some(retrieval.clone()),
+    );
+
+    let (status, _) = send_with_auth_json(
+        app.clone(),
+        "POST",
+        "/rbx/v1/rag/shadow/retrieve",
+        None,
+        Some(rag_request()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = send_with_auth_json(
+        app.clone(),
+        "POST",
+        "/rbx/v1/rag/shadow/retrieve",
+        Some("rbxsess-no-scope"),
+        Some(rag_request()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "policy_denied");
+
+    let (status, body) = send_with_auth_json(
+        app.clone(),
+        "POST",
+        "/rbx/v1/rag/shadow/retrieve",
+        Some("rbxsess-unattributed"),
+        Some(rag_request()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let audit_id = body["audit_id"].as_str().unwrap();
+    let (audit_status, audit) =
+        send_request(app.clone(), "GET", &format!("/v1/audit/{audit_id}"), None).await;
+    assert_eq!(audit_status, StatusCode::OK);
+    assert_eq!(audit["events"][0]["kind"], "PreCallDecision");
+    assert_eq!(
+        audit["events"][0]["details"]["policy_ref"],
+        "credential-principal"
+    );
+    assert!(audit["events"][0]["details"]["user"].is_null());
+
+    let mut invalid_request = rag_request();
+    invalid_request["tenant"] = json!("invalid/tenant");
+    let (status, body) = send_with_auth_json(
+        app.clone(),
+        "POST",
+        "/rbx/v1/rag/shadow/retrieve",
+        Some("rbxsess-site"),
+        Some(invalid_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let audit_id = body["audit_id"].as_str().unwrap();
+    let (audit_status, audit) =
+        send_request(app.clone(), "GET", &format!("/v1/audit/{audit_id}"), None).await;
+    assert_eq!(audit_status, StatusCode::OK);
+    assert_eq!(audit["events"][0]["details"]["tenant"], "<invalid>");
+    assert_eq!(
+        audit["events"][0]["details"]["policy_ref"],
+        "invalid-request"
+    );
+    assert!(audit["events"][0]["details"]["user"].is_null());
+
+    let mut wrong_package = rag_request();
+    wrong_package["package_id"] = json!("rbx-rag-sales-enablement");
+    let (status, body) = send_with_auth_json(
+        app,
+        "POST",
+        "/rbx/v1/rag/shadow/retrieve",
+        Some("rbxsess-site"),
+        Some(wrong_package),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "context_not_permitted");
+    assert_eq!(retrieval.call_count(), 0);
+
+    let mut blocking_policy = rag_policy();
+    blocking_policy.redaction_rules = vec![RedactionRule {
+        pattern: "private".to_owned(),
+        action: RedactionAction::Block,
+    }];
+    let blocking_port = Arc::new(RecordingRetrievalPort::successful(
+        rag_scope(),
+        rag_response("public fact"),
+    ));
+    let blocking_app = app::build_with_rbx_api_embedding_retrieval(
+        make_config(vec![blocking_policy]),
+        Arc::new(StaticCredentialVerifier::with_valid(
+            "rbxsess-site",
+            rbx_caller("rbx-site-bff", &["thalamus:rag:retrieve"]),
+        )),
+        None,
+        None,
+        Some(blocking_port.clone()),
+    );
+    let mut blocked = rag_request();
+    blocked["query"] = json!("private material");
+    let (status, body) = send_with_auth_json(
+        blocking_app,
+        "POST",
+        "/rbx/v1/rag/shadow/retrieve",
+        Some("rbxsess-site"),
+        Some(blocked),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "content_blocked");
+    assert_eq!(blocking_port.call_count(), 0);
+}
+
+#[tokio::test]
+async fn governed_rag_shadow_retrieval_maps_invalid_dependency_response() {
+    let retrieval = Arc::new(RecordingRetrievalPort::failing(
+        rag_scope(),
+        rag_response("unused"),
+    ));
+    let app = app::build_with_rbx_api_embedding_retrieval(
+        make_config(vec![rag_policy()]),
+        Arc::new(StaticCredentialVerifier::with_valid(
+            "rbxsess-site",
+            rbx_caller("rbx-site-bff", &["thalamus:rag:retrieve"]),
+        )),
+        None,
+        None,
+        Some(retrieval.clone()),
+    );
+
+    let (status, body) = send_with_auth_json(
+        app,
+        "POST",
+        "/rbx/v1/rag/shadow/retrieve",
+        Some("rbxsess-site"),
+        Some(rag_request()),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "malformed_retrieval_response");
+    assert!(body["trace_id"].is_string());
+    assert!(body["audit_id"].is_string());
+    assert_eq!(retrieval.call_count(), 1);
 }
 
 // Matrix cases 3 + 5: expired / revoked map to session_expired.
