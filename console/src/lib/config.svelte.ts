@@ -29,9 +29,10 @@ function save(cfg: AppConfig) {
 
 let config = $state<AppConfig>(load());
 
-$effect(() => {
-  save(config);
-});
+// Persistence is explicit on each write instead of a module-level `$effect`:
+// Svelte 5 only allows `$effect` inside a component or `$effect.root`, so the
+// previous top-level effect threw `effect_orphan` on first import and left the
+// console blank.
 
 export function getConfig(): AppConfig {
   return config;
@@ -39,9 +40,10 @@ export function getConfig(): AppConfig {
 
 export function setConfig(cfg: AppConfig) {
   config = cfg;
+  save(config);
 }
 
 export function resetConfig() {
   config = { baseUrl: '' };
-  sessionStorage.removeItem(STORAGE_KEY);
+  if (typeof window !== 'undefined') sessionStorage.removeItem(STORAGE_KEY);
 }
