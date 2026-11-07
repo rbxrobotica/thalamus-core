@@ -1,0 +1,6 @@
+schema: spec-driven
+context: |
+  Thalamus owns policy, authorization, budgets, governed model selection and audit.
+  Provider transport belongs behind BackendPort adapters. Verentir owns evaluation;
+  TruthMetal owns accepted evaluation specifications. Backlog proposals do not
+  authorize runtime rollout or claim implementation.

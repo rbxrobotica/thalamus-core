@@ -24,7 +24,7 @@ thalamus-litellm-adapter = { path = "../thalamus-litellm-adapter", optional = tr
 thalamus-agentgateway-adapter = { path = "../thalamus-agentgateway-adapter", optional = true }
 thalamus-langfuse-adapter = { path = "../thalamus-langfuse-adapter", optional = true }
 thalamus-postgres-adapter = { path = "../thalamus-postgres-adapter", optional = true }
-async-trait = "0.1"
+async-trait = "0.1.92"
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
