@@ -2,7 +2,7 @@
 
 Status: backlog/proposal; no router implementation or activation.
 Owner: Thalamus; evaluation: Verentir; client coordination: Robson Code.
-Assignee/priority: unassigned. Created: 2026-11-07.
+Assignee and priority are maintained in the linked GitHub issue. Created: 2026-11-07.
 GitHub tracking: [Thalamus #25](https://github.com/rbxrobotica/thalamus-core/issues/25).
 This change versions the technical scope and checklist. GitHub progress reconciliation remains agent-managed until the publisher is configured.
 
