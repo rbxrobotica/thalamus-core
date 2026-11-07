@@ -792,6 +792,25 @@ Variation = policy and runtime configuration, not product-specific branches.
 **Decision Level**: Reviewed, within accepted ADR-0023 and existing server
 integration responsibilities. **Status**: Proposed in implementation PR.
 
+### 2026-11-07: async-trait compatibility with Rust 1.99 Clippy
+
+**Context**: The locked `async-trait` 0.1.89 generates a redundant `must_use`
+attribute on the credential-verification and retrieval traits. Rust 1.99 Clippy
+rejects that expansion under the existing `-D warnings` CI gate.
+
+**Decision**: Require `async-trait` 0.1.92 in the server and update its lockfile
+resolution, including the macro's required parser dependencies. The
+[upstream release](https://github.com/dtolnay/async-trait/releases/tag/0.1.92)
+fixes `double_must_use` in generated code. Retain the existing lint gate and
+trait signatures; a lint allowance or toolchain downgrade is unnecessary.
+
+**Control-boundary analysis**: Build compatibility only; no new control-plane
+capability, provider transport, gateway coupling, ownership or policy behavior.
+The public port contracts and runtime configuration remain unchanged.
+
+**Decision Level**: Reviewed dependency maintenance in PR #26. Validate with
+workspace Clippy and tests with all features enabled, plus the existing CI matrix.
+
 ### Open items
 
 - Policy language/representation and evaluation semantics: not yet decided.
